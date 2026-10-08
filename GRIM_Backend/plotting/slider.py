@@ -2,15 +2,13 @@
 
 The slider selects exactly one value in the chosen parameter list and
 re-renders the current plot type, independent of Auto Plot. Under Hold the
-curves the slider added last time are replaced, so a scrubbed curve can move
-over a held PBP band or held reference curves without piling up.
+curves and bands the slider added last time are replaced, so a scrubbed plot
+can move over held PBP bands or reference curves without piling up.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import QTimer
-
-from GRIM_Backend.plotting.dataset_style import is_pbp_band_key
 
 # The axis each plot type sweeps along; the slider must scrub a different one.
 SWEEP_AXIS = {
@@ -93,16 +91,17 @@ class PlotSliderMixin:
         before = set()
         if hold:
             for ax in self.plot_figure.axes:
-                for line in list(ax.lines):
-                    if getattr(line, "_grim_slider_trace", False):
-                        line.remove()
-            before = {id(line) for ax in self.plot_figure.axes for line in ax.lines}
+                for artist in (*ax.lines, *ax.collections):
+                    if getattr(artist, "_grim_slider_trace", False):
+                        artist.remove()
+            before = {id(artist) for ax in self.plot_figure.axes
+                      for artist in (*ax.lines, *ax.collections)}
         self._render_plot_mode(mode)
         if hold:
-            # Only dataset curves are replaced; bands replace themselves by
-            # group, and markers are re-snapped after every render.
+            # Keep pre-existing held bands, but replace this slider's own
+            # previous curves and bands. Markers re-snap after every render.
             for ax in self.plot_figure.axes:
-                for line in ax.lines:
-                    key = getattr(line, "_grim_dataset_key", None)
-                    if id(line) not in before and key is not None and not is_pbp_band_key(key):
-                        line._grim_slider_trace = True
+                for artist in (*ax.lines, *ax.collections):
+                    key = getattr(artist, "_grim_dataset_key", None)
+                    if id(artist) not in before and key is not None:
+                        artist._grim_slider_trace = True

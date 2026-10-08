@@ -223,38 +223,59 @@ class PbpBandTests(_WindowCase):
     def test_percentile_band_uses_chosen_percentiles(self):
         window = self.window
         controls = window.analysis_controls
+        self.select_rows(0, 1, 2, freqs=(0, 1, 2))
         window.btn_pbp.setChecked(True)
         self.plot("_plot_azimuth_rect")
         _artists, edges = self.band()
         np.testing.assert_allclose(edges[0].get_ydata(), self.dbsm(POWER_SHAPE))
-        np.testing.assert_allclose(edges[1].get_ydata(), self.dbsm(POWER_SHAPE * 9))
+        np.testing.assert_allclose(edges[1].get_ydata(), self.dbsm(POWER_SHAPE * np.linspace(1, 2, 8)[2]))
 
         controls.set_pbp_band("percentile")
         controls.spin_pbp_low.setValue(25.0)
         controls.spin_pbp_high.setValue(75.0)
         _artists, edges = self.band()
-        levels = self.dbsm(POWER_SHAPE[None, :] * np.array([1.0, 4.0, 9.0])[:, None])
+        levels = self.dbsm(POWER_SHAPE[None, :] * np.linspace(1, 2, 8)[:3, None])
         np.testing.assert_allclose(edges[0].get_ydata(), np.percentile(levels, 25, axis=0))
         np.testing.assert_allclose(edges[1].get_ydata(), np.percentile(levels, 75, axis=0))
-        self.assertTrue(self.legend_labels()[0].startswith("PBP P25–P75 Pol HH"))
+        self.assertTrue(self.legend_labels()[0].startswith("PBP P25–P75 Run 1 | Pol HH"))
         controls.spin_pbp_high.setValue(20.0)
         self.assertLess(controls.spin_pbp_low.value(), controls.spin_pbp_high.value())
 
-    def test_selected_datasets_draw_one_band_and_remove_together(self):
+    def test_selected_datasets_draw_separate_bands_and_remove_independently(self):
         window = self.window
         window.btn_pbp.setChecked(True)
         self.plot("_plot_azimuth_rect")
         artists, edges = self.band()
         self.assertTrue(artists)
         np.testing.assert_allclose(edges[0].get_ydata(), self.dbsm(POWER_SHAPE))
-        np.testing.assert_allclose(edges[1].get_ydata(), self.dbsm(POWER_SHAPE * 9))
+        np.testing.assert_allclose(edges[1].get_ydata(), self.dbsm(POWER_SHAPE))
         self.assertEqual(
             self.legend_labels(),
-            ["PBP Pol HH, Freq 9 GHz, Elevation 0 deg"],
+            [f"PBP Run {index} | Pol HH, Freq 9 GHz, Elevation 0 deg" for index in (1, 2, 3)],
         )
+        self.assertEqual(len(window.plot_ax.collections), 3)
+        retained = list(window.plot_ax.collections)[1:]
         self.assertTrue(window._remove_plot_dataset(pbp_band_key()))
         self.assertEqual(self.band()[0], [])
-        self.assertEqual(self.legend_labels(), [])
+        self.assertEqual(list(window.plot_ax.collections), retained)
+        self.assertEqual(len(self.legend_labels()), 2)
+
+    def test_settings_and_selection_changes_under_hold_wait_for_explicit_plot(self):
+        window = self.window
+        self.select_rows(0, freqs=(0, 1))
+        window.btn_pbp.setChecked(True)
+        self.plot("_plot_azimuth_rect")
+        original = list(window.plot_ax.collections)
+        window.btn_hold.setChecked(True)
+        window.pbp_fill_mode = "heatmap_rcs"
+        window._on_analysis_setting_changed("pbp")
+        window.analysis_controls.set_pbp_band("percentile")
+        self.select_rows(1, freqs=(0, 1))
+        self.assertEqual(list(window.plot_ax.collections), original)
+        self.plot("_plot_azimuth_rect")
+        self.assertEqual(len(window.plot_ax.collections), 2)
+        self.assertIs(window.plot_ax.collections[0], original[0])
+        self.assertIn("Run 2", window.plot_ax.collections[1].get_label())
 
 
 class RemovedDeltaReferenceTests(_WindowCase):
@@ -396,6 +417,24 @@ class SliderTests(_WindowCase):
         self.assertEqual(slider.btn_play.text(), "Pause")
         window.btn_slider.setChecked(False)
         self.assertFalse(slider.btn_play.isChecked())
+
+    def test_slider_replaces_its_own_bands_and_preserves_explicit_held_bands(self):
+        window = self.window
+        self.select_rows(0, 1, freqs=(0, 1))
+        window.btn_pbp.setChecked(True)
+        self.plot("_plot_azimuth_rect")
+        held = list(window.plot_ax.collections)
+        self.assertEqual(len(held), 2)
+        window.btn_hold.setChecked(True)
+        window.btn_slider.setChecked(True)
+        for row in (2, 3, 4, 5):
+            self.move(row)
+            self.assertEqual(len(window.plot_ax.collections), 4)
+            self.assertEqual(len(window.plot_ax.lines), 8)
+            self.assertEqual(list(window.plot_ax.collections)[:2], held)
+            for band in list(window.plot_ax.collections)[2:]:
+                self.assertTrue(band._grim_slider_trace)
+                self.assertIn(f"Freq {self.datasets[0].frequencies[row]:g} GHz", band.get_label())
 
 
 class TimeGateTests(unittest.TestCase):

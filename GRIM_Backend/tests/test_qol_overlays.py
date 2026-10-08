@@ -129,7 +129,7 @@ class NativeOverlayTests(unittest.TestCase):
         azimuth_rect_mode.render(owner)
         self.assertEqual(len(owner.plot_ax.lines), 3)
 
-    def test_pbp_keeps_a_separate_band_for_each_polarization(self):
+    def test_pbp_keeps_a_separate_band_for_each_dataset_and_polarization(self):
         for mode in (azimuth_rect_mode, azimuth_polar_mode, frequency_mode):
             with self.subTest(mode=mode.__name__):
                 owner = self.harness([("A", grid()), ("B", grid(scale=2))],
@@ -138,14 +138,18 @@ class NativeOverlayTests(unittest.TestCase):
                 mode.render(owner)
                 self.assertIn("updated", owner.status.message)
                 labels = owner.plot_ax.get_legend_handles_labels()[1]
-                self.assertEqual(len(labels), 2)
-                self.assertIn("[HH]", labels[0])
-                self.assertIn("[VV]", labels[1])
+                self.assertEqual(len(labels), 4)
+                self.assertIn("A | Pol HH", labels[0])
+                self.assertIn("A | Pol VV", labels[1])
+                self.assertIn("B | Pol HH", labels[2])
+                self.assertIn("B | Pol VV", labels[3])
                 # Two edges per band; corresponding VV levels are exactly 20 dB above HH.
                 lines = owner.plot_ax.lines
-                self.assertEqual(len(lines), 4)
+                self.assertEqual(len(lines), 8)
                 np.testing.assert_allclose(lines[2].get_ydata() - lines[0].get_ydata(), 20)
                 np.testing.assert_allclose(lines[3].get_ydata() - lines[1].get_ydata(), 20)
+                np.testing.assert_allclose(lines[6].get_ydata() - lines[4].get_ydata(), 20)
+                np.testing.assert_allclose(lines[7].get_ydata() - lines[5].get_ydata(), 20)
 
     def test_native_grid_multi_polarization_mixed_db_overlay_keeps_all_values(self):
         fine, coarse = grid(), grid((0, 1, 2))

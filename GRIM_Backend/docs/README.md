@@ -154,7 +154,13 @@ performed. Point-by-point bands and difference calculations still use aligned
 samples. Select several polarizations to draw separate labeled curves in
 azimuth, frequency, elevation, CDF, or Sector Stats plots. All data curves
 default to solid lines; use the line-type controls to choose another style.
-PBP keeps separate polarization bands.
+PBP draws a separate band for each selected dataset and polarization, bounding
+that dataset's selected cuts. Bands follow the normal plot color sequence
+(blue first) with transparent fills. With Hold enabled, each Plot adds new
+bands in the next colors and preserves the existing bands, including repeat
+plots of the same dataset. Turn off Hold or Clear to start again. Each band
+has its own legend entry and can be removed independently. Heatmap fills
+remain available for a single band in the PBP Fill Mode menu.
 
 Right-click **Sector Stats** to open its settings. Choose uniform-width sectors
 or **Custom sectors** and enter one start/stop azimuth pair per table row.

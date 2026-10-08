@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from uuid import uuid4
 
 import numpy as np
 
@@ -51,11 +52,6 @@ class _IsarComputeSignals(QObject):
 
 _AXIS_AVAILABILITY_WORK_BYTES = 8 * 1024**2
 
-# Translucent fills for PBP by group; one colour per group name.
-PBP_GROUP_COLORS = (
-    "#4c9be8", "#f28e2b", "#59a14f", "#e15759", "#b07aa1",
-    "#76b7b2", "#edc948", "#ff9da7", "#9c755f", "#bab0ac",
-)
 NATIVE_DB_LINE_MODES = (
     "azimuth_rect", "azimuth_polar", "frequency", "elevation_sweep",
     "cdf", "sector_stats",
@@ -63,21 +59,16 @@ NATIVE_DB_LINE_MODES = (
 
 
 class _PbpBands:
-    """One streaming envelope per group and polarization.
+    """One streaming envelope per dataset and polarization for this render."""
 
-    A single ungrouped band retains its classic appearance and item key.
-    Hold identifies each band by polarization even when the selection changes.
-    """
-
-    def __init__(self, owner, groups: dict[int, str]):
+    def __init__(self, owner, datasets):
         self._owner = owner
-        self._groups = groups
-        self._envelopes: dict[tuple[str, str], plot_common.StreamingEnvelope] = {}
-        self._db_quantities: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        self._names = {owner._dataset_plot_key(dataset): name for name, dataset in datasets}
+        self._envelopes = {}
+        self._db_quantities = {}
 
     def update(self, dataset, values, *, polarization=None) -> None:
-        group = self._groups.get(id(dataset), "")
-        identity = (group, str(polarization or ""))
+        identity = (self._owner._dataset_plot_key(dataset), str(polarization or ""))
         envelope = self._envelopes.get(identity)
         if envelope is None:
             envelope = self._envelopes[identity] = self._owner._new_pbp_envelope()
@@ -87,44 +78,29 @@ class _PbpBands:
                 self._owner._native_db_quantity(dataset)
             )
 
-    def _band_key(self, identity):
-        """Reuse held identity keys; reserve the legacy key for the first band."""
-        used = set()
-        for artist in (*self._owner.plot_ax.lines, *self._owner.plot_ax.collections):
-            key = getattr(artist, "_grim_dataset_key", None)
-            if is_pbp_band_key(key):
-                if getattr(artist, "_grim_pbp_identity", None) == identity:
-                    return key
-                used.add(key)
-        group = identity[0]
-        key = pbp_band_key(group)
-        if key not in used:
-            return key
-        name = " | ".join(value for value in identity if value) or "Ungrouped"
-        key = pbp_band_key(name)
-        suffix = 2
-        while key in used:
-            key = pbp_band_key(f"{name} ({suffix})")
-            suffix += 1
-        return key
+    def _band_key(self):
+        """A held render is a new plot item, even for the same dataset/cuts."""
+        if not self._owner._plot_item_artists(PBP_BAND_KEY):
+            return PBP_BAND_KEY
+        return pbp_band_key(uuid4().hex)
 
     def draw(self, x_values, description: str, *, polar: bool, to_plot_x=None) -> None:
         owner = self._owner
-        identities = set(self._envelopes)
-        identities.update(
-            artist._grim_pbp_identity
+        held_keys = {
+            artist._grim_dataset_key
             for artist in (*owner.plot_ax.lines, *owner.plot_ax.collections)
-            if hasattr(artist, "_grim_pbp_identity")
-        )
-        identity_order = sorted(identities)
-        grouped = any(group for group, _pol in identities) or len(identities) > 1
-        if grouped and owner.pbp_fill_mode in ("heatmap_rcs", "heatmap_density"):
+            if is_pbp_band_key(getattr(artist, "_grim_dataset_key", None))
+        }
+        multiple = len(held_keys) + len(self._envelopes) > 1
+        heatmap = not multiple and owner.pbp_fill_mode in ("heatmap_rcs", "heatmap_density")
+        if multiple and owner.pbp_fill_mode in ("heatmap_rcs", "heatmap_density"):
             owner._note_plot_render(
-                "Grouped PBP bands use translucent group colours; heatmap fills "
-                "apply to a single ungrouped band."
+                "New PBP bands use translucent plot colours when several bands "
+                "are displayed; heatmap fills apply to a single band."
             )
-        for identity in sorted(self._envelopes):
-            envelope = self._envelopes[identity]
+        # Preserve dataset selection order, then polarization order, just as
+        # ordinary curves do. Each complete band consumes one line-cycle colour.
+        for identity, envelope in self._envelopes.items():
             if envelope.lower is None:
                 envelope.close()
                 continue
@@ -140,17 +116,14 @@ class _PbpBands:
                 "PBP" if percentiles is None
                 else f"PBP P{percentiles[0]:g}–P{percentiles[1]:g}"
             )
-            if grouped:
-                group = " | ".join(value for value in identity if value)
-                band_description = description.removeprefix(f"Pol {identity[1]}, ")
-                label = f"{prefix} [{group or 'Ungrouped'}] {band_description}"
-                color = PBP_GROUP_COLORS[identity_order.index(identity) % len(PBP_GROUP_COLORS)]
-            else:
-                label, color = f"{prefix} {description}", None
-            key = self._band_key(identity)
+            name = self._names[identity[0]]
+            band_description = description.removeprefix(f"Pol {identity[1]}, ")
+            label = f"{prefix} {name} | Pol {identity[1]}, {band_description}"
+            color = owner.plot_ax._get_lines.get_next_color()
+            key = self._band_key()
             owner._plot_pbp_band(
                 x_display, lower, upper, label, polar, density=density,
-                key=key, color=color,
+                key=key, color=color, heatmap=heatmap,
             )
             for artist in owner._plot_item_artists(key):
                 artist._grim_pbp_identity = identity
@@ -635,18 +608,19 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         density: np.ndarray | None = None,
         key=PBP_BAND_KEY,
         color: str | None = None,
+        heatmap: bool = False,
     ) -> None:
-        if color is None and self.pbp_fill_mode in ("heatmap_rcs", "heatmap_density"):
+        if heatmap:
             self._plot_pbp_heatmap(x_values, y_min, y_max, density=density, key=key)
-            (proxy,) = self.plot_ax.plot([], [], color=self.pbp_fill_gray, label=label)
+            (proxy,) = self.plot_ax.plot([], [], color=color, label=label)
             self._register_plot_line(proxy, key)
             return
         fill = self.plot_ax.fill_between(
             x_values,
             y_min,
             y_max,
-            color=color or self.pbp_fill_gray,
-            alpha=1.0 if color is None else 0.35,
+            color=color,
+            alpha=0.35,
             linewidth=0,
             label=label,
         )
@@ -663,34 +637,24 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         density: np.ndarray | None = None,
         key=PBP_BAND_KEY,
         color: str | None = None,
+        heatmap: bool = False,
     ) -> None:
-        """Draw one PBP fill and its edges as one selectable plot item.
-
-        A canvas holds one band per group. Under Hold a new band replaces the
-        old band of the same group and keeps the held curves, which draw above
-        the bands either way.
-        """
-        self._remove_plot_item_artists(key)
+        """Append one PBP fill and its edges as one selectable plot item."""
+        if color is None:
+            color = self.plot_ax._get_lines.get_next_color()
         self._plot_pbp_fill(
-            x_values, lower, upper, label, polar, density=density, key=key, color=color
+            x_values, lower, upper, label, polar, density=density, key=key,
+            color=color, heatmap=heatmap,
         )
         for edge in (lower, upper):
             for line in self._plot_bounded_line(
-                self.plot_ax, x_values, edge, color=color or "#8a8a8a", linewidth=1,
+                self.plot_ax, x_values, edge, color=color, linewidth=1,
                 label="_nolegend_", zorder=1.9,
             ):
                 self._register_plot_line(line, key)
 
-    def _dataset_plot_group(self, dataset) -> str:
-        """Keep selected datasets together in the default PBP band."""
-        return ""
-
     def _new_pbp_bands(self, datasets) -> _PbpBands:
-        groups = {
-            id(dataset): str(self._dataset_plot_group(dataset) or "").strip()
-            for _name, dataset in datasets
-        }
-        return _PbpBands(self, groups)
+        return _PbpBands(self, datasets)
 
     def _pbp_percentiles(self) -> tuple[float, float] | None:
         controls = getattr(self, "analysis_controls", None)

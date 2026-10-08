@@ -229,6 +229,7 @@ class DatasetPlotStyleTest(unittest.TestCase):
 
     def test_hold_overlays_curves_on_pbp_band_in_either_order(self):
         window = self.window
+        self.select_rows(0)
         window.btn_pbp.setChecked(True)
         self.render()
         self.assertEqual(len(window.plot_ax.collections), 1)
@@ -250,16 +251,16 @@ class DatasetPlotStyleTest(unittest.TestCase):
         self.assertTrue(all(curve.get_zorder() > edge.get_zorder()
                             for edge in window.plot_ax.lines if edge in self.band_artists()))
 
-        # A new band under Hold replaces the old one and keeps the held curve.
+        # A new band under Hold preserves the old band and the held curve.
         window.btn_pbp.setChecked(True)
         self.select_rows(0, 1)
         window.list_freq.item(1).setSelected(True)
         self.render()
         self.assertNotIn("blocked", window.status.currentMessage().lower())
-        self.assertEqual(len(window.plot_ax.collections), 1)
+        self.assertEqual(len(window.plot_ax.collections), 3)
         self.assertEqual(len(self.band_artists()), 3)
         self.assertEqual(len(self.lines(self.keys[0])), 1)
-        self.assertEqual(len(self.legend_labels()), 2)
+        self.assertEqual(len(self.legend_labels()), 4)
 
         # Curves first, then a band added under Hold.
         window.btn_hold.setChecked(False)
@@ -268,7 +269,7 @@ class DatasetPlotStyleTest(unittest.TestCase):
         window.btn_hold.setChecked(True)
         window.btn_pbp.setChecked(True)
         self.render()
-        self.assertEqual(len(window.plot_ax.collections), 1)
+        self.assertEqual(len(window.plot_ax.collections), 2)
         self.assertEqual(len(self.lines(self.keys[0])), 2)
         self.assertEqual(len(self.lines(self.keys[1])), 2)
 
@@ -280,6 +281,7 @@ class DatasetPlotStyleTest(unittest.TestCase):
 
     def test_heatmap_band_is_one_removable_item(self):
         window = self.window
+        self.select_rows(0)
         window.pbp_fill_mode = "heatmap_rcs"
         window.btn_pbp.setChecked(True)
         self.render()
@@ -320,6 +322,7 @@ class DatasetPlotStyleTest(unittest.TestCase):
         self.assertEqual(self.lines(self.keys[1]), [])
         self.assertEqual(len(self.lines(self.keys[0])), 2)
 
+        self.select_rows(0)
         window.btn_pbp.setChecked(True)
         self.render()
         window.btn_hold.setChecked(True)
@@ -329,7 +332,7 @@ class DatasetPlotStyleTest(unittest.TestCase):
         self.assertEqual(len(self.legend_labels()), 3)
         remove = self.run_context_menu(self.legend_pos(0), "Remove from plot\tDel")
         menu_titles = [action.text() for action in remove.parent().actions()]
-        self.assertTrue(menu_titles[0].startswith("PBP Pol"))
+        self.assertTrue(menu_titles[0].startswith("PBP Shared name | Pol"))
         self.assertNotIn("Color…", menu_titles)
         remove.trigger()
         self.assertEqual(self.band_artists(), [])

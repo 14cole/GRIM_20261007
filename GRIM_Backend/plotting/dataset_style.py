@@ -23,9 +23,9 @@ _LINE_PROPERTIES = (
 )
 # Plot-item key shared by every artist of one PBP envelope, so a band is
 # selected, highlighted, and removed as one item alongside dataset curves.
-# PBP by group draws one band per group name; the ungrouped band uses "".
-def pbp_band_key(group: str | None = None) -> tuple[str, str]:
-    return ("pbp_band", str(group or ""))
+# The first band uses ""; additional bands have independent instance IDs.
+def pbp_band_key(instance: str | None = None) -> tuple[str, str]:
+    return ("pbp_band", str(instance or ""))
 
 
 def is_pbp_band_key(key) -> bool:
@@ -266,7 +266,7 @@ class DatasetPlotStyleMixin:
         for artist in self._plot_item_artists(key) if artists is None else artists:
             label = _legend_label(artist)
             if label is not None:
-                return label.split(" | ", 1)[0]
+                return label if is_pbp_band_key(key) else label.split(" | ", 1)[0]
         return "PBP band" if is_pbp_band_key(key) else "Dataset"
 
     def _remove_plot_item_artists(self, key) -> list:

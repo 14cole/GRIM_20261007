@@ -3365,9 +3365,9 @@ class DatasetOpsMixin:
         action_zoom_box.setChecked(self._button_checked(getattr(self, "btn_zoom_box", None)))
         menu.addSeparator()
         pbp_menu = menu.addMenu("PBP Fill Mode")
-        action_pbp_gray = pbp_menu.addAction("Gray")
-        action_pbp_gray.setCheckable(True)
-        action_pbp_gray.setChecked(self.pbp_fill_mode == "gray")
+        action_pbp_solid = pbp_menu.addAction("Plot Colors (Transparent)")
+        action_pbp_solid.setCheckable(True)
+        action_pbp_solid.setChecked(self.pbp_fill_mode == "solid")
         action_pbp_rcs = pbp_menu.addAction("Heatmap (RCS Value)")
         action_pbp_rcs.setCheckable(True)
         action_pbp_rcs.setChecked(self.pbp_fill_mode == "heatmap_rcs")
@@ -3418,21 +3418,14 @@ class DatasetOpsMixin:
             btn_zoom_box = getattr(self, "btn_zoom_box", None)
             if btn_zoom_box is not None:
                 btn_zoom_box.setChecked(not btn_zoom_box.isChecked())
-        elif action in (action_pbp_gray, action_pbp_rcs, action_pbp_density):
-            if action == action_pbp_gray:
-                self.pbp_fill_mode = "gray"
+        elif action in (action_pbp_solid, action_pbp_rcs, action_pbp_density):
+            if action == action_pbp_solid:
+                self.pbp_fill_mode = "solid"
             elif action == action_pbp_rcs:
                 self.pbp_fill_mode = "heatmap_rcs"
             else:
                 self.pbp_fill_mode = "heatmap_density"
-            if self.last_plot_mode == "azimuth_rect":
-                self._plot_azimuth_rect()
-            elif self.last_plot_mode == "azimuth_polar":
-                self._plot_azimuth_polar()
-            elif self.last_plot_mode == "frequency":
-                self._plot_frequency()
-            elif self.last_plot_mode == "isar_image":
-                self._plot_isar_image()
+            self._on_analysis_setting_changed("pbp")
 
     def _on_dataset_header_double_clicked(self, section: int) -> None:
         if section != 0:

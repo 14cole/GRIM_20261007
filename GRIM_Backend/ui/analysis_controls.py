@@ -45,7 +45,8 @@ class PlotAnalysisControls(QObject):
         self.combo_pbp_band.addItem("Min–Max", "minmax")
         self.combo_pbp_band.addItem("Percentiles", "percentile")
         self.combo_pbp_band.setToolTip(
-            "Min–Max bounds every selected series; Percentiles bounds the chosen "
+            "Each dataset and polarization gets its own band. Min–Max bounds its "
+            "selected series; Percentiles bounds the chosen "
             "lower and upper percentiles at each point, ignoring outliers."
         )
         self.spin_pbp_low = _percent_spin(10.0, "Lower percentile of the PBP band.")

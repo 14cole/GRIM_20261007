@@ -102,15 +102,18 @@ class MixedDbPlotTests(unittest.TestCase):
         azimuth_rect_mode.render(owner)
         self.assertEqual(owner.plot_ax.get_ylabel(), "Mixed dB")
 
-    def test_pbp_mixed_band_and_held_curve_use_displayed_native_units(self):
+    def test_pbp_separate_bands_and_held_curve_use_displayed_native_units(self):
         owner = self.harness()
         owner.btn_pbp.checked = True
         azimuth_rect_mode.render(owner)
         self.assertIn("updated", owner.status.message)
         self.assertEqual(owner.plot_ax.get_ylabel(), "Mixed dB")
-        band_label = owner.plot_ax.get_legend_handles_labels()[1][0]
-        self.assertIn("dBsm", band_label)
-        self.assertIn("dBke", band_label)
+        band_labels = owner.plot_ax.get_legend_handles_labels()[1]
+        self.assertEqual(len(band_labels), 2)
+        self.assertIn("dBsm", band_labels[0])
+        self.assertNotIn("dBke", band_labels[0])
+        self.assertIn("dBke", band_labels[1])
+        self.assertNotIn("dBsm", band_labels[1])
         owner.btn_hold.checked = True
         owner.btn_pbp.checked = False
         owner._named_datasets = [self.datasets[0]]

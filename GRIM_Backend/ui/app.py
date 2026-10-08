@@ -803,8 +803,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_zoom_box = None
         self.btn_pan = None
         self.btn_auto_scale = None
-        self.pbp_fill_mode = "gray"
-        self.pbp_fill_gray = "#7a7a7a"
+        self.pbp_fill_mode = "solid"
         self.pbp_heatmap_samples = 80
 
         self.table.files_dropped.connect(self._handle_files_dropped)
@@ -1888,8 +1887,9 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                     "elevation, or azimuth) and re-plots at each value."
                 ),
                 "pbp": (
-                    "Point-by-point band across the selected series. Choose "
-                    "Min–Max or percentile bands in Plot Settings."
+                    "Separate point-by-point bands for each dataset and polarization. "
+                    "Hold keeps existing bands and adds the next plot colors. "
+                    "Choose Min–Max or percentile bands in Plot Settings."
                 ),
             }
             if role in tooltips:
