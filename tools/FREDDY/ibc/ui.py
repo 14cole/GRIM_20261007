@@ -1,0 +1,5495 @@
+from __future__ import annotations
+
+import copy
+import json
+from collections.abc import Mapping
+import math
+import os
+import queue
+import random
+import sys
+import threading
+from pathlib import Path
+from typing import Callable, TypeVar
+
+try:
+    import numpy as np
+
+    NUMPY_AVAILABLE = True
+except Exception:
+    np = None  # type: ignore[assignment]
+    NUMPY_AVAILABLE = False
+
+try:
+    import scipy.optimize as _scipy_optimize
+
+    SCIPY_AVAILABLE = True
+except Exception:
+    _scipy_optimize = None  # type: ignore[assignment]
+    SCIPY_AVAILABLE = False
+
+try:
+    from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
+    from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPen
+    from PySide6.QtWidgets import (
+        QApplication,
+        QButtonGroup,
+        QCheckBox,
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
+        QFileDialog,
+        QFrame,
+        QGridLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QListWidget,
+        QMainWindow,
+        QMessageBox,
+        QProgressBar,
+        QPushButton,
+        QScrollArea,
+        QSizePolicy,
+        QStackedWidget,
+        QSplitter,
+        QToolButton,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    QT_AVAILABLE = True
+except Exception:  # pragma: no cover - lets the module import without a GUI toolkit
+    QT_AVAILABLE = False
+    # Minimal fallbacks so module-level class definitions still import; main() raises
+    # a friendly error and any GUI use fails loudly at call time.
+    QObject = QWidget = QMainWindow = QDialog = object  # type: ignore[assignment,misc]
+
+    def Signal(*_args: object, **_kwargs: object) -> None:  # type: ignore[misc]
+        return None
+
+if QT_AVAILABLE:
+    try:
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.figure import Figure
+
+        MPL_AVAILABLE = True
+    except Exception:
+        MPL_AVAILABLE = False
+else:
+    MPL_AVAILABLE = False
+
+
+from .ui_controls import (
+    BooleanVar,
+    StringVar,
+    _FileDialog,
+    _MessageBox,
+    _qt_filter,
+    bind_check_box,
+    bind_combo_box,
+    bind_line_edit,
+    filedialog,
+    make_combo,
+    messagebox,
+)
+
+
+from .mix_analysis import (mix_performance_values, mix_performance_gap,
+                           evaluate_mix_performance, build_mix_display)
+
+from .design_search import (
+    InverseSearchRequest, MixSearchRequest, run_inverse_search, run_mix_search,
+    StopMixSearch, MIX_REFINE_MAX_EVALS, MAX_MIX_RETAINED,
+    score_inverse_candidate,
+)
+
+from .batch import (
+    IbcBatchItem,
+    THICKNESS_UNITS,
+    export_pec_ibc_thickness_batch,
+    ibc_batch_frequency_count,
+    plan_ibc_thickness_batch,
+    validate_ibc_batch_workload,
+)
+from .compute import (
+    INCH_TO_M,
+    MIX_RULE_LABELS,
+    MIX_RULE_DESCRIPTIONS,
+    MIX_RULES,
+    InverseCandidate,
+    LayerConfig,
+    LoadedLayer,
+    MaterialTable,
+    MixCandidate,
+    MixComponent,
+    UncertaintyConfig,
+    align_phase_degrees,
+    blend_density_gcc,
+    build_uncertainty_scales,
+    combine_mix,
+    compute_angle_metrics,
+    compute_angle_metrics_many,
+    compute_stack_impedance_many,
+    interp_complex_many,
+    interp_components_on_grid,
+    is_nominal_scale,
+    make_frequency_sweep,
+    make_sweep,
+    mix_material_tables,
+    mix_model_advisories,
+    normalize_backing,
+    normalize_mix_rule,
+    normalize_wave_polarization,
+    parts_to_fractions,
+    prepare_layer_properties_many,
+    prepare_layer_wave_terms_many,
+    property_match_error,
+    property_match_error_curve,
+    project_bounded_fractions,
+    validate_incidence_angle,
+    validate_fraction_bounds,
+    validate_sweep_coverage,
+    weight_fractions_from_volume,
+)
+from .io import (
+    HZ_PER_GHZ,
+    _atomic_text_file,
+    _validate_csv_path,
+    layer_config_from_dict,
+    layer_config_to_dict,
+    load_project_file,
+    read_material_table,
+    save_project_file,
+    uncertainty_report_path,
+    write_impedance_bundle,
+    write_material_table,
+)
+from .material_explorer import MaterialExplorerWidget, SourceRequest
+from .guide import GuideWidget, MODE_TOPICS
+from .compute import layer_material_label
+from .io import constant_material_from_layer
+from .analysis_data import accumulate_grid_bounds
+from .plot import style_axis, style_colorbar
+
+APP_ACRONYM = "FREDDY"
+APP_NAME = "Frequency-Dependent Reflection and EM Dielectric Dimensional Yield"
+APP_TITLE = f"{APP_ACRONYM} - {APP_NAME}"
+ABOUT_GUIDE_HTML = f"<h2>{APP_ACRONYM}</h2><p>{APP_NAME}</p>" + """
+<h3>Physical scope</h3>
+<p>FREDDY calculates reflection, transmission, absorption, and front-face input
+impedance of an infinite planar material stack. It does not calculate
+finite-object RCS or dBsm. Layers run from the incident side to the backing.</p>
+
+<h3>Angles and polarization</h3>
+<p>Incidence angle is measured from the surface normal: <b>0° is normal incidence
+(broadside)</b>. Angles must be less than 90° because exact grazing has singular
+field normalization. The <b>plane of incidence</b> contains the incoming ray and
+the surface normal.</p>
+<ul>
+<li><b>TE (s):</b> electric field perpendicular to the plane of incidence.</li>
+<li><b>TM (p):</b> electric field within that plane, perpendicular to the incoming ray.</li>
+</ul>
+<p>Choose using the <b>electric-field direction</b>. With a vertical incidence
+plane, TE is horizontal and TM is vertical. FREDDY's HH/VV input aliases mean
+HH = TE and VV = TM; the controls use TE/TM to avoid ambiguity.</p>
+<p><b>Comparing with GHOST:</b> in GHOST's 2D elevation cut, drawing x/y is the
+cross-section and the out-of-plane z span is horizontal. GHOST VV has its electric
+field in x/y (its solver calls this TE); GHOST HH has its electric field along z
+(its solver calls this TM). When the local incidence plane is that cross-section,
+compare <b>GHOST VV with FREDDY TM</b> and <b>GHOST HH with FREDDY TE</b>.
+GHOST's body-of-revolution VV is the meridian-plane electric field; HH is the
+azimuthal electric field. Its rotation axis uses a different coordinate frame.</p>
+<p>For an isotropic stack at normal incidence, TE and TM give the same result.
+At oblique incidence, compare both if the incident polarization is unknown.
+Directional-material principal-axis orientation is a separate layer setting.</p>
+
+<h3>Material convention</h3>
+<p>A material CSV supplies relative
+permittivity and permeability versus frequency using the
+<b>e<sup>+jωt</sup></b> convention. Passive loss therefore has a
+<b>negative imaginary part</b>.</p>
+
+<h3>Material and IBC files</h3>
+<p><b>Constant material layers:</b> in Add Layer or Edit, choose
+<b>Constant εr / μr (all frequencies)</b> and enter the real and signed imaginary
+parts of relative epsilon and mu. For εr = 6 − 0.8j and μr = 1 − 0.1j, enter
+6, −0.8, 1, −0.1. The same values are used at every computed frequency, with
+no interpolation or measured-coverage restriction. They are saved directly in
+the project and work with impedance, angle/thickness sweeps, IBC batches, and
+inverse design. Measured layers in the same stack still require frequency
+coverage. Constant values are an isotropic, nondispersive model; measured CSV
+inputs remain available for frequency-dependent behavior.</p>
+<p>GHOST and FREDDY use <b>comma-separated .csv files with frequency in Hz</b>.
+A header is required. Material inputs and mixed-material exports use:</p>
+<pre>frequency_hz,eps_real,eps_imag,mu_real,mu_imag
+1000000000,3.2,-0.15,1,0</pre>
+<p>Nominal IBC exports and GHOST IBC inputs use:</p>
+<pre>frequency_hz,resistance_ohm,reactance_ohm
+1000000000,120,15</pre>
+<p>1000000000 Hz is 1 GHz. CSV files use Hz even though sweep controls and plots
+show GHz. Epsilon and mu are relative; impedance is in ohms. Headers and column
+order must match these examples. Use finite values and positive, unique
+frequencies. Blank lines and full-line # comments are allowed; UTF-8 files with
+or without a BOM are accepted. Whitespace-delimited and headerless files are
+rejected. Uncertainty, off-angle and thickness CSVs are analysis reports;
+use the nominal three-column CSV when assigning an IBC in GHOST.</p>
+<p><b>File &gt; File Converter:</b> open or drop a CSV or whitespace-delimited
+ASCII table, label its columns, and select input/output units (including Hz,
+kHz, MHz and GHz). Add constant columns for missing values. Preview the
+conversion and save a new file. For a material input, use the five labels above,
+frequency output in Hz, and comma-separated output.</p>
+
+<h3>Material variables</h3>
+<table cellspacing="6" cellpadding="4">
+<tr><th align="left">Variable</th><th align="left">Physical meaning and typical effect</th></tr>
+<tr><td><b>ε′ — eps real</b></td><td>Electric energy storage. Increasing ε′ usually
+shortens wavelength inside the material, increases electrical thickness, and
+moves interference or quarter-wave features to lower frequency. It also changes
+wave impedance and interface reflection.</td></tr>
+<tr><td><b>ε″ — eps imaginary</b></td><td>Electric/dielectric loss. In FREDDY a passive
+material uses ε″ ≤ 0. A more-negative value generally increases attenuation and
+heat produced by electric-field loss, but excessive mismatch can increase front-face reflection.</td></tr>
+<tr><td><b>μ′ — mu real</b></td><td>Magnetic energy storage. Increasing μ′ changes
+both wavelength and wave impedance and can enable a thinner absorber, especially
+when ε and μ are balanced for impedance matching.</td></tr>
+<tr><td><b>μ″ — mu imaginary</b></td><td>Magnetic loss. In FREDDY a passive material
+uses μ″ ≤ 0. A more-negative value increases magnetic-field dissipation; its benefit
+depends on field placement and impedance match.</td></tr>
+<tr><td><b>Thickness</b></td><td>Sets propagation phase and attenuation distance.
+Small thickness changes can move a narrow absorption minimum substantially.</td></tr>
+<tr><td><b>Sheet resistance</b></td><td>Resistance in Ω/square for a zero-thickness
+resistive sheet. It is a shunt surface impedance; values near the applicable wave
+impedance can improve matching when combined with the correct spacing/backing.</td></tr>
+</table>
+
+<h3>How the values work together</h3>
+<p>The approximate normal-incidence material wave impedance is
+η = η<sub>0</sub>√(μ<sub>r</sub>/ε<sub>r</sub>), while refractive index is
+n = √(ε<sub>r</sub>μ<sub>r</sub>). Matching η toward free space reduces the first
+surface reflection; n and thickness determine phase; ε″ and μ″ dissipate energy.
+More loss alone does not guarantee lower reflection.</p>
+
+<h3>Result terminology</h3>
+<ul>
+<li><b>Reflection |Γ| (dB)</b> = 20 log<sub>10</sub>|Γ|. More-negative is less reflected field.</li>
+<li><b>Transmission |S21| (dB)</b> = 20 log<sub>10</sub>|S21|. More-negative is less transmitted field.</li>
+<li><b>Absorbed power (dB)</b> = 10 log<sub>10</sub>(absorbed fraction). 0 dB is 100% absorption.</li>
+<li><b>Resistance/reactance</b> are the real/imaginary parts of front-face input impedance in ohms.</li>
+</ul>
+<p>For coefficient dB, negative means magnitude below 1, zero means magnitude 1,
+and positive means magnitude above 1 (effective gain/non-passive response in
+this air-to-air normalization). PEC-backed reflection uses Γ<sub>metal</sub>;
+air-backed reflection uses Γ<sub>air</sub>; transmission uses S21.</p>
+<p><b>PEC-backed absorbed power:</b>
+10 log<sub>10</sub>(1 − |Γ<sub>metal</sub>|<sup>2</sup>), for a stack on a metal
+ground plane. <b>Air-backed absorbed power:</b>
+10 log<sub>10</sub>(1 − |Γ<sub>air</sub>|<sup>2</sup> − |S21|<sup>2</sup>), for a
+free-standing stack. Both use 0 dB for perfect absorption.</p>
+
+<h3>Optimization quick start</h3>
+<ol>
+<li>Add or edit every bulk layer.</li>
+<li>Enter its <b>minimum thickness, maximum thickness, and thickness step</b>.</li>
+<li>For a resistive sheet, enter resistance minimum, maximum, and step; leave
+minimum/maximum blank to keep it fixed.</li>
+<li>Choose the frequency and angle target, review the combination count, then
+choose <b>Analyze all combinations</b>. Each configured combination is evaluated;
+no seed or refinement is needed.</li>
+</ol>
+<p><b>Scope:</b> results are planar reflection/transmission properties, not finite-object RCS.
+Directional materials support measured principal axes only.</p>
+"""
+
+# --- GRIM blue/slate palette --------------------------------------------
+# The dark theme shares GRIM's exact application chrome colors. The light
+# variant keeps the same blue identity for standalone users who prefer a
+# bright workspace. Plot traces use blue, amber, and violet so adjacent data
+# remains distinguishable without the former red/green theme.
+
+LIGHT_THEME = {
+    "window_bg": "#f1f5f9",
+    "panel_bg": "#e2e8f0",
+    "head_bg": "#dbeafe",
+    "text": "#0f172a",
+    "muted_text": "#475569",
+    "field_bg": "#f8fafc",
+    "field_fg": "#0f172a",
+    "field_disabled_bg": "#cbd5e1",
+    "field_disabled_fg": "#64748b",
+    "button_bg": "#e2e8f0",
+    "button_active_bg": "#bfdbfe",
+    "selection_bg": "#2563eb",
+    "selection_fg": "#ffffff",
+    "accent": "#1d4ed8",
+    "preview_bg": "#f8fafc",
+    "preview_border": "#3b82f6",
+    "preview_outline": "#64748b",
+    "preview_text": "#0f172a",
+    "preview_empty": "#64748b",
+    "preview_layer_text": "#eff6ff",
+    "preview_layer_border": "#f8fafc",
+    "layer_colors": [
+        "#1d4ed8",
+        "#0369a1",
+        "#4f46e5",
+        "#0e7490",
+        "#2563eb",
+        "#475569",
+        "#7c3aed",
+        "#0284c7",
+    ],
+    "plot_bg": "#f8fafc",
+    "plot_axes_bg": "#ffffff",
+    "plot_text": "#0f172a",
+    "plot_spine": "#64748b",
+    "plot_grid": "#cbd5e1",
+    "plot_line_freq": "#0369a1",
+    "plot_line_angle": "#6d28d9",
+    "plot_worst": "#b45309",
+    "plot_crosshair": "#0f172a",
+}
+
+DARK_THEME = {
+    "window_bg": "#0f172a",
+    "panel_bg": "#0b1222",
+    "head_bg": "#172554",
+    "text": "#dbeafe",
+    "muted_text": "#94a3b8",
+    "field_bg": "#0b1222",
+    "field_fg": "#dbeafe",
+    "field_disabled_bg": "#172554",
+    "field_disabled_fg": "#64748b",
+    "button_bg": "#0b1222",
+    "button_active_bg": "#1d4ed8",
+    "selection_bg": "#2563eb",
+    "selection_fg": "#ffffff",
+    "accent": "#3b82f6",
+    "preview_bg": "#0b1222",
+    "preview_border": "#1e3a8a",
+    "preview_outline": "#64748b",
+    "preview_text": "#dbeafe",
+    "preview_empty": "#94a3b8",
+    "preview_layer_text": "#eff6ff",
+    "preview_layer_border": "#0b1222",
+    "layer_colors": [
+        "#1e3a8a",
+        "#1d4ed8",
+        "#172554",
+        "#2563eb",
+        "#1e40af",
+        "#3b82f6",
+        "#334155",
+        "#0284c7",
+    ],
+    "plot_bg": "#0b1222",
+    "plot_axes_bg": "#0b1222",
+    "plot_text": "#dbeafe",
+    "plot_spine": "#1e3a8a",
+    "plot_grid": "#475569",
+    "plot_line_freq": "#38bdf8",
+    "plot_line_angle": "#a78bfa",
+    "plot_worst": "#fbbf24",
+    "plot_crosshair": "#dbeafe",
+}
+
+HEATMAP_METRIC_OPTIONS = [
+    ("PEC-backed reflection |Γ| (dB)", "metal_loss_db"),
+    ("PEC reflection phase (deg)", "metal_phase_deg"),
+    ("PEC absorbed power (dB)", "metal_absorption_db"),
+    ("Air-backed reflection |Γ| (dB)", "air_loss_db"),
+    ("Air reflection phase (deg)", "air_phase_deg"),
+    ("Air absorbed power (dB)", "air_absorption_db"),
+    ("Transmission |S21| (dB)", "insertion_loss_db"),
+    ("Transmission phase (deg)", "insertion_phase_deg"),
+]
+HEATMAP_METRIC_KEYS = [key for _label, key in HEATMAP_METRIC_OPTIONS]
+METRIC_EXPORT_NAMES = {
+    "metal_loss_db": "pec_reflection_db",
+    "metal_phase_deg": "pec_reflection_phase_deg",
+    "metal_absorption_db": "pec_absorbed_power_db",
+    "air_loss_db": "air_reflection_db",
+    "air_phase_deg": "air_reflection_phase_deg",
+    "air_absorption_db": "air_absorbed_power_db",
+    "insertion_loss_db": "transmission_db",
+    "insertion_phase_deg": "transmission_phase_deg",
+}
+PHASE_METRIC_KEYS = {
+    "metal_phase_deg",
+    "air_phase_deg",
+    "insertion_phase_deg",
+}
+# Choices of the retired "Uncertainty view" control. FREDDY no longer reads
+# them; impedance_gui.py still re-exports the name for older scripts.
+UNCERTAINTY_VIEW_OPTIONS = [
+    ("Nominal", "nominal"),
+    ("Min", "min"),
+    ("Max", "max"),
+    ("Span (max-min)", "span"),
+]
+from .ui_options import (
+    INVERSE_SCORE_MODE_OPTIONS,
+    INVERSE_SCORE_WHOLE_BAND,
+    inverse_requirement_target,
+    MIX_OBJECTIVE_FORWARD,
+    MIX_OBJECTIVE_OPTIONS,
+    MIX_OBJECTIVE_PERFORMANCE,
+    MIX_OBJECTIVE_PROPERTY,
+    MIX_PERFORMANCE_METRIC_OPTIONS,
+    MIX_PERFORMANCE_SPEC_BY_LABEL,
+    MIX_PROP_SOURCE_OPTIONS,
+    MIX_RULE_LABEL_OPTIONS,
+    MIX_SCORE_MODE_OPTIONS,
+)
+# Material Mix predicts a single homogeneous effective layer. Its performance
+# target is therefore deliberately narrower than the separate multilayer-stack
+# inverse-design workflow, and neither workflow calculates finite-object RCS.
+# Corner-aggregation labels for property mismatch or performance gap.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+BUILTIN_MATERIAL_PRESETS = {
+    # Air is exact and is the only bundled material until measured/validated
+    # property data are available. Do not ship generic unvalidated presets.
+    "Air (reference)": str(_PROJECT_ROOT / "materials" / "air_reference.csv"),
+}
+_T = TypeVar("_T")
+
+
+class CollapsibleFrame(QWidget):
+    """A section with a clickable header that shows/hides its body."""
+
+    def __init__(
+        self,
+        text: str,
+        *,
+        expanded: bool = True,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._text = text
+        self._expanded = expanded
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._header = QToolButton()
+        self._header.setObjectName("CollapsibleHeader")
+        self._header.setCursor(Qt.PointingHandCursor)
+        self._header.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self._header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._header.clicked.connect(self.toggle)
+        outer.addWidget(self._header)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        outer.addWidget(separator)
+
+        self.body = QWidget()
+        outer.addWidget(self.body)
+
+        self._refresh_label()
+        self.body.setVisible(expanded)
+
+    def _refresh_label(self) -> None:
+        arrow = "▾" if self._expanded else "▸"
+        self._header.setText(f"{arrow}  {self._text}")
+
+    def toggle(self) -> None:
+        if self._expanded:
+            self.collapse()
+        else:
+            self.expand()
+
+    def expand(self) -> None:
+        if self._expanded:
+            return
+        self._expanded = True
+        self._refresh_label()
+        self.body.setVisible(True)
+
+    def collapse(self) -> None:
+        if not self._expanded:
+            return
+        self._expanded = False
+        self._refresh_label()
+        self.body.setVisible(False)
+
+
+class LayerPreview(QWidget):
+    """Canvas-like widget that delegates painting to a callback."""
+
+    def __init__(
+        self,
+        paint_cb: Callable[[QPainter], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._paint_cb = paint_cb
+        self.setMinimumSize(250, 250)
+        self.setObjectName("LayerPreview")
+
+    def paintEvent(self, _event: object) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        try:
+            self._paint_cb(painter)
+        finally:
+            painter.end()
+
+    def resizeEvent(self, event: object) -> None:
+        super().resizeEvent(event)
+        self.update()
+
+
+from .ui_dialogs import (
+    LayerDialog,
+    MixComponentDialog,
+    SheetDialog,
+    _parse_optional_thickness,
+)
+
+
+from .inverse_workflow import InverseWorkflowMixin, StopInverseSearch, search_identity, check_layers
+from .inverse_grid import DesignGrid
+from .inverse_results import InverseResultsMixin
+from .analysis_workflow import AnalysisWorkflowMixin, stack_description, tolerance_description
+from .analysis_data import (SweepResult, grid_metrics, impedance_result, reflection_from_impedance,
+                            extra_polarization, file_digest, expected_ibc_digest)
+
+
+from .project_state import ProjectStateMixin
+
+
+def _entry(var: StringVar, chars: int | None = None) -> QLineEdit:
+    edit = QLineEdit()
+    bind_line_edit(var, edit)
+    if chars is not None:
+        edit.setMaximumWidth(chars * 9 + 16)
+    return edit
+
+
+def _output_row(
+    var: StringVar,
+    browse_cb: Callable[[], None],
+    label: str = "Output file",
+) -> QWidget:
+    row = QWidget()
+    row_layout = QHBoxLayout(row)
+    row_layout.setContentsMargins(0, 0, 0, 0)
+    row_layout.addWidget(QLabel(label))
+    row_layout.addWidget(_entry(var), 1)
+    browse = QPushButton("Browse")
+    browse.clicked.connect(browse_cb)
+    row_layout.addWidget(browse)
+    return row
+
+
+def _uncertainty_group(enabled_var, t_var, eps_var, mu_var, sync_cb):
+    group = QGroupBox("Uncertainty corners")
+    grid = QGridLayout(group)
+    check = QCheckBox(
+        "Enable analyzed tolerance corners"
+    )
+    bind_check_box(enabled_var, check)
+    check.clicked.connect(sync_cb)
+    grid.addWidget(check, 0, 0, 1, 6, Qt.AlignLeft)
+    details = QWidget()
+    dgrid = QGridLayout(details)
+    dgrid.setContentsMargins(0, 0, 0, 0)
+    dgrid.addWidget(QLabel("Thickness ±%"), 0, 0, Qt.AlignLeft)
+    t_entry = _entry(t_var, 8)
+    dgrid.addWidget(t_entry, 0, 1, Qt.AlignLeft)
+    dgrid.addWidget(QLabel("Eps ±%"), 0, 2, Qt.AlignLeft)
+    eps_entry = _entry(eps_var, 8)
+    dgrid.addWidget(eps_entry, 0, 3, Qt.AlignLeft)
+    dgrid.addWidget(QLabel("Mu ±%"), 0, 4, Qt.AlignLeft)
+    mu_entry = _entry(mu_var, 8)
+    dgrid.addWidget(mu_entry, 0, 5, Qt.AlignLeft)
+    dgrid.setColumnStretch(6, 1)
+    grid.addWidget(details, 1, 0, 1, 6)
+    return group, details, t_entry, eps_entry, mu_entry
+
+
+class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin, InverseWorkflowMixin, QMainWindow):
+    # Host integrations may consume this deliberately narrow artifact stream.
+    # It is never emitted for off-angle/thickness analysis, uncertainty, or a
+    # multi-file IBC batch with no unambiguous current file. ``kind`` is exactly
+    # ``ibc`` or ``material`` and the second value is the absolute path of one
+    # solver-compatible nominal CSV.
+    nominal_artifact_exported = Signal(str, str)
+    # Emitted when an operation intentionally has no singular attachable
+    # result. Embedding hosts must discard any previously remembered artifact.
+    nominal_artifact_cleared = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Build the FREDDY workspace as a window or an embedded child widget."""
+        super().__init__(parent)
+        self.setWindowTitle(APP_TITLE)
+        self.resize(1180, 820)
+        self.setMinimumSize(960, 640)
+
+        self.layers: list[LayerConfig] = []
+
+        self.f_start_var = StringVar("1.0")
+        self.f_stop_var = StringVar("18.0")
+        self.f_step_var = StringVar("0.1")
+        # A PEC-backed front-face input impedance is the safe default for
+        # collapsing a coating onto a Type 2 RCS body.
+        self.backing_var = StringVar("pec")
+        self.output_var = StringVar("impedance_out.csv")
+        # Nominal IBC batch: one PEC-backed broadside solver CSV per selected-
+        # layer thickness. The frequency grid is deliberately shared with the
+        # single Impedance mode above.
+        self.ibc_batch_layer_var = StringVar("")
+        self.ibc_batch_start_var = StringVar("0.015")
+        self.ibc_batch_stop_var = StringVar("0.030")
+        self.ibc_batch_step_var = StringVar("0.001")
+        self.ibc_batch_unit_var = StringVar("in")
+        self.ibc_batch_output_dir_var = StringVar(".")
+        self.ibc_batch_prefix_var = StringVar("ibc")
+        self.uncertainty_var = BooleanVar(False)
+        self.unc_t_pct_var = StringVar("5.0")
+        self.unc_eps_pct_var = StringVar("5.0")
+        self.unc_mu_pct_var = StringVar("5.0")
+        # Off Angle tab keeps its own frequency sweep, output, and uncertainty.
+        self.angle_f_start_var = StringVar("1.0")
+        self.angle_f_stop_var = StringVar("18.0")
+        self.angle_f_step_var = StringVar("0.1")
+        self.angle_start_var = StringVar("0.0")
+        self.angle_stop_var = StringVar("80.0")
+        self.angle_step_var = StringVar("1.0")
+        self.wave_pol_var = StringVar("TE")
+        self.angle_output_var = StringVar("angle_out.csv")
+        self.angle_uncertainty_var = BooleanVar(False)
+        self.angle_unc_t_pct_var = StringVar("5.0")
+        self.angle_unc_eps_pct_var = StringVar("5.0")
+        self.angle_unc_mu_pct_var = StringVar("5.0")
+        # Thickness tab: sweep one layer's thickness against frequency at a
+        # fixed incidence angle. Every other layer stays as configured.
+        self.thk_f_start_var = StringVar("1.0")
+        self.thk_f_stop_var = StringVar("18.0")
+        self.thk_f_step_var = StringVar("0.1")
+        self.thk_start_var = StringVar("0.01")
+        self.thk_stop_var = StringVar("0.25")
+        self.thk_step_var = StringVar("0.005")
+        self.thk_layer_var = StringVar("")
+        self.thk_angle_var = StringVar("0.0")
+        self.thk_wave_pol_var = StringVar("TE")
+        self.thk_output_var = StringVar("thickness_out.csv")
+        self.thk_uncertainty_var = BooleanVar(False)
+        self.thk_unc_t_pct_var = StringVar("5.0")
+        self.thk_unc_eps_pct_var = StringVar("5.0")
+        self.thk_unc_mu_pct_var = StringVar("5.0")
+        # Color limits of the Material Mix performance map.
+        self.cbar_auto_var = BooleanVar(True)
+        self.cbar_min_var = StringVar("")
+        self.cbar_max_var = StringVar("")
+        self.inv_freq_mode_var = StringVar("Band sweep")
+        self.inv_freq_list_var = StringVar("8.0, 10.0, 12.0")
+        self.inv_target_start_var = StringVar("8.0")
+        self.inv_target_stop_var = StringVar("12.0")
+        self.inv_target_step_var = StringVar("0.25")
+        self.inv_angle_start_var = StringVar("0.0")
+        self.inv_angle_stop_var = StringVar("80.0")
+        self.inv_angle_step_var = StringVar("5.0")
+        self.inv_wave_pol_var = StringVar("TE")
+        # Legacy project fields; exhaustive analysis ignores budget, seed, and refinement.
+        self.inv_max_evals_var = StringVar("400")
+        self.inv_top_n_var = StringVar("10")
+        self.inv_percentile_var = StringVar("10")
+        self.inv_uncertainty_var = BooleanVar(True)
+        self.inv_unc_t_pct_var = StringVar("5.0")
+        self.inv_unc_eps_pct_var = StringVar("5.0")
+        self.inv_unc_mu_pct_var = StringVar("5.0")
+        self.inv_score_mode_var = StringVar(INVERSE_SCORE_MODE_OPTIONS[0])
+        self.inv_requirement_db_var = StringVar('-10')
+        self.inv_refine_var = BooleanVar(True)
+        self.inv_seed_var = StringVar("1")
+        # Material Mix tab: predict effective properties from a volume recipe or
+        # find bounded volume-fraction recipes for properties/planar performance.
+        self.mix_components: list[dict] = []
+        self.mix_rule_var = StringVar(MIX_RULE_LABEL_OPTIONS[0])
+        self.mix_objective_var = StringVar(MIX_OBJECTIVE_OPTIONS[0])
+        self.mix_thickness_var = StringVar("0.125")
+        self.mix_freq_mode_var = StringVar("Band sweep")
+        self.mix_freq_list_var = StringVar("8.0, 10.0, 12.0")
+        self.mix_target_start_var = StringVar("0.1")
+        self.mix_target_stop_var = StringVar("18.0")
+        self.mix_target_step_var = StringVar("0.1")
+        # Property-design target: constants or a measured 5-column material
+        # file, plus eps/mu weighting for the match error.
+        self.mix_prop_source_var = StringVar(MIX_PROP_SOURCE_OPTIONS[0])
+        self.mix_prop_eps_re_var = StringVar("7.0")
+        self.mix_prop_eps_im_var = StringVar("-0.5")
+        self.mix_prop_mu_re_var = StringVar("1.0")
+        self.mix_prop_mu_im_var = StringVar("0.0")
+        self.mix_prop_file_var = StringVar("")
+        self.mix_prop_weps_var = StringVar("1.0")
+        self.mix_prop_wmu_var = StringVar("1.0")
+        self.mix_perf_metric_var = StringVar(MIX_PERFORMANCE_METRIC_OPTIONS[0][0])
+        self.mix_perf_target_var = StringVar("-10.0")
+        self.mix_perf_angle_start_var = StringVar("0.0")
+        self.mix_perf_angle_stop_var = StringVar("60.0")
+        self.mix_perf_angle_step_var = StringVar("5.0")
+        self.mix_perf_wave_pol_var = StringVar("TE")
+        self.mix_max_evals_var = StringVar("400")
+        self.mix_top_n_var = StringVar("10")
+        self.mix_seed_var = StringVar("")
+        self.mix_refine_var = BooleanVar(True)
+        self.mix_score_mode_var = StringVar(MIX_SCORE_MODE_OPTIONS[0])
+        self.mix_uncertainty_var = BooleanVar(False)
+        self.mix_unc_t_pct_var = StringVar("5.0")
+        self.mix_unc_eps_pct_var = StringVar("5.0")
+        self.mix_unc_mu_pct_var = StringVar("5.0")
+        self.dark_mode_var = BooleanVar(True)
+        self.project_path: Path | None = None
+        self._clean_project_state: dict[str, object] | None = None
+        self.inverse_candidates: list[InverseCandidate] = []
+        self._colors = DARK_THEME
+        self._host_theme_override: dict[str, object] | None = None
+
+        # Plot objects are created in _build_ui(). Initialize here so early callbacks are safe.
+        self.fig = None
+        self.ax_heatmap = None
+        self.ax_freq_slice = None
+        self.ax_angle_slice = None
+        self.canvas = None
+        self.plot_frame = None
+        self.heatmap_cbar = None
+        self.inv_results_list = None
+        self.inv_parameter_summary_label: QLabel | None = None
+        self.left_tabs = None
+        self.mode_stack = None
+        self.nav_group = None
+        self.dark_mode_action = None
+        self.view_menu = None
+        self._mode_labels: list[str] = []
+        self.material_explorer: MaterialExplorerWidget | None = None
+        self.layers_group = None
+        self.results_pane = None
+        self.work_split = None
+        self._solver_split_sizes = [320, 380]
+        self.angle_tab = None
+        self.thickness_tab = None
+        self.thk_layer_combo = None
+        self.ibc_batch_layer_combo = None
+        self.ibc_batch_preview_label = None
+        self.ibc_batch_export_btn = None
+        self.thk_unc_details_frame = None
+        self.thk_unc_t_entry = None
+        self.thk_unc_eps_entry = None
+        self.thk_unc_mu_entry = None
+        self.inv_tab = None
+        self.inv_unc_t_entry = None
+        self.inv_unc_eps_entry = None
+        self.inv_unc_mu_entry = None
+        self.inv_percentile_entry = None
+        self.inv_target_start_entry = None
+        self.inv_target_stop_entry = None
+        self.inv_target_step_entry = None
+        self.inv_freq_list_entry = None
+        self.layer_add_btn = None
+        self.layer_add_sheet_btn = None
+        self.layer_edit_btn = None
+        self.layer_remove_btn = None
+        self.layer_up_btn = None
+        self.layer_down_btn = None
+        self.compute_btn = None
+        self.coating_check_btn = None
+        self.angle_compute_btn = None
+        self.thk_compute_btn = None
+        self.inv_run_btn = None
+        self.inv_apply_btn = None
+        self.status_var = StringVar("Ready")
+        self.status_progress = None
+        self._task_running = False
+
+        self.inverse_plot_freqs: list[float] = []
+        self.inverse_plot_samples: list[list[list[float]]] = []
+
+        # Material Mix tab widget handles and result state.
+        self.mix_tab = None
+        self.mix_list: QListWidget | None = None
+        self.mix_results_list: QListWidget | None = None
+        self.mix_results_frame = None
+        self.mix_search_frame = None
+        self.mix_model_help_label: QLabel | None = None
+        self.mix_workflow_help_label: QLabel | None = None
+        self.mix_summary_label: QLabel | None = None
+        self.mix_candidates: list[MixCandidate] = []
+        self.mix_preview: dict | None = None
+        self.mix_plot_data: list[dict] = []
+        self.mix_add_btn = None
+        self.mix_edit_btn = None
+        self.mix_remove_btn = None
+        self.mix_run_btn = None
+        self.mix_preview_btn = None
+        self.mix_apply_btn = None
+        self.mix_export_btn = None
+        self.mix_stop_btn = None
+        self.mix_budget_note = None
+        self._mix_stop_event = threading.Event()
+        self._mix_active = False
+        self._mix_progress = None
+        self._mix_input_revision = 0
+        self.mix_target_start_entry = None
+        self.mix_target_stop_entry = None
+        self.mix_target_step_entry = None
+        self.mix_freq_list_entry = None
+        self.mix_unc_t_entry = None
+        self.mix_unc_eps_entry = None
+        self.mix_unc_mu_entry = None
+        self.mix_prop_frame = None
+        self.mix_perf_frame = None
+        self.mix_perf_requirement_label: QLabel | None = None
+        self.mix_prop_const_entries: list = []
+        self.mix_prop_file_entry = None
+        self.mix_prop_browse_btn = None
+
+        self._build_ui()
+        self._apply_theme()
+        # A material layer must come from an explicit user action or project.
+        # Auto-loading ``material.csv`` from the process working directory made
+        # the physics stack depend silently on how GRIM/FREDDY was launched.
+        self._mark_project_clean()
+
+    def job_is_running(self) -> bool:
+        """Return whether FREDDY currently owns an active background job."""
+        return bool(self._task_running)
+
+    def _publish_nominal_artifact(self, kind: str, path: Path | str) -> None:
+        """Publish one validated, solver-facing CSV to an embedding host.
+
+        Keeping this whitelist at FREDDY's authoritative export boundary makes
+        it impossible for analysis-only CSVs to enter a GHOST material table
+        merely because their filenames also end in ``.csv``.
+        """
+
+        artifact_kind = str(kind).strip().lower()
+        if artifact_kind not in {"ibc", "material"}:
+            raise ValueError(
+                "Attachable FREDDY artifacts must be nominal IBC or material CSVs."
+            )
+        artifact_path = Path(path).expanduser().resolve()
+        if artifact_path.suffix.lower() != ".csv" or not artifact_path.is_file():
+            raise ValueError(
+                f"Attachable FREDDY artifact is not a readable CSV: {artifact_path}"
+            )
+        self.nominal_artifact_exported.emit(
+            artifact_kind, str(artifact_path)
+        )
+
+    def can_close(self) -> bool:
+        """Return whether a host may safely remove or close this workspace."""
+        return not self.job_is_running()
+
+    def _mark_project_clean(self) -> None:
+        self._clean_project_state = copy.deepcopy(self._collect_project_state())
+
+    def is_dirty(self) -> bool:
+        clean = self._clean_project_state
+        return clean is not None and self._collect_project_state() != clean
+
+    def request_close(self, parent: QWidget | None = None) -> bool:
+        """Resolve unsaved native project state before a host closes."""
+
+        if not self.is_dirty():
+            return True
+        buttons = getattr(QMessageBox, "StandardButton", QMessageBox)
+        shown_name = self.project_path.name if self.project_path else "Untitled FREDDY project"
+        answer = QMessageBox.warning(
+            parent or self,
+            "Unsaved FREDDY Project",
+            f"'{shown_name}' has unsaved material-stack or project changes. "
+            "Save them before closing?",
+            buttons.Save | buttons.Discard | buttons.Cancel,
+            buttons.Save,
+        )
+        if answer == buttons.Cancel:
+            return False
+        if answer == buttons.Save:
+            return self._save_project()
+        return True
+
+    def _confirm_output_replacements(
+        self, paths: list[Path], *, operation: str
+    ) -> bool:
+        """Preflight every output on the GUI thread before starting a worker."""
+
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for raw_path in paths:
+            path = Path(raw_path).expanduser()
+            key = os.path.normcase(os.path.abspath(path)).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+
+        invalid = [path for path in unique if path.exists() and not path.is_file()]
+        if invalid:
+            messagebox.showerror(
+                f"{operation} Output",
+                "An output path is not a file:\n" + "\n".join(str(p) for p in invalid),
+                parent=self,
+            )
+            return False
+        existing = [path for path in unique if path.is_file()]
+        if not existing:
+            return True
+        shown = "\n".join(str(path.resolve()) for path in existing[:10])
+        if len(existing) > 10:
+            shown += f"\n…and {len(existing) - 10} more"
+        return messagebox.askyesno(
+            f"Replace Existing {operation} Output?",
+            f"{len(existing)} output file(s) already exist:\n\n{shown}\n\n"
+            "Replace all listed files?",
+            parent=self,
+        )
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        """Keep standalone FREDDY alive until its background write finishes."""
+        if self.job_is_running():
+            QMessageBox.warning(
+                self,
+                "FREDDY Task Still Running",
+                "A FREDDY material or IBC task is still running. Wait for it "
+                "to finish before closing FREDDY.",
+            )
+            event.ignore()
+            return
+        if not self.request_close(self):
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _open_file_converter(self) -> None:
+        from .converter_dialog import FileConverterDialog
+        dialog = FileConverterDialog(self)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def _build_ui(self) -> None:
+
+        # Global actions live in a menu bar (File / View) rather than an
+        # inline button row, and the window is organized as a left navigation
+        # rail driving a stacked workspace above a full-width results band.
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("File")
+        load_action = QAction("Load Project…", self)
+        load_action.triggered.connect(self._load_project)
+        file_menu.addAction(load_action)
+        save_action = QAction("Save Project…", self)
+        save_action.triggered.connect(self._save_project)
+        file_menu.addAction(save_action)
+        self.file_converter_action = QAction("File Converter…", self)
+        self.file_converter_action.triggered.connect(self._open_file_converter)
+        file_menu.addAction(self.file_converter_action)
+        self.view_menu = menubar.addMenu("View")
+        self.dark_mode_action = QAction("Dark mode", self)
+        self.dark_mode_action.setCheckable(True)
+        self.dark_mode_action.setChecked(self.dark_mode_var.get())
+        self.dark_mode_action.toggled.connect(self.dark_mode_var.set)
+        self.dark_mode_var.valueChanged.connect(self.dark_mode_action.setChecked)
+        self.dark_mode_var.valueChanged.connect(lambda _v: self._apply_theme())
+        self.view_menu.addAction(self.dark_mode_action)
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        nav = QFrame()
+        nav.setObjectName("NavRail")
+        nav.setFixedWidth(166)
+        nav_layout = QVBoxLayout(nav)
+        nav_layout.setContentsMargins(10, 14, 10, 14)
+        nav_layout.setSpacing(4)
+        brand = QLabel(APP_ACRONYM)
+        brand.setObjectName("NavBrand")
+        nav_layout.addWidget(brand)
+        nav_layout.addSpacing(10)
+        root_layout.addWidget(nav)
+
+        self.mode_stack = QStackedWidget()
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
+        self._mode_labels = []
+
+        def _add_mode(label: str, page: QWidget) -> None:
+            index = self.mode_stack.count()
+            self.mode_stack.addWidget(page)
+            button = QToolButton()
+            button.setObjectName("ModeNavButton")
+            button.setText(label.replace("&", "&&"))
+            button.setCheckable(True)
+            button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            if index == 0:
+                button.setChecked(True)
+            self.nav_group.addButton(button, index)
+            nav_layout.addWidget(button)
+            self._mode_labels.append(label)
+
+
+        self._build_impedance_tab(_add_mode)
+
+        self._build_ibc_batch_tab(_add_mode)
+
+        self._build_angle_tab(_add_mode)
+
+        self._build_thickness_tab(_add_mode)
+
+        self._build_inverse_tab(_add_mode)
+
+        self._build_mix_tab(_add_mode)
+
+        from .tolerance_ui import ToleranceWidget
+        self.tolerance_workspace = ToleranceWidget(self)
+        _add_mode('Sensitivity & Yield', self.tolerance_workspace)
+
+        # Material Explorer is informational and session-only. It deliberately
+        # lives inside FREDDY so the same workspace appears in GRIM and in the
+        # standalone launcher, while its file list stays out of project state.
+        self.material_explorer = MaterialExplorerWidget(
+            presets=BUILTIN_MATERIAL_PRESETS,
+            stack_source_provider=self._material_explorer_stack_sources,
+            mix_source_provider=self._material_explorer_mix_sources,
+        )
+        _add_mode("Material Explorer", self.material_explorer)
+
+        # One read-only home for application help and material definitions.
+        # It does not participate in project state or show analysis controls.
+        self.guide = GuideWidget(ABOUT_GUIDE_HTML)
+        self.guide.mode_requested.connect(self._open_guide_workflow)
+        _add_mode("About & Guide", self.guide)
+        self.guide_action = QAction("Workflow help", self)
+        self.guide_action.setShortcut("F1")
+        self.guide_action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        self.guide_action.triggered.connect(lambda: self._show_guide())
+        self.addAction(self.guide_action)
+        guide_hint = QLabel("F1 · workflow help")
+        guide_hint.setWordWrap(True)
+        nav_layout.addWidget(guide_hint)
+
+        layers_group = QGroupBox("Layers (top to bottom)")
+        self.layers_group = layers_group
+        layers_layout = QHBoxLayout(layers_group)
+        self.layer_list = QListWidget()
+        self.layer_list.setMinimumHeight(200)
+        layers_layout.addWidget(self.layer_list, 1)
+
+        preview_container = QWidget()
+        preview_layout = QVBoxLayout(preview_container)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.addWidget(QLabel("Visual stack (real-time)"))
+        self.layer_preview = LayerPreview(self._draw_layer_preview)
+        preview_layout.addWidget(self.layer_preview, 1)
+        layers_layout.addWidget(preview_container, 1)
+
+        btns = QWidget()
+        btns_layout = QVBoxLayout(btns)
+        btns_layout.setContentsMargins(0, 0, 0, 0)
+        self.layer_add_btn = QPushButton("Add Layer")
+        self.layer_add_btn.clicked.connect(self._add_layer)
+        btns_layout.addWidget(self.layer_add_btn)
+        self.layer_add_sheet_btn = QPushButton("Add Sheet")
+        self.layer_add_sheet_btn.clicked.connect(self._add_sheet)
+        btns_layout.addWidget(self.layer_add_sheet_btn)
+        self.layer_edit_btn = QPushButton("Edit")
+        self.layer_edit_btn.clicked.connect(self._edit_layer)
+        btns_layout.addWidget(self.layer_edit_btn)
+        self.layer_remove_btn = QPushButton("Remove")
+        self.layer_remove_btn.clicked.connect(self._remove_layer)
+        btns_layout.addWidget(self.layer_remove_btn)
+        self.layer_up_btn = QPushButton("Move Up")
+        self.layer_up_btn.clicked.connect(self._move_up)
+        btns_layout.addWidget(self.layer_up_btn)
+        self.layer_down_btn = QPushButton("Move Down")
+        self.layer_down_btn.clicked.connect(self._move_down)
+        btns_layout.addWidget(self.layer_down_btn)
+        btns_layout.addStretch(1)
+        layers_layout.addWidget(btns)
+        # Finish the navigation rail and wire mode switching.
+        nav_layout.addStretch(1)
+        self.nav_group.idClicked.connect(self._select_mode)
+        self.mode_stack.currentChanged.connect(self._on_left_tab_changed)
+
+        # Vertical workspace splitter: parameter inputs and the material stack
+        # share the top band; the visualization spans the full width below.
+        work_split = QSplitter(Qt.Vertical)
+        self.work_split = work_split
+
+        top_pane = QWidget()
+        top_layout = QHBoxLayout(top_pane)
+        top_layout.setContentsMargins(12, 12, 12, 6)
+        top_layout.addWidget(self.mode_stack, 3)
+        top_layout.addWidget(layers_group, 2)
+        work_split.addWidget(top_pane)
+
+        bottom_pane = QWidget()
+        self.results_pane = bottom_pane
+        right_layout = QVBoxLayout(bottom_pane)
+        right_layout.setContentsMargins(12, 6, 12, 12)
+        work_split.addWidget(bottom_pane)
+
+        # Every other mode has its own results workspace, so this band only
+        # shows Material Mix. Its color scale applies to the performance map.
+        plot_opts = QGroupBox("Plot Controls")
+        opts_row = QHBoxLayout(plot_opts)
+        cbar_auto_check = QCheckBox("Auto color scale")
+        cbar_auto_check.setToolTip(
+            "Clear to fix the performance map's color limits, so blends "
+            "compare on one scale."
+        )
+        bind_check_box(self.cbar_auto_var, cbar_auto_check)
+        cbar_auto_check.clicked.connect(self._sync_cbar_state)
+        opts_row.addWidget(cbar_auto_check)
+        opts_row.addWidget(QLabel("Min"))
+        self.cbar_min_entry = _entry(self.cbar_min_var, 10)
+        self.cbar_min_entry.returnPressed.connect(self._update_plot)
+        opts_row.addWidget(self.cbar_min_entry)
+        opts_row.addWidget(QLabel("Max"))
+        self.cbar_max_entry = _entry(self.cbar_max_var, 10)
+        self.cbar_max_entry.returnPressed.connect(self._update_plot)
+        opts_row.addWidget(self.cbar_max_entry)
+        for entry in (self.cbar_min_entry, self.cbar_max_entry):
+            entry.setToolTip("Performance-map color limit. Press Enter to apply.")
+        opts_row.addStretch(1)
+        save_plot_btn = QPushButton("Save Plot")
+        save_plot_btn.clicked.connect(self._save_plot)
+        opts_row.addWidget(save_plot_btn)
+        right_layout.addWidget(plot_opts)
+        self._sync_cbar_state()
+
+        self.plot_frame = QGroupBox("Material Mix")
+        plot_frame_layout = QVBoxLayout(self.plot_frame)
+        plot_frame_layout.setContentsMargins(4, 4, 4, 4)
+        if MPL_AVAILABLE:
+            self.fig = Figure(figsize=(8.0, 4.6), dpi=100)
+            # The main Mix view (ε/μ curves or the performance map) fills the
+            # left column; two supporting plots stack in the right column.
+            gs = self.fig.add_gridspec(
+                2, 2, width_ratios=[2.3, 1.0], wspace=0.5, hspace=0.85
+            )
+            self.ax_heatmap = self.fig.add_subplot(gs[:, 0])
+            self.ax_freq_slice = self.fig.add_subplot(gs[0, 1])
+            self.ax_angle_slice = self.fig.add_subplot(gs[1, 1])
+            self.canvas = FigureCanvas(self.fig)
+            self.heatmap_cbar = None
+            plot_frame_layout.addWidget(self.canvas)
+            self._update_mix_plot()
+        else:
+            self.fig = None
+            self.ax_heatmap = None
+            self.ax_freq_slice = None
+            self.ax_angle_slice = None
+            self.canvas = None
+            self.heatmap_cbar = None
+            plot_frame_layout.addWidget(
+                QLabel("Matplotlib not available. Install matplotlib to enable plotting.")
+            )
+        right_layout.addWidget(self.plot_frame, 1)
+
+        work_split.setStretchFactor(0, 0)
+        work_split.setStretchFactor(1, 1)
+        work_split.setSizes([320, 380])
+        self._build_inverse_results_workspace(work_split, root_layout)
+        self._build_analysis_workspaces()
+
+        # Status text and the busy indicator live in the window status bar.
+        self.status_label = QLabel(self.status_var.get())
+        self.status_var.valueChanged.connect(self.status_label.setText)
+        self.statusBar().addWidget(self.status_label)
+        self.status_progress = QProgressBar()
+        self.status_progress.setRange(0, 0)
+        self.status_progress.setMaximumWidth(120)
+        self.status_progress.setVisible(False)
+        self.statusBar().addPermanentWidget(self.status_progress)
+
+        self._sync_uncertainty_state()
+        self._sync_angle_uncertainty_state()
+        self._sync_thickness_uncertainty_state()
+        self._sync_inverse_freq_mode_state()
+        self._sync_inverse_uncertainty_state()
+        self._sync_mix_freq_mode_state()
+        self._sync_mix_uncertainty_state()
+        self._sync_mix_objective_state()
+        self._refresh_mix_components_list()
+        self._refresh_thickness_layers()
+        self._sync_mode_chrome()
+
+    def _build_impedance_tab(self, _add_mode) -> None:
+        """Construct the impedance sweep and backing controls."""
+        imp_tab = QWidget()
+        imp_layout = QVBoxLayout(imp_tab)
+        _add_mode("Impedance", imp_tab)
+
+        imp_freq_group = QGroupBox("Frequency sweep")
+        imp_freq_grid = QGridLayout(imp_freq_group)
+        imp_freq_grid.addWidget(QLabel("Start (GHz)"), 0, 0, Qt.AlignLeft)
+        imp_freq_grid.addWidget(_entry(self.f_start_var, 10), 0, 1, Qt.AlignLeft)
+        imp_freq_grid.addWidget(QLabel("Stop"), 0, 2, Qt.AlignLeft)
+        imp_freq_grid.addWidget(_entry(self.f_stop_var, 10), 0, 3, Qt.AlignLeft)
+        imp_freq_grid.addWidget(QLabel("Step"), 0, 4, Qt.AlignLeft)
+        imp_freq_grid.addWidget(_entry(self.f_step_var, 10), 0, 5, Qt.AlignLeft)
+        self.backing_label = QLabel("Backing")
+        imp_freq_grid.addWidget(self.backing_label, 1, 0, Qt.AlignLeft)
+        self.backing_combo = make_combo(("pec", "air"), self.backing_var, width=110)
+        self.backing_combo.setToolTip(
+            "PEC: front-face impedance of a coating on a conductor; suitable "
+            "for a scalar Type 2 IBC on the OUTER coating envelope in 2D/BoR. "
+            "Check the angle approximation before replacing bulk layers.\n"
+            "air: planar air-terminated input impedance for analysis; it is "
+            "not a general one-sided IBC for a closed transmitting body."
+        )
+        imp_freq_grid.addWidget(self.backing_combo, 1, 1, 1, 3, Qt.AlignLeft)
+        imp_freq_grid.setColumnStretch(5, 1)
+        imp_layout.addWidget(imp_freq_group)
+
+        (
+            imp_unc_group,
+            self.unc_details_frame,
+            self.unc_t_entry,
+            self.unc_eps_entry,
+            self.unc_mu_entry,
+        ) = _uncertainty_group(
+            self.uncertainty_var,
+            self.unc_t_pct_var,
+            self.unc_eps_pct_var,
+            self.unc_mu_pct_var,
+            self._sync_uncertainty_state,
+        )
+        imp_layout.addWidget(imp_unc_group)
+        imp_layout.addWidget(
+            _output_row(
+                self.output_var,
+                self._browse_output,
+                "Nominal 2D/BoR IBC CSV",
+            )
+        )
+
+        imp_btn_row = QHBoxLayout()
+        self.compute_btn = QPushButton("Compute")
+        self.compute_btn.clicked.connect(self._compute_impedance)
+        imp_btn_row.addWidget(self.compute_btn)
+        self.coating_check_btn = QPushButton("Check GHOST coating approximation...")
+        self.coating_check_btn.setToolTip("Compare the PEC-backed stack with its normal-incidence scalar IBC for TE/TM at 0-85 degrees. Uses the frequency sweep above; does not write a CSV or certify finite-body RCS.")
+        self.coating_check_btn.clicked.connect(self._check_ghost_coating)
+        imp_btn_row.addWidget(self.coating_check_btn)
+        imp_btn_row.addStretch(1)
+        imp_layout.addLayout(imp_btn_row)
+        imp_layout.addStretch(1)
+
+
+    def _build_ibc_batch_tab(self, _add_mode) -> None:
+        """Construct the IBC thickness-batch export controls."""
+        ibc_batch_tab = QWidget()
+        ibc_batch_layout = QVBoxLayout(ibc_batch_tab)
+        _add_mode("IBC Batch", ibc_batch_tab)
+
+        ibc_batch_intro = QLabel(
+            "Create one solver-compatible three-column IBC CSV per thickness. "
+            "Only the selected material layer changes; the stack order, other "
+            "layers, and material data stay fixed. Every file is broadside and "
+            "PEC-backed."
+        )
+        ibc_batch_intro.setWordWrap(True)
+        ibc_batch_layout.addWidget(ibc_batch_intro)
+
+        ibc_batch_freq_group = QGroupBox("Frequency sweep (shared with Impedance)")
+        ibc_batch_freq_grid = QGridLayout(ibc_batch_freq_group)
+        ibc_batch_freq_grid.addWidget(QLabel("Start (GHz)"), 0, 0, Qt.AlignLeft)
+        ibc_batch_freq_grid.addWidget(_entry(self.f_start_var, 10), 0, 1, Qt.AlignLeft)
+        ibc_batch_freq_grid.addWidget(QLabel("Stop"), 0, 2, Qt.AlignLeft)
+        ibc_batch_freq_grid.addWidget(_entry(self.f_stop_var, 10), 0, 3, Qt.AlignLeft)
+        ibc_batch_freq_grid.addWidget(QLabel("Step"), 0, 4, Qt.AlignLeft)
+        ibc_batch_freq_grid.addWidget(_entry(self.f_step_var, 10), 0, 5, Qt.AlignLeft)
+        ibc_batch_freq_grid.setColumnStretch(5, 1)
+        ibc_batch_layout.addWidget(ibc_batch_freq_group)
+
+        ibc_batch_sweep_group = QGroupBox("Selected-layer thickness sweep")
+        ibc_batch_sweep_grid = QGridLayout(ibc_batch_sweep_group)
+        ibc_batch_sweep_grid.addWidget(QLabel("Layer"), 0, 0, Qt.AlignLeft)
+        self.ibc_batch_layer_combo = make_combo(
+            (), self.ibc_batch_layer_var, width=260
+        )
+        ibc_batch_sweep_grid.addWidget(
+            self.ibc_batch_layer_combo, 0, 1, 1, 5, Qt.AlignLeft
+        )
+        ibc_batch_sweep_grid.addWidget(QLabel("Start"), 1, 0, Qt.AlignLeft)
+        ibc_batch_sweep_grid.addWidget(
+            _entry(self.ibc_batch_start_var, 10), 1, 1, Qt.AlignLeft
+        )
+        ibc_batch_sweep_grid.addWidget(QLabel("Stop"), 1, 2, Qt.AlignLeft)
+        ibc_batch_sweep_grid.addWidget(
+            _entry(self.ibc_batch_stop_var, 10), 1, 3, Qt.AlignLeft
+        )
+        ibc_batch_sweep_grid.addWidget(QLabel("Step"), 1, 4, Qt.AlignLeft)
+        ibc_batch_sweep_grid.addWidget(
+            _entry(self.ibc_batch_step_var, 10), 1, 5, Qt.AlignLeft
+        )
+        ibc_batch_sweep_grid.addWidget(QLabel("Units"), 2, 0, Qt.AlignLeft)
+        self.ibc_batch_unit_combo = make_combo(
+            THICKNESS_UNITS, self.ibc_batch_unit_var, width=80
+        )
+        ibc_batch_sweep_grid.addWidget(
+            self.ibc_batch_unit_combo,
+            2,
+            1,
+            Qt.AlignLeft,
+        )
+        ibc_batch_sweep_grid.setColumnStretch(5, 1)
+        ibc_batch_layout.addWidget(ibc_batch_sweep_group)
+
+        ibc_batch_output_group = QGroupBox("Output naming")
+        ibc_batch_output_grid = QGridLayout(ibc_batch_output_group)
+        ibc_batch_output_grid.addWidget(QLabel("Folder"), 0, 0, Qt.AlignLeft)
+        ibc_batch_output_grid.addWidget(
+            _entry(self.ibc_batch_output_dir_var), 0, 1, 1, 4
+        )
+        ibc_batch_browse = QPushButton("Browse")
+        ibc_batch_browse.clicked.connect(self._browse_ibc_batch_output_dir)
+        ibc_batch_output_grid.addWidget(ibc_batch_browse, 0, 5)
+        ibc_batch_output_grid.addWidget(QLabel("File prefix"), 1, 0, Qt.AlignLeft)
+        ibc_batch_output_grid.addWidget(
+            _entry(self.ibc_batch_prefix_var), 1, 1, 1, 2
+        )
+        ibc_batch_output_grid.addWidget(
+            QLabel("Pattern: <prefix>_<thickness><unit>.csv"),
+            1,
+            3,
+            1,
+            3,
+            Qt.AlignLeft,
+        )
+        ibc_batch_layout.addWidget(ibc_batch_output_group)
+
+        self.ibc_batch_preview_label = QLabel("")
+        self.ibc_batch_preview_label.setWordWrap(True)
+        ibc_batch_layout.addWidget(self.ibc_batch_preview_label)
+        self.ibc_batch_export_btn = QPushButton("Export IBC batch")
+        self.ibc_batch_export_btn.clicked.connect(self._export_ibc_batch)
+        ibc_batch_layout.addWidget(self.ibc_batch_export_btn, 0, Qt.AlignLeft)
+        ibc_batch_layout.addStretch(1)
+
+        for batch_var in (
+            self.f_start_var,
+            self.f_stop_var,
+            self.f_step_var,
+            self.ibc_batch_layer_var,
+            self.ibc_batch_start_var,
+            self.ibc_batch_stop_var,
+            self.ibc_batch_step_var,
+            self.ibc_batch_unit_var,
+            self.ibc_batch_output_dir_var,
+            self.ibc_batch_prefix_var,
+        ):
+            batch_var.valueChanged.connect(
+                lambda _value: self._refresh_ibc_batch_preview()
+            )
+
+
+    def _build_angle_tab(self, _add_mode) -> None:
+        """Construct the off-angle sweep controls."""
+        angle_tab = QWidget()
+        self.angle_tab = angle_tab
+        angle_layout = QVBoxLayout(angle_tab)
+        _add_mode("Off Angle", angle_tab)
+
+        ang_freq_group = QGroupBox("Frequency sweep")
+        ang_freq_grid = QGridLayout(ang_freq_group)
+        ang_freq_grid.addWidget(QLabel("Start (GHz)"), 0, 0, Qt.AlignLeft)
+        ang_freq_grid.addWidget(_entry(self.angle_f_start_var, 10), 0, 1, Qt.AlignLeft)
+        ang_freq_grid.addWidget(QLabel("Stop"), 0, 2, Qt.AlignLeft)
+        ang_freq_grid.addWidget(_entry(self.angle_f_stop_var, 10), 0, 3, Qt.AlignLeft)
+        ang_freq_grid.addWidget(QLabel("Step"), 0, 4, Qt.AlignLeft)
+        ang_freq_grid.addWidget(_entry(self.angle_f_step_var, 10), 0, 5, Qt.AlignLeft)
+        ang_freq_grid.setColumnStretch(5, 1)
+        angle_layout.addWidget(ang_freq_group)
+
+        angle_group = QGroupBox("Angle sweep")
+        angle_grid = QGridLayout(angle_group)
+        angle_grid.addWidget(QLabel("Start (deg)"), 0, 0, Qt.AlignLeft)
+        angle_grid.addWidget(_entry(self.angle_start_var, 10), 0, 1, Qt.AlignLeft)
+        angle_grid.addWidget(QLabel("Stop"), 0, 2, Qt.AlignLeft)
+        angle_grid.addWidget(_entry(self.angle_stop_var, 10), 0, 3, Qt.AlignLeft)
+        angle_grid.addWidget(QLabel("Step"), 0, 4, Qt.AlignLeft)
+        angle_grid.addWidget(_entry(self.angle_step_var, 10), 0, 5, Qt.AlignLeft)
+        angle_grid.addWidget(QLabel("Wave pol"), 1, 0, Qt.AlignLeft)
+        angle_grid.addWidget(make_combo(("TE", "TM"), self.wave_pol_var, width=70), 1, 1, Qt.AlignLeft)
+        angle_grid.setColumnStretch(5, 1)
+        angle_layout.addWidget(angle_group)
+        self.angle_compare_both = QCheckBox("Compute TE and TM comparison (adds a second polarization solve)")
+        self.angle_compare_both.setChecked(True)
+        self.angle_compare_both.setToolTip('Oblique TM is unavailable for the directional two-axis model. In that case a valid TE run is retained without a TM comparison.')
+        angle_layout.addWidget(self.angle_compare_both)
+
+        (
+            ang_unc_group,
+            self.angle_unc_details_frame,
+            self.angle_unc_t_entry,
+            self.angle_unc_eps_entry,
+            self.angle_unc_mu_entry,
+        ) = _uncertainty_group(
+            self.angle_uncertainty_var,
+            self.angle_unc_t_pct_var,
+            self.angle_unc_eps_pct_var,
+            self.angle_unc_mu_pct_var,
+            self._sync_angle_uncertainty_state,
+        )
+        angle_layout.addWidget(ang_unc_group)
+        angle_layout.addWidget(_output_row(self.angle_output_var, self._browse_angle_output))
+
+        self.angle_compute_btn = QPushButton("Compute")
+        self.angle_compute_btn.clicked.connect(self._compute_off_angle)
+        angle_layout.addWidget(self.angle_compute_btn, 0, Qt.AlignLeft)
+        angle_layout.addStretch(1)
+
+
+    def _build_thickness_tab(self, _add_mode) -> None:
+        """Construct the layer-thickness sweep controls."""
+        thickness_tab = QWidget()
+        self.thickness_tab = thickness_tab
+        thk_layout = QVBoxLayout(thickness_tab)
+        _add_mode("Thickness", thickness_tab)
+
+        thk_freq_group = QGroupBox("Frequency sweep")
+        thk_freq_grid = QGridLayout(thk_freq_group)
+        thk_freq_grid.addWidget(QLabel("Start (GHz)"), 0, 0, Qt.AlignLeft)
+        thk_freq_grid.addWidget(_entry(self.thk_f_start_var, 10), 0, 1, Qt.AlignLeft)
+        thk_freq_grid.addWidget(QLabel("Stop"), 0, 2, Qt.AlignLeft)
+        thk_freq_grid.addWidget(_entry(self.thk_f_stop_var, 10), 0, 3, Qt.AlignLeft)
+        thk_freq_grid.addWidget(QLabel("Step"), 0, 4, Qt.AlignLeft)
+        thk_freq_grid.addWidget(_entry(self.thk_f_step_var, 10), 0, 5, Qt.AlignLeft)
+        thk_freq_grid.setColumnStretch(5, 1)
+        thk_layout.addWidget(thk_freq_group)
+
+        thk_group = QGroupBox("Thickness sweep")
+        thk_grid = QGridLayout(thk_group)
+        thk_grid.addWidget(QLabel("Layer"), 0, 0, Qt.AlignLeft)
+        self.thk_layer_combo = make_combo((), self.thk_layer_var, width=260)
+        thk_grid.addWidget(self.thk_layer_combo, 0, 1, 1, 5, Qt.AlignLeft)
+        thk_grid.addWidget(QLabel("Start (in)"), 1, 0, Qt.AlignLeft)
+        thk_grid.addWidget(_entry(self.thk_start_var, 10), 1, 1, Qt.AlignLeft)
+        thk_grid.addWidget(QLabel("Stop"), 1, 2, Qt.AlignLeft)
+        thk_grid.addWidget(_entry(self.thk_stop_var, 10), 1, 3, Qt.AlignLeft)
+        thk_grid.addWidget(QLabel("Step"), 1, 4, Qt.AlignLeft)
+        thk_grid.addWidget(_entry(self.thk_step_var, 10), 1, 5, Qt.AlignLeft)
+        thk_grid.addWidget(QLabel("Angle (deg)"), 2, 0, Qt.AlignLeft)
+        thk_grid.addWidget(_entry(self.thk_angle_var, 10), 2, 1, Qt.AlignLeft)
+        thk_grid.addWidget(QLabel("Wave pol"), 2, 2, Qt.AlignLeft)
+        thk_grid.addWidget(
+            make_combo(("TE", "TM"), self.thk_wave_pol_var, width=70), 2, 3, Qt.AlignLeft
+        )
+        thk_grid.setColumnStretch(5, 1)
+        thk_layout.addWidget(thk_group)
+
+        (
+            thk_unc_group,
+            self.thk_unc_details_frame,
+            self.thk_unc_t_entry,
+            self.thk_unc_eps_entry,
+            self.thk_unc_mu_entry,
+        ) = _uncertainty_group(
+            self.thk_uncertainty_var,
+            self.thk_unc_t_pct_var,
+            self.thk_unc_eps_pct_var,
+            self.thk_unc_mu_pct_var,
+            self._sync_thickness_uncertainty_state,
+        )
+        thk_layout.addWidget(thk_unc_group)
+        thk_layout.addWidget(_output_row(self.thk_output_var, self._browse_thickness_output))
+
+        self.thk_compute_btn = QPushButton("Compute")
+        self.thk_compute_btn.clicked.connect(self._compute_thickness)
+        thk_layout.addWidget(self.thk_compute_btn, 0, Qt.AlignLeft)
+        thk_layout.addStretch(1)
+
+    def _build_inverse_tab(self, _add_mode) -> None:
+        """Construct the inverse-design setup controls."""
+        inv_tab = QScrollArea()
+        inv_tab.setWidgetResizable(True)
+        self.inv_tab = inv_tab
+        inv_content = QWidget()
+        inv_tab.setWidget(inv_content)
+        inv_layout = QVBoxLayout(inv_content)
+        _add_mode("Inverse Design", inv_tab)
+
+        inv_intro = QLabel(
+            "Choose Fixed or Vary for each layer, then enter Minimum, "
+            "Maximum, and Step for thickness or sheet resistance. FREDDY then "
+            "analyzes every combination of those values. The summary below shows "
+            "exactly what will vary."
+        )
+        inv_intro.setWordWrap(True)
+        inv_layout.addWidget(inv_intro)
+        self.inv_parameter_summary_label = QLabel("No optimization parameters configured.")
+        self.inv_parameter_summary_label.setWordWrap(True)
+        self.inv_parameter_summary_label.setObjectName("PreviewLabel")
+        inv_layout.addWidget(self.inv_parameter_summary_label)
+        self._build_inverse_workflow(inv_layout)
+
+        self.inv_freq_target_frame = CollapsibleFrame("Frequency target", expanded=True)
+        inv_layout.addWidget(self.inv_freq_target_frame)
+        freq_body = QGridLayout(self.inv_freq_target_frame.body)
+        freq_body.addWidget(QLabel("Mode"), 0, 0, Qt.AlignLeft)
+        freq_mode_combo = make_combo(
+            ("Band sweep", "Discrete list"),
+            self.inv_freq_mode_var,
+            width=130,
+            on_change=self._sync_inverse_freq_mode_state,
+        )
+        freq_body.addWidget(freq_mode_combo, 0, 1, 1, 2, Qt.AlignLeft)
+        freq_body.addWidget(QLabel("Band start"), 1, 0, Qt.AlignLeft)
+        self.inv_target_start_entry = _entry(self.inv_target_start_var, 8)
+        freq_body.addWidget(self.inv_target_start_entry, 1, 1, Qt.AlignLeft)
+        freq_body.addWidget(QLabel("Stop"), 1, 2, Qt.AlignLeft)
+        self.inv_target_stop_entry = _entry(self.inv_target_stop_var, 8)
+        freq_body.addWidget(self.inv_target_stop_entry, 1, 3, Qt.AlignLeft)
+        freq_body.addWidget(QLabel("Step"), 1, 4, Qt.AlignLeft)
+        self.inv_target_step_entry = _entry(self.inv_target_step_var, 8)
+        freq_body.addWidget(self.inv_target_step_entry, 1, 5, Qt.AlignLeft)
+        freq_body.addWidget(QLabel("Discrete f (GHz)"), 2, 0, Qt.AlignLeft)
+        self.inv_freq_list_entry = _entry(self.inv_freq_list_var)
+        freq_body.addWidget(self.inv_freq_list_entry, 2, 1, 1, 5)
+        freq_body.setColumnStretch(5, 1)
+
+        self.inv_angle_target_frame = CollapsibleFrame("Angle target", expanded=True)
+        inv_layout.addWidget(self.inv_angle_target_frame)
+        angle_body = QGridLayout(self.inv_angle_target_frame.body)
+        angle_body.addWidget(QLabel("Start (deg)"), 0, 0, Qt.AlignLeft)
+        angle_body.addWidget(_entry(self.inv_angle_start_var, 8), 0, 1, Qt.AlignLeft)
+        angle_body.addWidget(QLabel("Stop"), 0, 2, Qt.AlignLeft)
+        angle_body.addWidget(_entry(self.inv_angle_stop_var, 8), 0, 3, Qt.AlignLeft)
+        angle_body.addWidget(QLabel("Step"), 0, 4, Qt.AlignLeft)
+        angle_body.addWidget(_entry(self.inv_angle_step_var, 8), 0, 5, Qt.AlignLeft)
+        angle_body.addWidget(QLabel("Wave pol"), 0, 6, Qt.AlignLeft)
+        angle_body.addWidget(make_combo(("TE", "TM"), self.inv_wave_pol_var, width=60), 0, 7, Qt.AlignLeft)
+        angle_body.setColumnStretch(8, 1)
+
+        self.inv_search_frame = CollapsibleFrame("Analyze all combinations", expanded=True)
+        inv_layout.addWidget(self.inv_search_frame)
+        search_body = QGridLayout(self.inv_search_frame.body)
+        search_body.addWidget(QLabel("Keep best for comparison"), 0, 0, Qt.AlignLeft)
+        search_body.addWidget(_entry(self.inv_top_n_var, 8), 0, 1, Qt.AlignLeft)
+        search_help = QLabel(
+            "Every combination of the configured layer values is analyzed. "
+            "Keep best only limits the results retained for comparison. "
+            "Values start at Minimum and advance by Step without exceeding Maximum."
+        )
+        search_help.setWordWrap(True)
+        search_body.addWidget(search_help, 1, 0, 1, 3)
+        search_body.setColumnStretch(2, 1)
+
+        self.inv_score_frame = CollapsibleFrame("Objective and tolerances", expanded=True)
+        inv_layout.addWidget(self.inv_score_frame)
+        score_body = QGridLayout(self.inv_score_frame.body)
+        inv_unc_check = QCheckBox("Enable uncertainty corners")
+        bind_check_box(self.inv_uncertainty_var, inv_unc_check)
+        inv_unc_check.clicked.connect(self._sync_inverse_uncertainty_state)
+        score_body.addWidget(inv_unc_check, 0, 0, 1, 6, Qt.AlignLeft)
+        score_body.addWidget(QLabel("T ±%"), 1, 0, Qt.AlignLeft)
+        self.inv_unc_t_entry = _entry(self.inv_unc_t_pct_var, 7)
+        score_body.addWidget(self.inv_unc_t_entry, 1, 1, Qt.AlignLeft)
+        score_body.addWidget(QLabel("Eps ±%"), 1, 2, Qt.AlignLeft)
+        self.inv_unc_eps_entry = _entry(self.inv_unc_eps_pct_var, 7)
+        score_body.addWidget(self.inv_unc_eps_entry, 1, 3, Qt.AlignLeft)
+        score_body.addWidget(QLabel("Mu ±%"), 1, 4, Qt.AlignLeft)
+        self.inv_unc_mu_entry = _entry(self.inv_unc_mu_pct_var, 7)
+        score_body.addWidget(self.inv_unc_mu_entry, 1, 5, Qt.AlignLeft)
+        score_body.addWidget(QLabel("Score"), 2, 0, Qt.AlignLeft)
+        score_body.addWidget(
+            make_combo(INVERSE_SCORE_MODE_OPTIONS, self.inv_score_mode_var, width=355),
+            2,
+            1,
+            1,
+            5,
+            Qt.AlignLeft,
+        )
+        self.inv_requirement_label = QLabel('Reflection limit (dB)')
+        score_body.addWidget(self.inv_requirement_label, 3, 0, 1, 2)
+        self.inv_requirement_entry = _entry(self.inv_requirement_db_var, 8)
+        self.inv_requirement_entry.setToolTip('Rank by worst PEC reflection minus this target over all analyzed frequencies, angles, and tolerance cases. Gap ≤ 0 passes. Saved with the search; separate from the Results comparison target.')
+        score_body.addWidget(self.inv_requirement_entry, 3, 2)
+        self.inv_objective_note = QLabel()
+        self.inv_objective_note.setWordWrap(True)
+        score_body.addWidget(self.inv_objective_note, 4, 0, 1, 6)
+        self.inv_score_mode_var.valueChanged.connect(self._sync_inverse_objective)
+        self._sync_inverse_objective()
+        score_body.setColumnStretch(5, 1)
+
+        self.inv_results_list = self._create_inverse_candidate_table()
+
+        inv_actions = QWidget()
+        inv_actions_layout = QHBoxLayout(inv_actions)
+        inv_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.inv_run_btn = QPushButton("Analyze all combinations")
+        self.inv_run_btn.clicked.connect(self._run_inverse_design)
+        inv_actions_layout.addWidget(self.inv_run_btn)
+        self.inv_apply_btn = QPushButton("Apply Selected")
+        self.inv_apply_btn.clicked.connect(self._apply_inverse_candidate)
+        self.inv_percentile_entry = _entry(self.inv_percentile_var, 6)
+        self.inv_percentile_entry.editingFinished.connect(self._on_inverse_percentile_changed)
+        inv_actions_layout.addStretch(1)
+        inv_layout.addWidget(inv_actions)
+        self._build_inverse_continue_actions(inv_layout)
+        inv_layout.addStretch(1)
+
+
+    def _sync_inverse_objective(self, *_args):
+        whole_band = self.inv_score_mode_var.get() == INVERSE_SCORE_WHOLE_BAND
+        self.inv_requirement_entry.setEnabled(whole_band)
+        self.inv_requirement_label.setEnabled(whole_band)
+        self.inv_objective_note.setText(
+            'Minimize the worst reflection gap across every analyzed frequency, angle, and tolerance case. Gap ≤ 0 passes the limit. Verify between samples with a finer sweep.'
+            if whole_band else 'Minimize mean reflection dB across frequency and angle, then take the worst or average tolerance corner. A good mean score can still miss a peak requirement.')
+
+    def _build_mix_tab(self, _add_mode) -> None:
+        """Construct the material recipe and target controls."""
+        mix_tab = QScrollArea()
+        mix_tab.setWidgetResizable(True)
+        self.mix_tab = mix_tab
+        mix_content = QWidget()
+        mix_tab.setWidget(mix_content)
+        mix_layout = QVBoxLayout(mix_content)
+        _add_mode("Material Mix", mix_tab)
+
+        intro = QLabel(
+            "Build a volume-based recipe from measured material CSV files. "
+            "Predict effective ε/μ for a known recipe or search for recipes "
+            "matching target properties or planar-stack performance. Results "
+            "remain morphology-model-dependent estimates."
+        )
+        intro.setWordWrap(True)
+        mix_layout.addWidget(intro)
+
+        workflow_frame = QGroupBox("1. Choose task and morphology model")
+        workflow_grid = QGridLayout(workflow_frame)
+        workflow_grid.addWidget(QLabel("Task"), 0, 0, Qt.AlignLeft)
+        workflow_grid.addWidget(
+            make_combo(
+                MIX_OBJECTIVE_OPTIONS,
+                self.mix_objective_var,
+                width=310,
+                on_change=self._sync_mix_objective_state,
+            ),
+            0,
+            1,
+            Qt.AlignLeft,
+        )
+        workflow_grid.addWidget(QLabel("Effective-medium model"), 1, 0, Qt.AlignLeft)
+        workflow_grid.addWidget(
+            make_combo(
+                MIX_RULE_LABEL_OPTIONS,
+                self.mix_rule_var,
+                width=410,
+                on_change=self._on_mix_model_changed,
+            ),
+            1,
+            1,
+            Qt.AlignLeft,
+        )
+        self.mix_workflow_help_label = QLabel()
+        self.mix_workflow_help_label.setWordWrap(True)
+        workflow_grid.addWidget(self.mix_workflow_help_label, 2, 0, 1, 2)
+        self.mix_model_help_label = QLabel()
+        self.mix_model_help_label.setWordWrap(True)
+        workflow_grid.addWidget(self.mix_model_help_label, 3, 0, 1, 2)
+        workflow_grid.setColumnStretch(1, 1)
+        mix_layout.addWidget(workflow_frame)
+
+        mix_comp_frame = CollapsibleFrame(
+            "2. Add measured materials and volume recipe", expanded=True
+        )
+        mix_layout.addWidget(mix_comp_frame)
+        comp_body = QVBoxLayout(mix_comp_frame.body)
+        comp_body.setContentsMargins(0, 0, 0, 0)
+        self.mix_list = QListWidget()
+        self.mix_list.setMinimumHeight(130)
+        self.mix_list.itemSelectionChanged.connect(self._update_plot)
+        self.mix_list.itemDoubleClicked.connect(lambda _item: self._edit_mix_component())
+        comp_body.addWidget(self.mix_list)
+        comp_btns = QWidget()
+        comp_btns_layout = QHBoxLayout(comp_btns)
+        comp_btns_layout.setContentsMargins(0, 0, 0, 0)
+        self.mix_add_btn = QPushButton("Add measured material…")
+        self.mix_add_btn.clicked.connect(self._add_mix_component)
+        comp_btns_layout.addWidget(self.mix_add_btn)
+        self.mix_edit_btn = QPushButton("Edit selected…")
+        self.mix_edit_btn.clicked.connect(self._edit_mix_component)
+        comp_btns_layout.addWidget(self.mix_edit_btn)
+        self.mix_remove_btn = QPushButton("Remove")
+        self.mix_remove_btn.clicked.connect(self._remove_mix_component)
+        comp_btns_layout.addWidget(self.mix_remove_btn)
+        comp_btns_layout.addStretch(1)
+        comp_body.addWidget(comp_btns)
+
+        mix_freq_frame = CollapsibleFrame("3. Choose prediction band", expanded=True)
+        mix_layout.addWidget(mix_freq_frame)
+        mix_freq_body = QGridLayout(mix_freq_frame.body)
+        mix_freq_body.addWidget(QLabel("Mode"), 0, 0, Qt.AlignLeft)
+        mix_freq_body.addWidget(
+            make_combo(
+                ("Band sweep", "Discrete list"),
+                self.mix_freq_mode_var,
+                width=130,
+                on_change=self._sync_mix_freq_mode_state,
+            ),
+            0,
+            1,
+            1,
+            2,
+            Qt.AlignLeft,
+        )
+        mix_freq_body.addWidget(QLabel("Band start (GHz)"), 1, 0, Qt.AlignLeft)
+        self.mix_target_start_entry = _entry(self.mix_target_start_var, 8)
+        mix_freq_body.addWidget(self.mix_target_start_entry, 1, 1, Qt.AlignLeft)
+        mix_freq_body.addWidget(QLabel("Stop"), 1, 2, Qt.AlignLeft)
+        self.mix_target_stop_entry = _entry(self.mix_target_stop_var, 8)
+        mix_freq_body.addWidget(self.mix_target_stop_entry, 1, 3, Qt.AlignLeft)
+        mix_freq_body.addWidget(QLabel("Step"), 1, 4, Qt.AlignLeft)
+        self.mix_target_step_entry = _entry(self.mix_target_step_var, 8)
+        mix_freq_body.addWidget(self.mix_target_step_entry, 1, 5, Qt.AlignLeft)
+        mix_freq_body.addWidget(QLabel("Discrete frequencies (GHz)"), 2, 0, Qt.AlignLeft)
+        self.mix_freq_list_entry = _entry(self.mix_freq_list_var)
+        mix_freq_body.addWidget(self.mix_freq_list_entry, 2, 1, 1, 5)
+        mix_freq_body.setColumnStretch(5, 1)
+
+        self.mix_prop_frame = CollapsibleFrame(
+            "4. Set target effective properties", expanded=True
+        )
+        mix_layout.addWidget(self.mix_prop_frame)
+        mix_prop_body = QGridLayout(self.mix_prop_frame.body)
+        mix_prop_body.addWidget(QLabel("Target source"), 0, 0, Qt.AlignLeft)
+        mix_prop_body.addWidget(
+            make_combo(
+                MIX_PROP_SOURCE_OPTIONS,
+                self.mix_prop_source_var,
+                width=140,
+                on_change=self._sync_mix_prop_source_state,
+            ),
+            0,
+            1,
+            1,
+            2,
+            Qt.AlignLeft,
+        )
+        mix_prop_body.addWidget(QLabel("ε'"), 1, 0, Qt.AlignLeft)
+        eps_re_entry = _entry(self.mix_prop_eps_re_var, 8)
+        mix_prop_body.addWidget(eps_re_entry, 1, 1, Qt.AlignLeft)
+        mix_prop_body.addWidget(QLabel("ε'' (passive loss < 0)"), 1, 2, Qt.AlignLeft)
+        eps_im_entry = _entry(self.mix_prop_eps_im_var, 8)
+        mix_prop_body.addWidget(eps_im_entry, 1, 3, Qt.AlignLeft)
+        mix_prop_body.addWidget(QLabel("μ'"), 1, 4, Qt.AlignLeft)
+        mu_re_entry = _entry(self.mix_prop_mu_re_var, 8)
+        mix_prop_body.addWidget(mu_re_entry, 1, 5, Qt.AlignLeft)
+        mix_prop_body.addWidget(QLabel("μ'' (passive loss < 0)"), 1, 6, Qt.AlignLeft)
+        mu_im_entry = _entry(self.mix_prop_mu_im_var, 8)
+        mix_prop_body.addWidget(mu_im_entry, 1, 7, Qt.AlignLeft)
+        self.mix_prop_const_entries = [eps_re_entry, eps_im_entry, mu_re_entry, mu_im_entry]
+        mix_prop_body.addWidget(QLabel("Target material CSV"), 2, 0, Qt.AlignLeft)
+        self.mix_prop_file_entry = _entry(self.mix_prop_file_var)
+        mix_prop_body.addWidget(self.mix_prop_file_entry, 2, 1, 1, 6)
+        self.mix_prop_browse_btn = QPushButton("Browse…")
+        self.mix_prop_browse_btn.clicked.connect(self._browse_mix_prop_file)
+        mix_prop_body.addWidget(self.mix_prop_browse_btn, 2, 7, Qt.AlignLeft)
+        mix_prop_body.addWidget(QLabel("Importance: ε"), 3, 0, Qt.AlignLeft)
+        mix_prop_body.addWidget(_entry(self.mix_prop_weps_var, 6), 3, 1, Qt.AlignLeft)
+        mix_prop_body.addWidget(QLabel("μ"), 3, 2, Qt.AlignLeft)
+        mix_prop_body.addWidget(_entry(self.mix_prop_wmu_var, 6), 3, 3, Qt.AlignLeft)
+        mix_prop_body.setColumnStretch(7, 1)
+
+        self.mix_perf_frame = CollapsibleFrame(
+            "4. Set target planar-stack performance", expanded=True
+        )
+        mix_layout.addWidget(self.mix_perf_frame)
+        mix_perf_body = QGridLayout(self.mix_perf_frame.body)
+        mix_perf_body.addWidget(QLabel("Performance metric"), 0, 0, Qt.AlignLeft)
+        mix_perf_body.addWidget(
+            make_combo(
+                tuple(item[0] for item in MIX_PERFORMANCE_METRIC_OPTIONS),
+                self.mix_perf_metric_var,
+                width=300,
+                on_change=self._on_mix_performance_metric_changed,
+            ),
+            0,
+            1,
+            1,
+            3,
+            Qt.AlignLeft,
+        )
+        mix_perf_body.addWidget(QLabel("Required threshold"), 1, 0, Qt.AlignLeft)
+        mix_perf_body.addWidget(_entry(self.mix_perf_target_var, 9), 1, 1, Qt.AlignLeft)
+        self.mix_perf_requirement_label = QLabel()
+        mix_perf_body.addWidget(self.mix_perf_requirement_label, 1, 2, 1, 4, Qt.AlignLeft)
+        mix_perf_body.addWidget(QLabel("Angle start (deg)"), 2, 0, Qt.AlignLeft)
+        mix_perf_body.addWidget(_entry(self.mix_perf_angle_start_var, 8), 2, 1, Qt.AlignLeft)
+        mix_perf_body.addWidget(QLabel("Stop"), 2, 2, Qt.AlignLeft)
+        mix_perf_body.addWidget(_entry(self.mix_perf_angle_stop_var, 8), 2, 3, Qt.AlignLeft)
+        mix_perf_body.addWidget(QLabel("Step"), 2, 4, Qt.AlignLeft)
+        mix_perf_body.addWidget(_entry(self.mix_perf_angle_step_var, 8), 2, 5, Qt.AlignLeft)
+        mix_perf_body.addWidget(QLabel("Wave polarization"), 3, 0, Qt.AlignLeft)
+        mix_perf_body.addWidget(
+            make_combo(("TE", "TM"), self.mix_perf_wave_pol_var, width=80),
+            3,
+            1,
+            Qt.AlignLeft,
+        )
+        perf_help = QLabel(
+            "The requirement is enforced at the worst frequency/angle point, "
+            "not only on an average. PEC-backed metrics model the mixed layer "
+            "on a conductor; air-backed metrics model a free-standing slab."
+        )
+        perf_help.setWordWrap(True)
+        mix_perf_body.addWidget(perf_help, 4, 0, 1, 6)
+        mix_perf_body.setColumnStretch(5, 1)
+
+        self.mix_search_frame = CollapsibleFrame(
+            "Inverse recipe search settings", expanded=False
+        )
+        mix_layout.addWidget(self.mix_search_frame)
+        mix_search_body = QGridLayout(self.mix_search_frame.body)
+        mix_search_body.addWidget(QLabel("Recipe samples"), 0, 0, Qt.AlignLeft)
+        mix_search_body.addWidget(_entry(self.mix_max_evals_var, 8), 0, 1, Qt.AlignLeft)
+        mix_search_body.addWidget(QLabel("Keep best"), 0, 2, Qt.AlignLeft)
+        mix_search_body.addWidget(_entry(self.mix_top_n_var, 8), 0, 3, Qt.AlignLeft)
+        mix_search_body.addWidget(QLabel("Seed"), 0, 4, Qt.AlignLeft)
+        mix_search_body.addWidget(_entry(self.mix_seed_var, 10), 0, 5, Qt.AlignLeft)
+        mix_refine_check = QCheckBox(
+            "Refine best recipes on the bounded volume-fraction simplex"
+        )
+        bind_check_box(self.mix_refine_var, mix_refine_check)
+        mix_search_body.addWidget(mix_refine_check, 1, 0, 1, 6, Qt.AlignLeft)
+        mix_unc_check = QCheckBox(
+            "Include systematic constituent-property tolerance corners"
+        )
+        bind_check_box(self.mix_uncertainty_var, mix_unc_check)
+        mix_unc_check.clicked.connect(self._sync_mix_uncertainty_state)
+        mix_search_body.addWidget(mix_unc_check, 2, 0, 1, 6, Qt.AlignLeft)
+        mix_search_body.addWidget(QLabel("Layer thickness ±%"), 3, 0, Qt.AlignLeft)
+        self.mix_unc_t_entry = _entry(self.mix_unc_t_pct_var, 7)
+        mix_search_body.addWidget(self.mix_unc_t_entry, 3, 1, Qt.AlignLeft)
+        mix_search_body.addWidget(QLabel("ε constituents ±%"), 3, 2, Qt.AlignLeft)
+        self.mix_unc_eps_entry = _entry(self.mix_unc_eps_pct_var, 7)
+        mix_search_body.addWidget(self.mix_unc_eps_entry, 3, 3, Qt.AlignLeft)
+        mix_search_body.addWidget(QLabel("μ constituents ±%"), 3, 4, Qt.AlignLeft)
+        self.mix_unc_mu_entry = _entry(self.mix_unc_mu_pct_var, 7)
+        mix_search_body.addWidget(self.mix_unc_mu_entry, 3, 5, Qt.AlignLeft)
+        tolerance_help = QLabel(
+            "Property tolerance scales all constituent ε values together and "
+            "all μ values together (correlated calibration bias). Thickness "
+            "tolerance affects performance searches and is ignored for a pure "
+            "effective-property target."
+        )
+        tolerance_help.setWordWrap(True)
+        mix_search_body.addWidget(tolerance_help, 4, 0, 1, 6)
+        mix_search_body.addWidget(QLabel("Tolerance score"), 5, 0, Qt.AlignLeft)
+        mix_search_body.addWidget(
+            make_combo(MIX_SCORE_MODE_OPTIONS, self.mix_score_mode_var, width=300),
+            5,
+            1,
+            1,
+            5,
+            Qt.AlignLeft,
+        )
+        mix_search_body.setColumnStretch(5, 1)
+        self.mix_budget_note = QLabel()
+        self.mix_budget_note.setWordWrap(True)
+        mix_search_body.addWidget(self.mix_budget_note, 6, 0, 1, 6)
+        self._refresh_mix_budget()
+
+        self.mix_results_frame = CollapsibleFrame(
+            "Results and candidate recipes", expanded=True
+        )
+        mix_layout.addWidget(self.mix_results_frame)
+        mix_results_body = QVBoxLayout(self.mix_results_frame.body)
+        mix_results_body.setContentsMargins(0, 0, 0, 0)
+        self.mix_results_list = QListWidget()
+        self.mix_results_list.setMinimumHeight(110)
+        self.mix_results_list.itemSelectionChanged.connect(self._update_plot)
+        mix_results_body.addWidget(self.mix_results_list)
+        self.mix_summary_label = QLabel(
+            "Add at least two measured materials, then calculate a known "
+            "recipe or find recipes for a target."
+        )
+        self.mix_summary_label.setWordWrap(True)
+        mix_results_body.addWidget(self.mix_summary_label)
+
+        mix_actions = QWidget()
+        mix_actions_layout = QHBoxLayout(mix_actions)
+        mix_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.mix_preview_btn = QPushButton("Calculate recipe")
+        self.mix_preview_btn.clicked.connect(self._preview_mix)
+        mix_actions_layout.addWidget(self.mix_preview_btn)
+        self.mix_run_btn = QPushButton("Find matching recipes")
+        self.mix_run_btn.clicked.connect(self._run_mix_design)
+        mix_actions_layout.addWidget(self.mix_run_btn)
+        self.mix_stop_btn = QPushButton("Stop search")
+        self.mix_stop_btn.setEnabled(False)
+        self.mix_stop_btn.clicked.connect(self._stop_mix_search)
+        mix_actions_layout.addWidget(self.mix_stop_btn)
+        mix_actions_layout.addStretch(1)
+        mix_actions_layout.addWidget(QLabel("Stack-layer thickness (in)"))
+        mix_actions_layout.addWidget(_entry(self.mix_thickness_var, 7))
+        self.mix_apply_btn = QPushButton("Add selected as layer…")
+        self.mix_apply_btn.clicked.connect(self._apply_mix_as_layer)
+        mix_actions_layout.addWidget(self.mix_apply_btn)
+        self.mix_export_btn = QPushButton("Export selected CSV…")
+        self.mix_export_btn.clicked.connect(self._export_mix_material)
+        mix_actions_layout.addWidget(self.mix_export_btn)
+        mix_layout.addWidget(mix_actions)
+        self._bind_mix_input_invalidation()
+        mix_layout.addStretch(1)
+
+
+    def _theme_colors(self) -> dict[str, object]:
+        if self._host_theme_override is not None:
+            return self._host_theme_override
+        return DARK_THEME if self.dark_mode_var.get() else LIGHT_THEME
+
+    def apply_host_theme(self, colors: Mapping[str, object]) -> None:
+        """Let an embedding application own FREDDY's complete appearance.
+
+        This deliberately does not change ``dark_mode_var`` because that value
+        belongs to standalone FREDDY project state. Embedded GRIM palette
+        changes are presentation-only and must not dirty or rewrite a project.
+        """
+
+        missing = sorted(set(DARK_THEME).difference(colors))
+        if missing:
+            raise ValueError(
+                "FREDDY host theme is missing roles: " + ", ".join(missing)
+            )
+        self._host_theme_override = copy.deepcopy(dict(colors))
+        if self.dark_mode_action is not None:
+            self.dark_mode_action.setVisible(False)
+        if self.view_menu is not None:
+            self.view_menu.menuAction().setVisible(False)
+        self._apply_theme()
+
+    def clear_host_theme(self) -> None:
+        """Return a standalone workspace to its saved light/dark preference."""
+
+        self._host_theme_override = None
+        if self.dark_mode_action is not None:
+            self.dark_mode_action.setVisible(True)
+        if self.view_menu is not None:
+            self.view_menu.menuAction().setVisible(True)
+        self._apply_theme()
+
+    def _style_plot_axis(self, axis: object) -> None:
+        style_axis(axis, self._colors)
+
+    def _apply_theme(self) -> None:
+        colors = self._theme_colors()
+        self._colors = colors
+
+        qss = f"""
+        QWidget {{ background-color: {colors['window_bg']}; color: {colors['text']}; }}
+        QGroupBox {{
+            background-color: {colors['panel_bg']};
+            border: 1px solid {colors['preview_border']};
+            border-radius: 4px;
+            margin-top: 8px;
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 8px;
+            padding: 0 3px;
+            color: {colors['text']};
+        }}
+        QLabel {{ background: transparent; color: {colors['text']}; }}
+        QLabel:disabled {{ color: {colors['field_disabled_fg']}; }}
+        QToolButton#CollapsibleHeader {{
+            border: none;
+            text-align: left;
+            padding: 4px 6px;
+            background: transparent;
+            color: {colors['text']};
+        }}
+        QLineEdit {{
+            background-color: {colors['field_bg']};
+            color: {colors['field_fg']};
+            border: 1px solid {colors['preview_border']};
+            border-radius: 3px;
+            padding: 2px 4px;
+        }}
+        QLineEdit:disabled {{
+            background-color: {colors['field_disabled_bg']};
+            color: {colors['field_disabled_fg']};
+        }}
+        QPushButton {{
+            background-color: {colors['button_bg']};
+            color: {colors['text']};
+            border: 1px solid {colors['preview_border']};
+            border-radius: 3px;
+            padding: 4px 10px;
+        }}
+        QPushButton:hover {{ background-color: {colors['button_active_bg']}; }}
+        QPushButton:disabled {{
+            background-color: {colors['field_disabled_bg']};
+            color: {colors['field_disabled_fg']};
+        }}
+        QCheckBox {{ background: transparent; color: {colors['text']}; }}
+        QCheckBox:disabled {{ color: {colors['field_disabled_fg']}; }}
+        QComboBox {{
+            background-color: {colors['field_bg']};
+            color: {colors['field_fg']};
+            border: 1px solid {colors['preview_border']};
+            border-radius: 3px;
+            padding: 2px 4px;
+        }}
+        QComboBox:disabled {{
+            background-color: {colors['field_disabled_bg']};
+            color: {colors['field_disabled_fg']};
+        }}
+        QComboBox QAbstractItemView {{
+            background-color: {colors['field_bg']};
+            color: {colors['field_fg']};
+            selection-background-color: {colors['selection_bg']};
+            selection-color: {colors['selection_fg']};
+        }}
+        QListWidget {{
+            background-color: {colors['field_bg']};
+            color: {colors['field_fg']};
+            border: 1px solid {colors['preview_border']};
+        }}
+        QListWidget::item:selected {{
+            background-color: {colors['selection_bg']};
+            color: {colors['selection_fg']};
+        }}
+        QTableView {{
+            background-color: {colors['field_bg']};
+            alternate-background-color: {colors['panel_bg']};
+            color: {colors['field_fg']};
+            border: 1px solid {colors['preview_border']};
+            gridline-color: {colors['preview_border']};
+            selection-background-color: {colors['selection_bg']};
+            selection-color: {colors['selection_fg']};
+        }}
+        QHeaderView::section {{
+            background-color: {colors['head_bg']};
+            color: {colors['text']};
+            border: 0;
+            border-right: 1px solid {colors['preview_border']};
+            border-bottom: 1px solid {colors['preview_border']};
+            padding: 4px 6px;
+        }}
+        QTabWidget::pane {{ border: 1px solid {colors['preview_border']}; }}
+        QTabBar::tab {{
+            background: {colors['button_bg']};
+            color: {colors['text']};
+            padding: 5px 10px;
+        }}
+        QTabBar::tab:selected {{ background: {colors['head_bg']}; color: {colors['field_fg']}; }}
+        QTabBar::tab:hover {{ background: {colors['button_active_bg']}; }}
+        QProgressBar {{
+            background-color: {colors['field_disabled_bg']};
+            border: none;
+            border-radius: 3px;
+        }}
+        QProgressBar::chunk {{ background-color: {colors['accent']}; }}
+        QSplitter::handle {{ background-color: {colors['preview_border']}; }}
+        QMenuBar {{ background-color: {colors['panel_bg']}; color: {colors['text']}; }}
+        QMenuBar::item {{ background: transparent; padding: 4px 10px; }}
+        QMenuBar::item:selected {{ background-color: {colors['button_active_bg']}; }}
+        QMenu {{
+            background-color: {colors['field_bg']};
+            color: {colors['field_fg']};
+            border: 1px solid {colors['preview_border']};
+        }}
+        QMenu::item:selected {{
+            background-color: {colors['selection_bg']};
+            color: {colors['selection_fg']};
+        }}
+        QStatusBar {{ background-color: {colors['panel_bg']}; color: {colors['muted_text']}; }}
+        QStatusBar QLabel {{ color: {colors['muted_text']}; }}
+        QFrame#NavRail {{
+            background-color: {colors['field_bg']};
+            border-right: 1px solid {colors['preview_border']};
+        }}
+        QLabel#NavBrand {{
+            color: {colors['accent']};
+            font-weight: 600;
+            font-size: 15px;
+            padding: 2px 2px;
+        }}
+        QToolButton#ModeNavButton {{
+            border: none;
+            border-radius: 5px;
+            text-align: left;
+            padding: 9px 12px;
+            color: {colors['text']};
+            background: transparent;
+        }}
+        QToolButton#ModeNavButton:hover {{ background-color: {colors['button_active_bg']}; }}
+        QToolButton#ModeNavButton:checked {{
+            background-color: {colors['selection_bg']};
+            color: {colors['selection_fg']};
+        }}
+        """
+        self.setStyleSheet(qss)
+        self.guide.apply_theme(colors)
+        self.tolerance_workspace.apply_theme(colors)
+        self.layer_preview.update()
+        if self.material_explorer is not None:
+            self.material_explorer.apply_theme(colors)
+
+        if self.canvas is not None and self.fig is not None:
+            self.fig.patch.set_facecolor(colors["plot_bg"])
+            self._update_plot()
+
+    def _browse_output(self) -> None:
+        p = filedialog.asksaveasfilename(
+            title="Select output file",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+        )
+        if p:
+            self.output_var.set(p)
+
+    def _browse_ibc_batch_output_dir(self) -> None:
+        current = self.ibc_batch_output_dir_var.get().strip()
+        p = filedialog.askdirectory(
+            parent=self,
+            title="Select IBC batch output folder",
+            initialdir=current if current and Path(current).is_dir() else "",
+        )
+        if p:
+            self.ibc_batch_output_dir_var.set(p)
+
+    def _browse_angle_output(self) -> None:
+        p = filedialog.asksaveasfilename(
+            title="Select output file",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+        )
+        if p:
+            self.angle_output_var.set(p)
+
+    def _browse_thickness_output(self) -> None:
+        p = filedialog.asksaveasfilename(
+            title="Select output file",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+        )
+        if p:
+            self.thk_output_var.set(p)
+
+    def _coerce_bool(self, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return False
+
+
+    def _save_project(self) -> bool:
+        try:
+            target = self.project_path
+            if target is None:
+                path_str = filedialog.asksaveasfilename(
+                    title="Save project",
+                    defaultextension=".json",
+                    filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")],
+                )
+                if not path_str:
+                    return False
+                target = Path(path_str)
+            save_project_file(target, self._collect_project_state())
+        except Exception as exc:
+            messagebox.showerror("Project Save Error", str(exc))
+            return False
+        self.project_path = target
+        self._mark_project_clean()
+        messagebox.showinfo("Project", f"Saved project to:\n{self.project_path}")
+        return True
+
+    def _load_project(self) -> bool:
+        try:
+            path_str = filedialog.askopenfilename(
+                title="Load project",
+                filetypes=[("JSON Files", "*.json"), ("All Files", "*.*")],
+            )
+            if not path_str:
+                return False
+            if self.is_dirty():
+                buttons = getattr(QMessageBox, "StandardButton", QMessageBox)
+                answer = QMessageBox.warning(
+                    self,
+                    "Unsaved FREDDY Project",
+                    "The current FREDDY project has unsaved changes. Save them "
+                    "before loading another project?",
+                    buttons.Save | buttons.Discard | buttons.Cancel,
+                    buttons.Save,
+                )
+                if answer == buttons.Cancel:
+                    return False
+                if answer == buttons.Save and not self._save_project():
+                    return False
+            path = Path(path_str)
+            portability_warnings: list[str] = []
+            state = load_project_file(
+                path,
+                warning_handler=portability_warnings.append,
+            )
+            self._apply_project_state(state)
+            self.project_path = path
+            self._mark_project_clean()
+            if portability_warnings:
+                messagebox.showwarning(
+                    "Project Portability",
+                    "\n\n".join(portability_warnings),
+                    parent=self,
+                )
+            messagebox.showinfo("Project", f"Loaded project from:\n{path}")
+            return True
+        except Exception as exc:
+            messagebox.showerror("Project Load Error", str(exc))
+            return False
+
+    def _sync_cbar_state(self) -> None:
+        enabled = not self.cbar_auto_var.get()
+        self.cbar_min_entry.setEnabled(enabled)
+        self.cbar_max_entry.setEnabled(enabled)
+        if (
+            enabled
+            and self.heatmap_cbar is not None
+            and not (self.cbar_min_var.get().strip() or self.cbar_max_var.get().strip())
+        ):
+            # Fix the scale on screen instead of failing on empty limits.
+            low, high = self.heatmap_cbar.mappable.get_clim()
+            self.cbar_min_var.set(f"{low:.5g}")
+            self.cbar_max_var.set(f"{high:.5g}")
+        if self.canvas is not None:
+            self._update_plot()
+
+    def _sync_uncertainty_state(self) -> None:
+        enabled = self.uncertainty_var.get()
+        self.unc_details_frame.setVisible(enabled)
+        self.unc_t_entry.setEnabled(enabled)
+        self.unc_eps_entry.setEnabled(enabled)
+        self.unc_mu_entry.setEnabled(enabled)
+
+    def _sync_angle_uncertainty_state(self) -> None:
+        enabled = self.angle_uncertainty_var.get()
+        self.angle_unc_details_frame.setVisible(enabled)
+        self.angle_unc_t_entry.setEnabled(enabled)
+        self.angle_unc_eps_entry.setEnabled(enabled)
+        self.angle_unc_mu_entry.setEnabled(enabled)
+
+    def _sync_thickness_uncertainty_state(self) -> None:
+        enabled = self.thk_uncertainty_var.get()
+        if self.thk_unc_details_frame is None:
+            return
+        self.thk_unc_details_frame.setVisible(enabled)
+        self.thk_unc_t_entry.setEnabled(enabled)
+        self.thk_unc_eps_entry.setEnabled(enabled)
+        self.thk_unc_mu_entry.setEnabled(enabled)
+
+    def _sync_inverse_uncertainty_state(self) -> None:
+        enabled = self.inv_uncertainty_var.get()
+        if self.inv_unc_t_entry is not None:
+            self.inv_unc_t_entry.setEnabled(enabled)
+        if self.inv_unc_eps_entry is not None:
+            self.inv_unc_eps_entry.setEnabled(enabled)
+        if self.inv_unc_mu_entry is not None:
+            self.inv_unc_mu_entry.setEnabled(enabled)
+
+    def _sync_inverse_freq_mode_state(self) -> None:
+        mode = self.inv_freq_mode_var.get().strip().lower()
+        band_enabled = mode.startswith("band")
+        for entry in (
+            self.inv_target_start_entry,
+            self.inv_target_stop_entry,
+            self.inv_target_step_entry,
+        ):
+            if entry is not None:
+                entry.setEnabled(band_enabled)
+        if self.inv_freq_list_entry is not None:
+            self.inv_freq_list_entry.setEnabled(not band_enabled)
+
+    def _on_inverse_percentile_changed(self) -> None:
+        text = self.inv_percentile_var.get().strip()
+        if not text:
+            self.inv_percentile_var.set("10")
+            self._refresh_inverse_results_list()
+            return
+        try:
+            p = float(text)
+        except Exception:
+            messagebox.showerror("Inverse Plot", "Percentile must be a number between 0 and 100.")
+            return
+        if not math.isfinite(p) or p < 0.0 or p > 100.0:
+            messagebox.showerror("Inverse Plot", "Percentile must be between 0 and 100.")
+            return
+        self.inv_percentile_var.set(f"{p:g}")
+        self._refresh_inverse_results_list()
+
+    def _current_inverse_percentile(self) -> float:
+        text = self.inv_percentile_var.get().strip()
+        try:
+            p = float(text)
+        except Exception:
+            return 10.0
+        if not math.isfinite(p):
+            return 10.0
+        return max(0.0, min(100.0, p))
+
+    def _read_uncertainty_config(
+        self,
+        enabled_var: BooleanVar,
+        t_var: StringVar,
+        eps_var: StringVar,
+        mu_var: StringVar,
+    ) -> UncertaintyConfig:
+        if not enabled_var.get():
+            return UncertaintyConfig(enabled=False, thickness_pct=0.0, eps_pct=0.0, mu_pct=0.0)
+
+        thickness_pct = float(t_var.get().strip())
+        eps_pct = float(eps_var.get().strip())
+        mu_pct = float(mu_var.get().strip())
+        if not all(
+            math.isfinite(value)
+            for value in (thickness_pct, eps_pct, mu_pct)
+        ):
+            raise ValueError("Uncertainty percentages must be finite.")
+        if thickness_pct < 0 or eps_pct < 0 or mu_pct < 0:
+            raise ValueError("Uncertainty percentages must be >= 0.")
+        if thickness_pct >= 100 or eps_pct >= 100 or mu_pct >= 100:
+            raise ValueError(
+                "Uncertainty percentages must be < 100 so all physical "
+                "scales remain positive."
+            )
+        return UncertaintyConfig(
+            enabled=True,
+            thickness_pct=thickness_pct,
+            eps_pct=eps_pct,
+            mu_pct=mu_pct,
+        )
+
+    def _save_plot(self) -> None:
+        panel = self._active_analysis_panel()
+        figure = panel.figure if panel is not None else self.inv_figure if self._is_inverse_tab_active() else self.fig
+        if not MPL_AVAILABLE or figure is None:
+            messagebox.showerror("Plot", "Matplotlib is not available.")
+            return
+        p = filedialog.asksaveasfilename(
+            title="Save plot image",
+            defaultextension=".png",
+            filetypes=[("PNG Image", "*.png"), ("JPEG Image", "*.jpg;*.jpeg"), ("All Files", "*.*")],
+        )
+        if not p:
+            return
+        try:
+            figure.savefig(p, dpi=300, bbox_inches="tight")
+            messagebox.showinfo("Plot", f"Saved plot to:\n{p}")
+        except Exception as exc:
+            messagebox.showerror("Plot", str(exc))
+
+    def _get_color_limits(self) -> tuple[float | None, float | None]:
+        if self.cbar_auto_var.get():
+            return None, None
+        cmin_text = self.cbar_min_var.get().strip()
+        cmax_text = self.cbar_max_var.get().strip()
+        if not cmin_text or not cmax_text:
+            raise ValueError("Set both colorbar Min and Max, or enable Auto color scale.")
+        cmin = float(cmin_text)
+        cmax = float(cmax_text)
+        if cmax <= cmin:
+            raise ValueError("Colorbar Max must be greater than Min.")
+        return cmin, cmax
+
+    def _stats(self, values: list[float]) -> tuple[float, float, float]:
+        if not values:
+            return float("nan"), float("nan"), float("nan")
+        if NUMPY_AVAILABLE:
+            arr = np.asarray(values, dtype=float)
+            return float(arr.mean()), float(arr.min()), float(arr.max())
+        mean = sum(values) / len(values)
+        return mean, min(values), max(values)
+
+    def _max_contiguous_bandwidth(
+        self,
+        freqs: list[float],
+        values: list[float],
+        threshold: float,
+    ) -> float:
+        if len(freqs) < 2:
+            return 0.0
+        best = 0.0
+        run_start: int | None = None
+        for i, v in enumerate(values):
+            if v <= threshold:
+                if run_start is None:
+                    run_start = i
+            elif run_start is not None:
+                best = max(best, freqs[i - 1] - freqs[run_start])
+                run_start = None
+        if run_start is not None:
+            best = max(best, freqs[-1] - freqs[run_start])
+        return max(best, 0.0)
+
+    def _summarize_angle_run(
+        self,
+        out: dict[str, list[list[float]] | list[float]],
+        wave_pol: str,
+        uncertainty_enabled: bool,
+    ) -> str:
+        freqs = out["freq_ghz"]
+        angles = out["angle_deg"]
+        metal = out["metal_loss_db"]
+        air = out["air_loss_db"]
+        ins = out["insertion_loss_db"]
+        phase = out["metal_phase_deg"]
+        metal_abs = out["metal_absorption_db"]
+
+        all_metal = [v for row in metal for v in row]
+        all_air = [v for row in air for v in row]
+        all_ins = [v for row in ins for v in row]
+        all_phase = [v for row in phase for v in row]
+        all_metal_abs = [v for row in metal_abs for v in row]
+        metal_mean, metal_min, metal_max = self._stats(all_metal)
+        air_mean, air_min, air_max = self._stats(all_air)
+        ins_mean, ins_min, ins_max = self._stats(all_ins)
+        phase_mean, phase_min, phase_max = self._stats(all_phase)
+        abs_mean, abs_min, abs_max = self._stats(all_metal_abs)
+
+        band_threshold = -10.0
+        best_bw = 0.0
+        best_bw_angle = angles[0]
+        for j, a in enumerate(angles):
+            row = [metal[i][j] for i in range(len(freqs))]
+            bw = self._max_contiguous_bandwidth(freqs, row, band_threshold)
+            if bw > best_bw:
+                best_bw = bw
+                best_bw_angle = a
+
+        best_angle = angles[0]
+        best_angle_score = float("inf")
+        for j, a in enumerate(angles):
+            row = [metal[i][j] for i in range(len(freqs))]
+            score, _mn, _mx = self._stats(row)
+            if score < best_angle_score:
+                best_angle_score = score
+                best_angle = a
+
+        unc_state = "ON" if uncertainty_enabled else "OFF"
+        return (
+            f"Mode: angle-frequency heatmap ({wave_pol.upper()}) | Uncertainty: {unc_state}\n"
+            f"Grid: {len(freqs)} freq x {len(angles)} angle points\n"
+            f"PEC reflection |Γ| dB mean/min/max: {metal_mean:.3f} / {metal_min:.3f} / {metal_max:.3f}\n"
+            f"PEC absorbed power dB mean/min/max: {abs_mean:.3f} / {abs_min:.3f} / {abs_max:.3f}\n"
+            f"Air reflection |Γ| dB mean/min/max: {air_mean:.3f} / {air_min:.3f} / {air_max:.3f}\n"
+            f"Transmission |S21| dB mean/min/max: {ins_mean:.3f} / {ins_min:.3f} / {ins_max:.3f}\n"
+            f"PEC reflection phase deg mean/min/max: {phase_mean:.3f} / {phase_min:.3f} / {phase_max:.3f}\n"
+            f"Best average PEC reflection angle: {best_angle:.2f} deg ({best_angle_score:.3f} dB)\n"
+            f"Max contiguous bandwidth with PEC reflection <= {band_threshold:.0f} dB: "
+            f"{best_bw:.3f} GHz @ {best_bw_angle:.2f} deg"
+        )
+
+    def _summarize_thickness_run(
+        self,
+        out: dict[str, list[list[float]] | list[float]],
+        wave_pol: str,
+        angle_deg: float,
+        uncertainty_enabled: bool,
+    ) -> str:
+        freqs = out["freq_ghz"]
+        thicknesses = out["thickness_in"]
+        metal = out["metal_loss_db"]
+        air = out["air_loss_db"]
+        ins = out["insertion_loss_db"]
+        metal_abs = out["metal_absorption_db"]
+
+        metal_mean, metal_min, metal_max = self._stats([v for row in metal for v in row])
+        air_mean, air_min, air_max = self._stats([v for row in air for v in row])
+        ins_mean, ins_min, ins_max = self._stats([v for row in ins for v in row])
+        abs_mean, abs_min, abs_max = self._stats([v for row in metal_abs for v in row])
+
+        # Per-thickness figures of merit: average metal loss across the band and
+        # the widest contiguous band under -10 dB.
+        band_threshold = -10.0
+        best_t = thicknesses[0]
+        best_t_score = float("inf")
+        best_bw = 0.0
+        best_bw_t = thicknesses[0]
+        for j, t_in in enumerate(thicknesses):
+            column = [metal[i][j] for i in range(len(freqs))]
+            score, _mn, _mx = self._stats(column)
+            if score < best_t_score:
+                best_t_score = score
+                best_t = t_in
+            bw = self._max_contiguous_bandwidth(freqs, column, band_threshold)
+            if bw > best_bw:
+                best_bw = bw
+                best_bw_t = t_in
+
+        unc_state = "ON" if uncertainty_enabled else "OFF"
+        return (
+            f"Mode: thickness-frequency heatmap ({wave_pol.upper()} @ {angle_deg:g} deg) | "
+            f"Uncertainty: {unc_state}\n"
+            f"Grid: {len(freqs)} freq x {len(thicknesses)} thickness points "
+            f"({thicknesses[0]:g} to {thicknesses[-1]:g} in)\n"
+            f"PEC reflection |Γ| dB mean/min/max: {metal_mean:.3f} / {metal_min:.3f} / {metal_max:.3f}\n"
+            f"PEC absorbed power dB mean/min/max: {abs_mean:.3f} / {abs_min:.3f} / {abs_max:.3f}\n"
+            f"Air reflection |Γ| dB mean/min/max: {air_mean:.3f} / {air_min:.3f} / {air_max:.3f}\n"
+            f"Transmission |S21| dB mean/min/max: {ins_mean:.3f} / {ins_min:.3f} / {ins_max:.3f}\n"
+            f"Best average PEC reflection thickness: {best_t:g} in ({best_t_score:.3f} dB)\n"
+            f"Max contiguous bandwidth with PEC reflection <= {band_threshold:.0f} dB: "
+            f"{best_bw:.3f} GHz @ {best_bw_t:g} in"
+        )
+
+    def _summarize_frequency_run(
+        self,
+        sweep: list[float],
+        loaded_layers: list[LoadedLayer],
+        wave_pol: str,
+        uncertainty_enabled: bool,
+        backing: str,
+    ) -> str:
+        metrics = compute_angle_metrics_many(sweep, 0.0, loaded_layers, wave_pol)
+        metal = metrics["metal_loss_db"]
+        air = metrics["air_loss_db"]
+        ins = metrics["insertion_loss_db"]
+        phase = metrics["metal_phase_deg"]
+        metal_abs = metrics["metal_absorption_db"]
+        metal_mean, metal_min, metal_max = self._stats(metal)
+        air_mean, air_min, air_max = self._stats(air)
+        ins_mean, ins_min, ins_max = self._stats(ins)
+        phase_mean, phase_min, phase_max = self._stats(phase)
+        abs_mean, abs_min, abs_max = self._stats(metal_abs)
+        bw10 = self._max_contiguous_bandwidth(sweep, metal, -10.0)
+        unc_state = "ON" if uncertainty_enabled else "OFF"
+        return (
+            f"Mode: frequency sweep ({wave_pol.upper()}, backing={backing}) | Uncertainty: {unc_state}\n"
+            f"Points: {len(sweep)}\n"
+            f"PEC reflection |Γ| dB mean/min/max: {metal_mean:.3f} / {metal_min:.3f} / {metal_max:.3f}\n"
+            f"PEC absorbed power dB mean/min/max: {abs_mean:.3f} / {abs_min:.3f} / {abs_max:.3f}\n"
+            f"Air reflection |Γ| dB mean/min/max: {air_mean:.3f} / {air_min:.3f} / {air_max:.3f}\n"
+            f"Transmission |S21| dB mean/min/max: {ins_mean:.3f} / {ins_min:.3f} / {ins_max:.3f}\n"
+            f"PEC reflection phase deg mean/min/max: {phase_mean:.3f} / {phase_min:.3f} / {phase_max:.3f}\n"
+            f"Contiguous bandwidth with PEC reflection <= -10 dB at 0 deg: {bw10:.3f} GHz"
+        )
+
+    def _selected_idx(self) -> int | None:
+        row = self.layer_list.currentRow()
+        if row < 0:
+            return None
+        return int(row)
+
+    def _draw_layer_preview(self, painter: QPainter) -> None:
+        colors = self._colors
+        width = self.layer_preview.width()
+        height = self.layer_preview.height()
+
+        # The LayerPreview widget paints its own surface, so start by filling it.
+        painter.fillRect(0, 0, width, height, QColor(colors["preview_bg"]))
+        if width < 40 or height < 40:
+            return
+
+        base_font = painter.font()
+        line_h = painter.fontMetrics().height()
+
+        if not self.layers:
+            painter.setPen(QColor(colors["preview_empty"]))
+            painter.drawText(QRectF(0, 0, width, height), Qt.AlignCenter, "No layers configured")
+            return
+
+        pad = 12.0
+        title_gap = 18.0
+        x0 = pad
+        x1 = width - pad
+        y0 = pad + title_gap
+        y1 = height - pad - title_gap
+        if y1 <= y0:
+            return
+
+        painter.setPen(QColor(colors["preview_text"]))
+        painter.drawText(
+            QRectF(x0, pad, x1 - x0, title_gap),
+            Qt.AlignHCenter | Qt.AlignTop,
+            "Top (incident side)",
+        )
+        painter.drawText(
+            QRectF(x0, height - pad - title_gap, x1 - x0, title_gap),
+            Qt.AlignHCenter | Qt.AlignBottom,
+            "Bottom / backing",
+        )
+
+        thicknesses = [max(layer.thickness_in, 0.0) if not layer.is_sheet else 0.0 for layer in self.layers]
+        n = len(self.layers)
+        n_bulk = sum(1 for layer in self.layers if not layer.is_sheet)
+        n_sheet = n - n_bulk
+        sheet_h = 6.0
+        stack_h = y1 - y0 - n_sheet * sheet_h
+        if n_bulk > 0:
+            min_h = min(22.0, stack_h / max(float(n_bulk), 1.0))
+        else:
+            min_h = 0.0
+        min_total = min_h * n_bulk
+
+        if n_bulk == 0 or stack_h <= min_total or sum(thicknesses) <= 0:
+            bulk_h_each = stack_h / max(n_bulk, 1)
+            heights = [sheet_h if layer.is_sheet else bulk_h_each for layer in self.layers]
+        else:
+            extra_h = stack_h - min_total
+            total_t = sum(thicknesses) or 1.0
+            heights = [
+                sheet_h if layer.is_sheet else min_h + extra_h * (t / total_t)
+                for layer, t in zip(self.layers, thicknesses)
+            ]
+
+        layer_colors = colors["layer_colors"]
+
+        y = y0
+        for i, (layer, layer_h) in enumerate(zip(self.layers, heights), start=1):
+            yn = y1 if i == n else y + layer_h
+            mid = (y + yn) * 0.5
+
+            if layer.is_sheet:
+                pen = QPen(QColor(colors.get("accent", "#3b82f6")))
+                pen.setWidth(2)
+                pen.setStyle(Qt.CustomDashLine)
+                pen.setDashPattern([6, 3])
+                painter.setPen(pen)
+                painter.drawLine(QPointF(x0, mid), QPointF(x1, mid))
+                label = f"{i}. SHEET {layer.sheet_resistance:g} \u03a9/sq"
+                max_chars = max(16, int((x1 - x0) / 6.7))
+                if len(label) > max_chars:
+                    label = label[: max_chars - 3] + "..."
+                small_font = QFont(base_font)
+                small_font.setPointSize(8)
+                painter.setFont(small_font)
+                small_h = painter.fontMetrics().height()
+                painter.setPen(QColor(colors["preview_layer_text"]))
+                painter.drawText(
+                    QRectF(x0, mid - 7 - small_h / 2.0, x1 - x0, small_h),
+                    Qt.AlignHCenter | Qt.AlignVCenter,
+                    label,
+                )
+                painter.setFont(base_font)
+                y = yn
+                continue
+
+            fill = layer_colors[(i - 1) % len(layer_colors)]
+            rect = QRectF(x0, y, x1 - x0, yn - y)
+            painter.fillRect(rect, QColor(fill))
+            pen = QPen(QColor(colors["preview_layer_border"]))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            painter.drawRect(rect)
+
+            material_name = 'Constant εr / μr' if layer.is_constant else Path(layer.file_0deg).stem or Path(layer.file_0deg).name or "material"
+            layer_type = "aniso" if layer.anisotropic else "iso"
+            label = f"{i}. {material_name} | {layer.thickness_in:g} in | {layer_type}"
+            max_chars = max(16, int((x1 - x0) / 6.7))
+            if len(label) > max_chars:
+                label = label[: max_chars - 3] + "..."
+            painter.setPen(QColor(colors["preview_layer_text"]))
+            painter.drawText(
+                QRectF(x0, mid - line_h / 2.0, x1 - x0, line_h),
+                Qt.AlignHCenter | Qt.AlignVCenter,
+                label,
+            )
+            y = yn
+
+        pen = QPen(QColor(colors["preview_outline"]))
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.drawRect(QRectF(x0, y0, x1 - x0, y1 - y0))
+
+    def _refresh_layers(self) -> None:
+        if hasattr(self, 'tolerance_workspace'):
+            self.tolerance_workspace.refresh_layers()
+        self._schedule_inverse_work_count()
+        self.layer_list.clear()
+        for i, layer in enumerate(self.layers, start=1):
+            if layer.is_sheet:
+                desc = f"{i}. SHEET R={layer.sheet_resistance:g} \u03a9/sq"
+                if layer.inv_rs_min is not None or layer.inv_rs_max is not None:
+                    rparts = []
+                    if layer.inv_rs_min is not None:
+                        rparts.append(f"min={layer.inv_rs_min:g}")
+                    if layer.inv_rs_max is not None:
+                        rparts.append(f"max={layer.inv_rs_max:g}")
+                    if layer.inv_rs_accuracy is not None:
+                        rparts.append(f"step={layer.inv_rs_accuracy:g}")
+                    desc += f" | inv[{', '.join(rparts)}]"
+            elif layer.is_constant:
+                desc = f'{i}. t={layer.thickness_in:g} in | {layer_material_label(layer)}'
+            elif layer.anisotropic:
+                file0 = Path(layer.file_0deg).name or layer.file_0deg
+                file90 = Path(layer.file_90deg).name or layer.file_90deg
+                desc = (
+                    f"{i}. t={layer.thickness_in:g} in | aniso | pol={layer.polarization_deg:g} deg | "
+                    f"0deg={file0} | 90deg={file90}"
+                )
+            else:
+                file0 = Path(layer.file_0deg).name or layer.file_0deg
+                desc = f"{i}. t={layer.thickness_in:g} in | iso | file={file0}"
+            if not layer.is_sheet and (
+                layer.inv_t_min_in is not None
+                or layer.inv_t_max_in is not None
+                or layer.inv_t_accuracy_in is not None
+            ):
+                parts = []
+                if layer.inv_t_min_in is not None:
+                    parts.append(f"min={layer.inv_t_min_in:g}")
+                if layer.inv_t_max_in is not None:
+                    parts.append(f"max={layer.inv_t_max_in:g}")
+                if layer.inv_t_accuracy_in is not None:
+                    parts.append(f"step={layer.inv_t_accuracy_in:g}")
+                desc += f" | inv[{', '.join(parts)}]"
+            self.layer_list.addItem(desc)
+        if self.inv_parameter_summary_label is not None:
+            parameters: list[str] = []
+            for index, layer in enumerate(self.layers, start=1):
+                if layer.is_sheet:
+                    if layer.inv_rs_min is not None and layer.inv_rs_max is not None:
+                        step = (
+                            f", step {layer.inv_rs_accuracy:g} Ω"
+                            if layer.inv_rs_accuracy is not None else ", step required"
+                        )
+                        parameters.append(
+                            f"Layer {index} resistance: {layer.inv_rs_min:g} to "
+                            f"{layer.inv_rs_max:g} Ω/sq{step}"
+                        )
+                elif layer.inv_t_min_in is not None and layer.inv_t_max_in is not None:
+                    step = (
+                        f", step {layer.inv_t_accuracy_in:g} in"
+                        if layer.inv_t_accuracy_in is not None else ", step required"
+                    )
+                    parameters.append(
+                        f"Layer {index} thickness: {layer.inv_t_min_in:g} to "
+                        f"{layer.inv_t_max_in:g} in{step}"
+                    )
+            self.inv_parameter_summary_label.setText(
+                "Optimization parameters: " + " | ".join(parameters)
+                if parameters else
+                "All layers are fixed. Choose Fixed / variable layers to vary a parameter, or run once to score the current stack."
+            )
+        self.layer_preview.update()
+        self._refresh_thickness_layers()
+
+    def _thickness_layer_choices(self) -> list[tuple[int, str]]:
+        """Layers whose thickness can be swept, as (index, label) pairs. Sheet
+        layers are excluded: they are zero-thickness impedance boundaries."""
+        return [
+            (i, f"{i + 1}. {layer_material_label(layer)}")
+            for i, layer in enumerate(self.layers)
+            if not layer.is_sheet
+        ]
+
+    def _refresh_thickness_layers(self) -> None:
+        labels = [label for _idx, label in self._thickness_layer_choices()]
+        for combo, var in (
+            (self.thk_layer_combo, self.thk_layer_var),
+            (self.ibc_batch_layer_combo, self.ibc_batch_layer_var),
+        ):
+            if combo is None:
+                continue
+            previous = var.get()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(labels)
+            selected = previous if previous in labels else (labels[0] if labels else "")
+            if selected:
+                combo.setCurrentIndex(labels.index(selected))
+            combo.blockSignals(False)
+            var.set(selected)
+        self._refresh_ibc_batch_preview()
+
+    def _selected_thickness_layer_index(self) -> int:
+        choices = self._thickness_layer_choices()
+        if not choices:
+            raise ValueError(
+                "Add at least one material layer (sheet layers have no thickness to sweep)."
+            )
+        wanted = self.thk_layer_var.get().strip()
+        for idx, label in choices:
+            if label == wanted:
+                return idx
+        return choices[0][0]
+
+    def _selected_ibc_batch_layer_index(self) -> int:
+        choices = self._thickness_layer_choices()
+        if not choices:
+            raise ValueError(
+                "Add at least one material layer; sheet layers have no thickness."
+            )
+        wanted = self.ibc_batch_layer_var.get().strip()
+        for idx, label in choices:
+            if label == wanted:
+                return idx
+        raise ValueError("Select a valid material layer for the IBC batch.")
+
+    def _plan_ibc_batch(self) -> list[IbcBatchItem]:
+        return plan_ibc_thickness_batch(
+            self.ibc_batch_output_dir_var.get(),
+            self.ibc_batch_prefix_var.get(),
+            self.ibc_batch_start_var.get(),
+            self.ibc_batch_stop_var.get(),
+            self.ibc_batch_step_var.get(),
+            self.ibc_batch_unit_var.get(),
+        )
+
+    def _refresh_ibc_batch_preview(self) -> None:
+        if self.ibc_batch_preview_label is None:
+            return
+        try:
+            self._selected_ibc_batch_layer_index()
+            plan = self._plan_ibc_batch()
+            frequency_count = ibc_batch_frequency_count(
+                float(self.f_start_var.get().strip()),
+                float(self.f_stop_var.get().strip()),
+                float(self.f_step_var.get().strip()),
+            )
+            total_points = validate_ibc_batch_workload(
+                len(plan), frequency_count
+            )
+            first = plan[0].path.name
+            last = plan[-1].path.name
+            filenames = first if len(plan) == 1 else f"{first} … {last}"
+            self.ibc_batch_preview_label.setText(
+                f"Preflight: {len(plan)} nominal PEC-backed IBC file(s), "
+                f"{frequency_count:,} frequency points each "
+                f"({total_points:,} total rows) — {filenames}"
+            )
+            if self.ibc_batch_export_btn is not None:
+                self.ibc_batch_export_btn.setText(
+                    f"Export {len(plan)} IBC file(s)"
+                )
+                self.ibc_batch_export_btn.setEnabled(not self._task_running)
+        except Exception as exc:
+            self.ibc_batch_preview_label.setText(f"Preflight: {exc}")
+            if self.ibc_batch_export_btn is not None:
+                self.ibc_batch_export_btn.setText("Export IBC batch")
+                self.ibc_batch_export_btn.setEnabled(False)
+
+    def _add_layer(self) -> None:
+        dlg = LayerDialog(self, presets=BUILTIN_MATERIAL_PRESETS)
+        dlg.exec()
+        if dlg.result is not None:
+            self.layers.append(dlg.result)
+            self._refresh_layers()
+
+    def _add_sheet(self) -> None:
+        dlg = SheetDialog(self)
+        dlg.exec()
+        if dlg.result is not None:
+            self.layers.append(dlg.result)
+            self._refresh_layers()
+
+    def _edit_layer(self) -> None:
+        idx = self._selected_idx()
+        if idx is None:
+            messagebox.showwarning("Layer", "Select a layer to edit.")
+            return
+        layer = self.layers[idx]
+        if layer.is_sheet:
+            dlg = SheetDialog(self, initial=layer)
+            dlg.exec()
+            if dlg.result is not None:
+                self.layers[idx] = dlg.result
+                self._refresh_layers()
+                self.layer_list.setCurrentRow(idx)
+        else:
+            dlg = LayerDialog(self, layer, presets=BUILTIN_MATERIAL_PRESETS)
+            dlg.exec()
+            if dlg.result is not None:
+                self.layers[idx] = dlg.result
+                self._refresh_layers()
+                self.layer_list.setCurrentRow(idx)
+
+    def _remove_layer(self) -> None:
+        idx = self._selected_idx()
+        if idx is None:
+            messagebox.showwarning("Layer", "Select a layer to remove.")
+            return
+        del self.layers[idx]
+        self._refresh_layers()
+
+    def _move_up(self) -> None:
+        idx = self._selected_idx()
+        if idx is None or idx == 0:
+            return
+        self.layers[idx - 1], self.layers[idx] = self.layers[idx], self.layers[idx - 1]
+        self._refresh_layers()
+        self.layer_list.setCurrentRow(idx - 1)
+
+    def _move_down(self) -> None:
+        idx = self._selected_idx()
+        if idx is None or idx >= len(self.layers) - 1:
+            return
+        self.layers[idx + 1], self.layers[idx] = self.layers[idx], self.layers[idx + 1]
+        self._refresh_layers()
+        self.layer_list.setCurrentRow(idx + 1)
+
+    def _load_layers(self, layer_configs: list[LayerConfig] | None = None) -> list[LoadedLayer]:
+        source_layers = self.layers if layer_configs is None else layer_configs
+        loaded: list[LoadedLayer] = []
+        # Share duplicate material tables within this run. A later run always
+        # reads disk again, so replacing a source cannot leave a stale cache.
+        tables = {}
+
+        def material_table(filename):
+            path = Path(filename).resolve()
+            if path not in tables:
+                tables[path] = read_material_table(path)
+            return tables[path]
+        for i, layer in enumerate(source_layers, start=1):
+            if layer.is_sheet:
+                if layer.sheet_resistance <= 0:
+                    raise ValueError(f"Layer {i}: sheet resistance must be > 0.")
+                loaded.append(
+                    LoadedLayer(
+                        thickness_m=0.0,
+                        anisotropic=False,
+                        polarization_deg=0.0,
+                        table_0deg=None,
+                        table_90deg=None,
+                        is_sheet=True,
+                        sheet_resistance=layer.sheet_resistance,
+                    )
+                )
+                continue
+
+            t_m = layer.thickness_in * INCH_TO_M
+            if t_m <= 0:
+                raise ValueError(f"Layer {i}: thickness must be > 0.")
+
+            if layer.material_source not in ('file', 'constant'):
+                raise ValueError(f'Layer {i}: choose a material CSV or constant ε/μ.')
+            table_0 = constant_material_from_layer(layer) if layer.is_constant else material_table(layer.file_0deg)
+            table_90 = (
+                material_table(layer.file_90deg)
+                if layer.anisotropic
+                else None
+            )
+            loaded.append(
+                LoadedLayer(
+                    thickness_m=t_m,
+                    anisotropic=layer.anisotropic,
+                    polarization_deg=layer.polarization_deg,
+                    table_0deg=table_0,
+                    table_90deg=table_90,
+                )
+            )
+        return loaded
+
+    def _snapshot_layers(self) -> list[LayerConfig]:
+        return copy.deepcopy(self.layers)
+
+    def _set_task_state(self, running: bool, text: str) -> None:
+        self._task_running = running
+        self.tolerance_workspace.set_busy(running)
+        for btn in (
+            self.compute_btn,
+            self.coating_check_btn,
+            self.ibc_batch_export_btn,
+            self.angle_compute_btn,
+            self.thk_compute_btn,
+            self.inv_run_btn,
+            self.inv_apply_btn,
+            self.inv_setup_btn, self.inv_check_btn,
+            self.inv_save_candidate_btn,
+            self.inv_checkpoint_save_btn, self.inv_checkpoint_load_btn,
+            self.inverse_recovery_path,
+            self.layer_add_btn,
+            self.layer_add_sheet_btn,
+            self.layer_edit_btn,
+            self.layer_remove_btn,
+            self.layer_up_btn,
+            self.layer_down_btn,
+            self.mix_add_btn,
+            self.mix_edit_btn,
+            self.mix_remove_btn,
+            self.mix_run_btn,
+            self.mix_preview_btn,
+            self.mix_apply_btn,
+            self.mix_export_btn,
+        ):
+            if btn is not None:
+                btn.setEnabled(not running)
+        self.inv_stop_btn.setEnabled(running and self._inverse_active)
+        if self.mix_stop_btn is not None:
+            self.mix_stop_btn.setEnabled(running and self._mix_active)
+        self.inv_extend_btn.setEnabled(not running and self._inverse_can_resume())
+        for panel in self.analysis_panels.values():
+            if hasattr(panel, 'export_action'):
+                panel.export_action.setEnabled(not running and panel.result is not None
+                                               and not panel.view.currentText().startswith('Coating'))
+        self._refresh_ibc_batch_preview()
+        self.status_var.set(text)
+        if self.status_progress is not None:
+            self.status_progress.setRange(0, 0)
+            self.status_progress.setVisible(running)
+
+    def _run_background_task(
+        self,
+        task_name: str,
+        worker: Callable[[], _T],
+        on_success: Callable[[_T], None],
+        error_title: str,
+    ) -> None:
+        if self._task_running:
+            messagebox.showwarning(task_name, "Another task is already running.")
+            return
+
+        result_q: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+        self._set_task_state(True, f"{task_name} running...")
+
+        def _runner() -> None:
+            try:
+                result_q.put(("ok", worker()))
+            except Exception as exc:
+                result_q.put(("err", exc))
+
+        threading.Thread(target=_runner, daemon=True).start()
+
+        timer = QTimer(self)
+        timer.setInterval(100)
+
+        def _poll() -> None:
+            from .tolerance_analysis import StopToleranceAnalysis
+            try:
+                status, payload = result_q.get_nowait()
+            except queue.Empty:
+                if self._inverse_active:
+                    self._show_inverse_progress()
+                if self._mix_active and self._mix_progress is not None:
+                    done, total, phase = self._mix_progress
+                    self.status_var.set(f'Material Mix: {phase} {done:,} / {total:,}')
+                    self.status_progress.setRange(0, 1000)
+                    self.status_progress.setValue(int(1000 * done / max(1, total)))
+                return
+            timer.stop()
+            timer.deleteLater()
+            self._inverse_active = False
+            self._mix_active = False
+            self._set_task_state(False, "Ready")
+            if status == "ok":
+                on_success(payload)  # type: ignore[arg-type]
+            elif isinstance(payload, (StopMixSearch, StopToleranceAnalysis)):
+                self.status_var.set(str(payload))
+                if isinstance(payload, StopToleranceAnalysis):
+                    self.tolerance_workspace.progress_label.setText(str(payload))
+            else:
+                messagebox.showerror(error_title, str(payload))
+
+        timer.timeout.connect(_poll)
+        timer.start()
+
+    def _show_guide(self, topic=None) -> None:
+        topic = topic or MODE_TOPICS.get(self._active_left_tab_label(), 'overview')
+        self.guide.open_topic(topic)
+        self._select_mode(self._mode_labels.index('About & Guide'))
+
+    def _open_guide_workflow(self, mode) -> None:
+        if mode not in MODE_TOPICS:
+            return
+        if mode in self._analysis_page_indices:
+            self._analysis_page_indices[mode] = 0
+        if mode == 'Inverse Design':
+            self._inverse_page_index = 0
+        if mode == 'Sensitivity & Yield':
+            self.tolerance_workspace.tabs.setCurrentIndex(0)
+        self._select_mode(self._mode_labels.index(mode))
+
+    def _select_mode(self, index: int) -> None:
+        if self.mode_stack is None:
+            return
+        if self.mode_stack.currentIndex() == index:
+            self._on_left_tab_changed(index)
+        else:
+            # currentChanged owns the refresh so programmatic mode changes and
+            # navigation-button changes follow exactly the same path.
+            self.mode_stack.setCurrentIndex(index)
+
+    def _material_explorer_stack_sources(self) -> list[SourceRequest]:
+        """Return measured material files referenced by the current stack."""
+
+        requests: list[SourceRequest] = []
+        for index, layer in enumerate(self.layers, start=1):
+            if layer.is_sheet or layer.is_constant:
+                continue
+            primary = str(layer.file_0deg).strip()
+            if primary:
+                orientation = " 0 deg" if layer.anisotropic else ""
+                requests.append(
+                    (primary, f"Layer {index}{orientation}: {Path(primary).name}")
+                )
+            secondary = str(layer.file_90deg).strip()
+            if layer.anisotropic and secondary:
+                requests.append(
+                    (secondary, f"Layer {index} 90 deg: {Path(secondary).name}")
+                )
+        return requests
+
+    def _material_explorer_mix_sources(self) -> list[SourceRequest]:
+        """Return measured component/target files visible in Material Mix."""
+
+        requests: list[SourceRequest] = []
+        for index, component in enumerate(self.mix_components, start=1):
+            path = str(component.get("file", "")).strip()
+            if path:
+                requests.append(
+                    (path, f"Mix input {index}: {Path(path).name}")
+                )
+        target_is_active = (
+            self._mix_objective_is_property()
+            and self.mix_prop_source_var.get().strip().casefold().startswith("material")
+        )
+        target = self.mix_prop_file_var.get().strip()
+        if target_is_active and target:
+            requests.append((target, f"Mix target: {Path(target).name}"))
+        return requests
+
+    def _active_left_tab_label(self) -> str:
+        if self.mode_stack is None:
+            return ""
+        try:
+            return self._mode_labels[self.mode_stack.currentIndex()]
+        except Exception:
+            return ""
+
+    def _is_inverse_tab_active(self) -> bool:
+        return self._active_left_tab_label() == "Inverse Design"
+
+    def _is_mix_tab_active(self) -> bool:
+        return self._active_left_tab_label() == "Material Mix"
+
+    def _is_material_explorer_active(self) -> bool:
+        return self._active_left_tab_label() == "Material Explorer"
+
+    def _is_about_active(self) -> bool:
+        return self._active_left_tab_label() == "About & Guide"
+
+    def _is_tolerance_active(self) -> bool:
+        return self._active_left_tab_label() == 'Sensitivity & Yield'
+
+    def _sync_mode_chrome(self) -> None:
+        """Show the Material Mix plot band or a mode's own results workspace."""
+
+        if self._sync_analysis_chrome():
+            return
+        inverse = self._is_inverse_tab_active()
+        if hasattr(self, 'inverse_workspace_tabs'):
+            from PySide6.QtCore import QSignalBlocker
+            blocker = QSignalBlocker(self.inverse_workspace_tabs)
+            self.inverse_workspace_tabs.setCurrentIndex(self._inverse_page_index if inverse else 0)
+            self.inverse_workspace_tabs.setTabVisible(1, inverse)
+            self.inverse_workspace_tabs.tabBar().setVisible(inverse)
+            del blocker
+        read_only_page = self._is_material_explorer_active() or self._is_about_active() or self._is_tolerance_active()
+        show_solver_workspace = not (read_only_page or inverse)
+        if self.layers_group is not None:
+            self.layers_group.setVisible(not read_only_page)
+        if self.results_pane is not None:
+            if (
+                not show_solver_workspace
+                and self.work_split is not None
+                and not self.results_pane.isHidden()
+            ):
+                current_sizes = self.work_split.sizes()
+                if len(current_sizes) == 2 and current_sizes[1] > 0:
+                    self._solver_split_sizes = current_sizes
+            self.results_pane.setVisible(show_solver_workspace)
+            if show_solver_workspace and self.work_split is not None:
+                self.work_split.setSizes(self._solver_split_sizes)
+
+    def _on_left_tab_changed(self, _event: object) -> None:
+        if self.mode_stack is not None and self.nav_group is not None:
+            button = self.nav_group.button(self.mode_stack.currentIndex())
+            if button is not None and not button.isChecked():
+                button.setChecked(True)
+        self._sync_mode_chrome()
+        if self._is_material_explorer_active() and self.material_explorer is not None:
+            # This updates changed/missing source markers but does not reread a
+            # file; reload remains an explicit user action.
+            self.material_explorer.refresh_external_state()
+        self._update_plot()
+
+    def _update_plot(self) -> None:
+        panel = self._active_analysis_panel()
+        if panel is not None:
+            panel.draw()
+            return
+        if not MPL_AVAILABLE or self.ax_heatmap is None or self.canvas is None:
+            return
+        if self._is_inverse_tab_active():
+            self._update_inverse_plot()
+        elif self._is_mix_tab_active():
+            self._update_mix_plot()
+
+    def _compute_heatmap_data(
+        self,
+        loaded_layers: list[LoadedLayer],
+        wave_pol: str,
+        angles: list[float],
+        freqs: list[float] | None = None,
+        thickness_scale: float = 1.0,
+        eps_scale: float = 1.0,
+        mu_scale: float = 1.0,
+    ) -> dict[str, list[list[float]] | list[float]]:
+        if freqs is None:
+            f_start = float(self.f_start_var.get().strip())
+            f_stop = float(self.f_stop_var.get().strip())
+            f_step = float(self.f_step_var.get().strip())
+            freqs = make_frequency_sweep(f_start, f_stop, f_step)
+
+        for i, layer in enumerate(loaded_layers, start=1):
+            if layer.is_sheet:
+                continue
+            validate_sweep_coverage(freqs, layer.table_0deg, f"layer {i} 0 deg/isotropic")
+            if layer.anisotropic:
+                if layer.table_90deg is None:
+                    raise ValueError(f"Layer {i}: anisotropic layer is missing a 90 deg table.")
+                validate_sweep_coverage(freqs, layer.table_90deg, f"layer {i} 90 deg")
+
+        if NUMPY_AVAILABLE:
+            prepared_properties = prepare_layer_properties_many(freqs, loaded_layers)
+            grids = {k: np.zeros((len(freqs), len(angles)), dtype=float) for k in HEATMAP_METRIC_KEYS}
+            for j, a in enumerate(angles):
+                col = compute_angle_metrics_many(
+                    freqs,
+                    a,
+                    loaded_layers,
+                    wave_pol,
+                    thickness_scale=thickness_scale,
+                    eps_scale=eps_scale,
+                    mu_scale=mu_scale,
+                    prepared_properties=prepared_properties,
+                    return_arrays=True,
+                )
+                for key in HEATMAP_METRIC_KEYS:
+                    grids[key][:, j] = np.asarray(col[key], dtype=float)
+            metric_grids = grids
+        else:
+            metric_grids = {k: [] for k in HEATMAP_METRIC_KEYS}
+            for f_ghz in freqs:
+                row = compute_angle_metrics(
+                    f_ghz,
+                    angles[0],
+                    loaded_layers,
+                    wave_pol,
+                    thickness_scale=thickness_scale,
+                    eps_scale=eps_scale,
+                    mu_scale=mu_scale,
+                )
+                for key in HEATMAP_METRIC_KEYS:
+                    metric_grids[key].append([row[key]])
+            for j in range(1, len(angles)):
+                for i, f_ghz in enumerate(freqs):
+                    m = compute_angle_metrics(
+                        f_ghz,
+                        angles[j],
+                        loaded_layers,
+                        wave_pol,
+                        thickness_scale=thickness_scale,
+                        eps_scale=eps_scale,
+                        mu_scale=mu_scale,
+                    )
+                    for key in HEATMAP_METRIC_KEYS:
+                        metric_grids[key][i].append(m[key])
+
+        return {
+            "angle_deg": angles,
+            "freq_ghz": freqs,
+            **metric_grids,
+        }
+
+    def _compute_thickness_data(
+        self,
+        loaded_layers: list[LoadedLayer],
+        layer_idx: int,
+        thicknesses_in: list[float],
+        wave_pol: str,
+        angle_deg: float,
+        freqs: list[float],
+        thickness_scale: float = 1.0,
+        eps_scale: float = 1.0,
+        mu_scale: float = 1.0,
+    ) -> dict[str, list[list[float]] | list[float]]:
+        """Metric grids indexed [frequency][thickness] for one layer swept over
+        ``thicknesses_in`` at a fixed incidence angle. Material tables are read
+        once by the caller and shared across every thickness."""
+        for i, layer in enumerate(loaded_layers, start=1):
+            if layer.is_sheet:
+                continue
+            validate_sweep_coverage(freqs, layer.table_0deg, f"layer {i} 0 deg/isotropic")
+            if layer.anisotropic:
+                if layer.table_90deg is None:
+                    raise ValueError(f"Layer {i}: anisotropic layer is missing a 90 deg table.")
+                validate_sweep_coverage(freqs, layer.table_90deg, f"layer {i} 90 deg")
+
+        swept = loaded_layers[layer_idx]
+
+        def stack_for(thickness_in: float) -> list[LoadedLayer]:
+            trial = list(loaded_layers)
+            trial[layer_idx] = LoadedLayer(
+                thickness_m=thickness_in * INCH_TO_M,
+                anisotropic=swept.anisotropic,
+                polarization_deg=swept.polarization_deg,
+                table_0deg=swept.table_0deg,
+                table_90deg=swept.table_90deg,
+                is_sheet=swept.is_sheet,
+                sheet_resistance=swept.sheet_resistance,
+            )
+            return trial
+
+        if NUMPY_AVAILABLE:
+            prepared_properties = prepare_layer_properties_many(freqs, loaded_layers)
+            prepared_wave_terms = prepare_layer_wave_terms_many(
+                freqs,
+                angle_deg,
+                loaded_layers,
+                wave_pol,
+                eps_scale=eps_scale,
+                mu_scale=mu_scale,
+                prepared_properties=prepared_properties,
+            )
+            grids = {
+                k: np.zeros((len(freqs), len(thicknesses_in)), dtype=float)
+                for k in HEATMAP_METRIC_KEYS
+            }
+            for j, t_in in enumerate(thicknesses_in):
+                col = compute_angle_metrics_many(
+                    freqs,
+                    angle_deg,
+                    stack_for(t_in),
+                    wave_pol,
+                    thickness_scale=thickness_scale,
+                    eps_scale=eps_scale,
+                    mu_scale=mu_scale,
+                    prepared_wave_terms=prepared_wave_terms,
+                    return_arrays=True,
+                )
+                for key in HEATMAP_METRIC_KEYS:
+                    grids[key][:, j] = np.asarray(col[key], dtype=float)
+            metric_grids = grids
+        else:
+            metric_grids = {k: [[] for _ in freqs] for k in HEATMAP_METRIC_KEYS}
+            for t_in in thicknesses_in:
+                col = compute_angle_metrics_many(
+                    freqs,
+                    angle_deg,
+                    stack_for(t_in),
+                    wave_pol,
+                    thickness_scale=thickness_scale,
+                    eps_scale=eps_scale,
+                    mu_scale=mu_scale,
+                )
+                for key in HEATMAP_METRIC_KEYS:
+                    for i in range(len(freqs)):
+                        metric_grids[key][i].append(col[key][i])
+
+        return {
+            "thickness_in": thicknesses_in,
+            "freq_ghz": freqs,
+            **metric_grids,
+        }
+
+    def _compute_frequency_mode(
+        self,
+        output_path: Path,
+        loaded_layers: list[LoadedLayer],
+        backing: str,
+        uncertainty: UncertaintyConfig,
+        sweep: list[float],
+        wave_pol: str,
+        capture: dict | None = None,
+    ) -> tuple[int, str]:
+        for i, layer in enumerate(loaded_layers, start=1):
+            if layer.is_sheet:
+                continue
+            validate_sweep_coverage(sweep, layer.table_0deg, f"layer {i} 0 deg/isotropic")
+            if layer.anisotropic:
+                if layer.table_90deg is None:
+                    raise ValueError(f"Layer {i}: anisotropic layer is missing a 90 deg table.")
+                validate_sweep_coverage(sweep, layer.table_90deg, f"layer {i} 90 deg")
+
+        z_nom = compute_stack_impedance_many(sweep, loaded_layers, backing)
+        if capture is not None:
+            capture['nominal'] = list(z_nom)
+            capture['cases'] = [list(z_nom)]
+        scales = build_uncertainty_scales(uncertainty)
+        envelope_enabled = uncertainty.enabled and len(scales) > 1
+
+        # The nominal file always retains the exact three-column schema used
+        # by both RCS solvers. Uncertainty bounds belong in a separate analysis
+        # report and must never make the solver input incompatible.
+        nominal_rows = [
+            (f_ghz, z.real, z.imag) for f_ghz, z in zip(sweep, z_nom)
+        ]
+        uncertainty_path: Path | None = None
+        uncertainty_rows = None
+        if envelope_enabled:
+            zr_nom = [z.real for z in z_nom]
+            zi_nom = [z.imag for z in z_nom]
+            zr_min = zr_nom.copy()
+            zr_max = zr_nom.copy()
+            zi_min = zi_nom.copy()
+            zi_max = zi_nom.copy()
+            for t_scale, e_scale, m_scale in scales:
+                if is_nominal_scale(t_scale, e_scale, m_scale):
+                    continue
+                z_s = compute_stack_impedance_many(
+                    sweep,
+                    loaded_layers,
+                    backing,
+                    thickness_scale=t_scale,
+                    eps_scale=e_scale,
+                    mu_scale=m_scale,
+                )
+                if capture is not None:
+                    capture['cases'].append(list(z_s))
+                for i, z in enumerate(z_s):
+                    zr = z.real
+                    zi = z.imag
+                    zr_min[i] = min(zr_min[i], zr)
+                    zr_max[i] = max(zr_max[i], zr)
+                    zi_min[i] = min(zi_min[i], zi)
+                    zi_max[i] = max(zi_max[i], zi)
+
+            uncertainty_path = uncertainty_report_path(output_path)
+            uncertainty_rows = [
+                (
+                    f_ghz,
+                    zr_nom[i],
+                    zi_nom[i],
+                    zr_min[i],
+                    zr_max[i],
+                    zi_min[i],
+                    zi_max[i],
+                )
+                for i, f_ghz in enumerate(sweep)
+            ]
+        write_impedance_bundle(
+            output_path,
+            nominal_rows,
+            uncertainty_path,
+            uncertainty_rows,
+        )
+
+        summary = self._summarize_frequency_run(
+            sweep,
+            loaded_layers,
+            wave_pol,
+            envelope_enabled,
+            backing,
+        )
+        if uncertainty_path is not None:
+            summary += f"\nUncertainty report: {uncertainty_path}"
+        return len(sweep), summary
+
+    def _compute_angle_mode(
+        self,
+        output_path: Path,
+        loaded_layers: list[LoadedLayer],
+        uncertainty: UncertaintyConfig,
+        angles: list[float],
+        freqs: list[float],
+        wave_pol: str,
+    ) -> tuple[
+        int,
+        dict[str, list[list[float]] | list[float]],
+        dict[str, list[list[float]]] | None,
+        dict[str, list[list[float]]] | None,
+        str,
+    ]:
+        out = self._compute_heatmap_data(loaded_layers, wave_pol, angles, freqs=freqs)
+
+        scales = build_uncertainty_scales(uncertainty)
+        envelope_enabled = uncertainty.enabled and len(scales) > 1
+        envelope_min: dict[str, list[list[float]]] | None = None
+        envelope_max: dict[str, list[list[float]]] | None = None
+        if envelope_enabled:
+            if NUMPY_AVAILABLE:
+                envelope_min = {
+                    key: np.asarray(out[key], dtype=float).copy()
+                    for key in HEATMAP_METRIC_KEYS
+                }
+                envelope_max = {
+                    key: np.asarray(out[key], dtype=float).copy()
+                    for key in HEATMAP_METRIC_KEYS
+                }
+                for t_scale, e_scale, m_scale in scales:
+                    if is_nominal_scale(t_scale, e_scale, m_scale):
+                        continue
+                    s_out = self._compute_heatmap_data(
+                        loaded_layers,
+                        wave_pol,
+                        angles,
+                        freqs=freqs,
+                        thickness_scale=t_scale,
+                        eps_scale=e_scale,
+                        mu_scale=m_scale,
+                    )
+                    accumulate_grid_bounds(out, envelope_min, envelope_max, s_out)
+                    del s_out
+            else:
+                envelope_min = {
+                    key: [[v for v in row] for row in out[key]]
+                    for key in HEATMAP_METRIC_KEYS
+                }
+                envelope_max = {
+                    key: [[v for v in row] for row in out[key]]
+                    for key in HEATMAP_METRIC_KEYS
+                }
+                for t_scale, e_scale, m_scale in scales:
+                    if is_nominal_scale(t_scale, e_scale, m_scale):
+                        continue
+                    s_out = self._compute_heatmap_data(
+                        loaded_layers,
+                        wave_pol,
+                        angles,
+                        freqs=freqs,
+                        thickness_scale=t_scale,
+                        eps_scale=e_scale,
+                        mu_scale=m_scale,
+                    )
+                    for key in HEATMAP_METRIC_KEYS:
+                        for i in range(len(out["freq_ghz"])):
+                            for j in range(len(out["angle_deg"])):
+                                val = s_out[key][i][j]
+                                if key in PHASE_METRIC_KEYS:
+                                    val = align_phase_degrees(
+                                        val, out[key][i][j]
+                                    )
+                                envelope_min[key][i][j] = min(envelope_min[key][i][j], val)
+                                envelope_max[key][i][j] = max(envelope_max[key][i][j], val)
+
+        freq = out["freq_ghz"]
+        ang = out["angle_deg"]
+        metal_loss = out["metal_loss_db"]
+        metal_phase = out["metal_phase_deg"]
+        metal_abs = out["metal_absorption_db"]
+        air_loss = out["air_loss_db"]
+        air_phase = out["air_phase_deg"]
+        air_abs = out["air_absorption_db"]
+        insertion_loss = out["insertion_loss_db"]
+        insertion_phase = out["insertion_phase_deg"]
+
+        _validate_csv_path(output_path)
+        with _atomic_text_file(output_path) as f:
+            if envelope_enabled:
+                f.write(
+                    "frequency_hz,angle_deg,"
+                    "pec_reflection_db,pec_reflection_db_min,pec_reflection_db_max,"
+                    "pec_reflection_phase_deg,pec_reflection_phase_deg_min,pec_reflection_phase_deg_max,"
+                    "pec_absorbed_power_db,pec_absorbed_power_db_min,pec_absorbed_power_db_max,"
+                    "air_reflection_db,air_reflection_db_min,air_reflection_db_max,"
+                    "air_reflection_phase_deg,air_reflection_phase_deg_min,air_reflection_phase_deg_max,"
+                    "air_absorbed_power_db,air_absorbed_power_db_min,air_absorbed_power_db_max,"
+                    "transmission_db,transmission_db_min,transmission_db_max,"
+                    "transmission_phase_deg,transmission_phase_deg_min,transmission_phase_deg_max\n"
+                )
+            else:
+                f.write(
+                    "frequency_hz,angle_deg,pec_reflection_db,pec_reflection_phase_deg,pec_absorbed_power_db,"
+                    "air_reflection_db,air_reflection_phase_deg,air_absorbed_power_db,"
+                    "transmission_db,transmission_phase_deg\n"
+                )
+            for i, f_ghz in enumerate(freq):
+                for j, a in enumerate(ang):
+                    if envelope_enabled:
+                        if envelope_min is None or envelope_max is None:
+                            raise ValueError("Internal error: uncertainty envelopes are unavailable.")
+                        f.write(
+                            f"{f_ghz * HZ_PER_GHZ:.17g},{a:.12g},"
+                            f"{metal_loss[i][j]:.12g},"
+                            f"{envelope_min['metal_loss_db'][i][j]:.12g},{envelope_max['metal_loss_db'][i][j]:.12g},"
+                            f"{metal_phase[i][j]:.12g},"
+                            f"{envelope_min['metal_phase_deg'][i][j]:.12g},{envelope_max['metal_phase_deg'][i][j]:.12g},"
+                            f"{metal_abs[i][j]:.12g},"
+                            f"{envelope_min['metal_absorption_db'][i][j]:.12g},{envelope_max['metal_absorption_db'][i][j]:.12g},"
+                            f"{air_loss[i][j]:.12g},"
+                            f"{envelope_min['air_loss_db'][i][j]:.12g},{envelope_max['air_loss_db'][i][j]:.12g},"
+                            f"{air_phase[i][j]:.12g},"
+                            f"{envelope_min['air_phase_deg'][i][j]:.12g},{envelope_max['air_phase_deg'][i][j]:.12g},"
+                            f"{air_abs[i][j]:.12g},"
+                            f"{envelope_min['air_absorption_db'][i][j]:.12g},{envelope_max['air_absorption_db'][i][j]:.12g},"
+                            f"{insertion_loss[i][j]:.12g},"
+                            f"{envelope_min['insertion_loss_db'][i][j]:.12g},{envelope_max['insertion_loss_db'][i][j]:.12g},"
+                            f"{insertion_phase[i][j]:.12g},"
+                            f"{envelope_min['insertion_phase_deg'][i][j]:.12g},{envelope_max['insertion_phase_deg'][i][j]:.12g}\n"
+                        )
+                    else:
+                        f.write(
+                            f"{f_ghz * HZ_PER_GHZ:.17g},{a:.12g},"
+                            f"{metal_loss[i][j]:.12g},{metal_phase[i][j]:.12g},{metal_abs[i][j]:.12g},"
+                            f"{air_loss[i][j]:.12g},{air_phase[i][j]:.12g},{air_abs[i][j]:.12g},"
+                            f"{insertion_loss[i][j]:.12g},{insertion_phase[i][j]:.12g}\n"
+                        )
+
+        summary = self._summarize_angle_run(out, wave_pol, envelope_enabled)
+        return len(freq) * len(ang), out, envelope_min, envelope_max, summary
+
+    def _compute_thickness_mode(
+        self,
+        output_path: Path,
+        loaded_layers: list[LoadedLayer],
+        layer_idx: int,
+        uncertainty: UncertaintyConfig,
+        thicknesses_in: list[float],
+        freqs: list[float],
+        wave_pol: str,
+        angle_deg: float,
+    ) -> tuple[
+        int,
+        dict[str, list[list[float]] | list[float]],
+        dict[str, list[list[float]]] | None,
+        dict[str, list[list[float]]] | None,
+        str,
+    ]:
+        out = self._compute_thickness_data(
+            loaded_layers, layer_idx, thicknesses_in, wave_pol, angle_deg, freqs
+        )
+
+        scales = build_uncertainty_scales(uncertainty)
+        envelope_enabled = uncertainty.enabled and len(scales) > 1
+        envelope_min: dict[str, list[list[float]]] | None = None
+        envelope_max: dict[str, list[list[float]]] | None = None
+        if envelope_enabled:
+            envelope_min = {
+                key: np.asarray(out[key], dtype=float).copy() if NUMPY_AVAILABLE else [list(row) for row in out[key]]
+                for key in HEATMAP_METRIC_KEYS
+            }
+            envelope_max = {
+                key: np.asarray(out[key], dtype=float).copy() if NUMPY_AVAILABLE else [list(row) for row in out[key]]
+                for key in HEATMAP_METRIC_KEYS
+            }
+            for t_scale, e_scale, m_scale in scales:
+                if is_nominal_scale(t_scale, e_scale, m_scale):
+                    continue
+                s_out = self._compute_thickness_data(
+                    loaded_layers,
+                    layer_idx,
+                    thicknesses_in,
+                    wave_pol,
+                    angle_deg,
+                    freqs,
+                    thickness_scale=t_scale,
+                    eps_scale=e_scale,
+                    mu_scale=m_scale,
+                )
+                if NUMPY_AVAILABLE:
+                    accumulate_grid_bounds(out, envelope_min, envelope_max, s_out)
+                    del s_out
+                    continue
+                for key in HEATMAP_METRIC_KEYS:
+                    grid = s_out[key]
+                    for i in range(len(freqs)):
+                        for j in range(len(thicknesses_in)):
+                            val = grid[i][j]
+                            if key in PHASE_METRIC_KEYS:
+                                val = align_phase_degrees(
+                                    val, out[key][i][j]
+                                )
+                            if val < envelope_min[key][i][j]:
+                                envelope_min[key][i][j] = val
+                            if val > envelope_max[key][i][j]:
+                                envelope_max[key][i][j] = val
+
+        _validate_csv_path(output_path)
+        with _atomic_text_file(output_path) as f:
+            cols = ["frequency_hz", "thickness_in"]
+            for key in HEATMAP_METRIC_KEYS:
+                export_key = METRIC_EXPORT_NAMES[key]
+                cols.append(export_key)
+                if envelope_enabled:
+                    cols.extend((f"{export_key}_min", f"{export_key}_max"))
+            f.write(",".join(cols) + "\n")
+            for i, f_ghz in enumerate(freqs):
+                for j, t_in in enumerate(thicknesses_in):
+                    vals = [f_ghz * HZ_PER_GHZ, t_in]
+                    for key in HEATMAP_METRIC_KEYS:
+                        vals.append(out[key][i][j])
+                        if envelope_enabled:
+                            if envelope_min is None or envelope_max is None:
+                                raise ValueError(
+                                    "Internal error: uncertainty envelopes are unavailable."
+                                )
+                            vals.append(envelope_min[key][i][j])
+                            vals.append(envelope_max[key][i][j])
+                    f.write(",".join(f"{v:.17g}" for v in vals) + "\n")
+
+        summary = self._summarize_thickness_run(out, wave_pol, angle_deg, envelope_enabled)
+        return len(freqs) * len(thicknesses_in), out, envelope_min, envelope_max, summary
+
+    def _read_inverse_uncertainty_config(self) -> UncertaintyConfig:
+        if not self.inv_uncertainty_var.get():
+            return UncertaintyConfig(enabled=False, thickness_pct=0.0, eps_pct=0.0, mu_pct=0.0)
+
+        t_pct = float(self.inv_unc_t_pct_var.get().strip())
+        eps_pct = float(self.inv_unc_eps_pct_var.get().strip())
+        mu_pct = float(self.inv_unc_mu_pct_var.get().strip())
+        if not all(math.isfinite(value) for value in (t_pct, eps_pct, mu_pct)):
+            raise ValueError("Inverse-design uncertainty percentages must be finite.")
+        if t_pct < 0 or eps_pct < 0 or mu_pct < 0:
+            raise ValueError("Inverse-design uncertainty percentages must be >= 0.")
+        if t_pct >= 100 or eps_pct >= 100 or mu_pct >= 100:
+            raise ValueError(
+                "Inverse-design uncertainty percentages must be < 100."
+            )
+        return UncertaintyConfig(enabled=True, thickness_pct=t_pct, eps_pct=eps_pct, mu_pct=mu_pct)
+
+    def _parse_inverse_discrete_freqs(self, text: str) -> list[float]:
+        tokens = (
+            text.replace(",", " ")
+            .replace(";", " ")
+            .replace("\n", " ")
+            .split()
+        )
+        if not tokens:
+            raise ValueError("Enter one or more discrete frequencies in GHz (for example: 8.2, 9.5, 10.0).")
+        values: list[float] = []
+        for token in tokens:
+            value = float(token)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(
+                    "Discrete frequencies must be finite and > 0 GHz."
+                )
+            values.append(value)
+        unique_sorted = sorted(set(values))
+        if not unique_sorted:
+            raise ValueError("No valid discrete frequencies were provided.")
+        return unique_sorted
+
+    def _score_inverse_candidate(
+        self,
+        target_freqs: list[float],
+        target_angles: list[float],
+        candidate_layers: list[LoadedLayer],
+        wave_pol: str,
+        scales: list[tuple[float, float, float]],
+        score_mode: str,
+        prepared_wave_terms: dict[
+            tuple[float, float, float],
+            list[tuple["np.ndarray", "np.ndarray"] | None],
+        ] | None = None,
+        *, requirement_db=-10.,
+    ) -> tuple[float, float, float, float, float]:
+        return score_inverse_candidate(
+            target_freqs, target_angles, candidate_layers, wave_pol, scales,
+            score_mode, prepared_wave_terms,
+            stop_requested=lambda: self._inverse_active and self._inverse_stop_event.is_set(),
+            statistics=self._stats, compute_metrics=compute_angle_metrics_many,
+            requirement_db=requirement_db,
+        )
+
+    def _apply_inverse_candidate(self) -> None:
+        try:
+            if not self.inverse_candidates or self.inv_results_list is None:
+                messagebox.showwarning("Inverse Design", "Run inverse design first.")
+                return
+            row = self._selected_inverse_index()
+            if row < 0:
+                messagebox.showwarning("Inverse Design", "Select a candidate to apply.")
+                return
+            idx = int(row)
+            if idx < 0 or idx >= len(self.inverse_candidates):
+                messagebox.showwarning("Inverse Design", "Selected candidate is out of range.")
+                return
+
+            self._ensure_inverse_result_current()
+            cand = self.inverse_candidates[idx]
+            if (
+                len(cand.thickness_in) != len(self.layers)
+                or len(cand.material_files) != len(self.layers)
+                or len(cand.sheet_resistance_ohm) != len(self.layers)
+            ):
+                raise ValueError("Layer count changed since inverse design run. Re-run inverse design.")
+
+            for i, layer in enumerate(self.layers):
+                if layer.is_sheet:
+                    if cand.sheet_resistance_ohm[i] > 0:
+                        layer.sheet_resistance = cand.sheet_resistance_ohm[i]
+                    continue
+                layer.thickness_in = cand.thickness_in[i]
+                if not layer.anisotropic and not layer.is_constant:
+                    layer.file_0deg = cand.material_files[i]
+            self._refresh_layers()
+
+            requirement = self.inverse_result_metadata.get('requirement_db')
+            score_description = (f'Gap: {cand.score_db:+.3f} dB ({"PASS" if cand.score_db <= 0 else "MISS"} at {requirement:g} dB)'
+                                 if requirement is not None else f'Score: {cand.score_db:.3f} dB')
+            msg = (
+                f"Applied inverse candidate #{idx + 1}.\n"
+                f"{score_description} | Nominal mean: {cand.nominal_mean_db:.3f} dB | "
+                f"Worst-corner mean: {cand.worst_mean_db:.3f} dB"
+            )
+            messagebox.showinfo("Inverse Design", msg)
+        except Exception as exc:
+            messagebox.showerror("Inverse Design Error", str(exc))
+
+    def _run_inverse_design(self, _checked=False, *, resume=False) -> None:
+        if self.job_is_running():
+            return
+        try:
+            if not self.layers:
+                raise ValueError("Add at least one layer before inverse design.")
+
+            layer_snapshot = self._snapshot_layers()
+            wave_pol = normalize_wave_polarization(self.inv_wave_pol_var.get())
+            freq_mode = self.inv_freq_mode_var.get().strip().lower()
+            if freq_mode.startswith("discrete"):
+                target_freqs = self._parse_inverse_discrete_freqs(self.inv_freq_list_var.get())
+                target_freq_desc = "Discrete GHz: " + ", ".join(f"{v:g}" for v in target_freqs)
+            else:
+                f_start = float(self.inv_target_start_var.get().strip())
+                f_stop = float(self.inv_target_stop_var.get().strip())
+                f_step = float(self.inv_target_step_var.get().strip())
+                target_freqs = make_frequency_sweep(f_start, f_stop, f_step)
+                target_freq_desc = f"Band GHz: {f_start:g}-{f_stop:g} (step {f_step:g})"
+            a_start = float(self.inv_angle_start_var.get().strip())
+            a_stop = float(self.inv_angle_stop_var.get().strip())
+            a_start = validate_incidence_angle(a_start)
+            a_stop = validate_incidence_angle(a_stop)
+            if a_stop < a_start:
+                raise ValueError("Inverse-design angle stop must be >= start.")
+            if a_stop == a_start:
+                target_angles = [a_start]
+            else:
+                a_step = float(self.inv_angle_step_var.get().strip())
+                target_angles = make_sweep(a_start, a_stop, a_step)
+
+            top_n = int(self.inv_top_n_var.get().strip())
+            if top_n <= 0:
+                raise ValueError("Keep best must be a positive integer.")
+            score_mode = self.inv_score_mode_var.get().strip()
+            if score_mode not in INVERSE_SCORE_MODE_OPTIONS:
+                raise ValueError('Choose a supported inverse-design objective.')
+            requirement_db = inverse_requirement_target(score_mode, self.inv_requirement_db_var.get())
+            uncertainty_cfg = self._read_inverse_uncertainty_config()
+            check_layers(layer_snapshot, target_freqs, materials=False)
+            grid = DesignGrid(layer_snapshot)
+            recovery_text = self.inverse_recovery_path.text().strip()
+            recovery_path = Path(recovery_text).expanduser().resolve() if recovery_text else None
+            if recovery_path is not None:
+                from .search_checkpoint import MAX_SCORE_BYTES
+                if recovery_path.suffix.lower() != '.fsearch':
+                    raise ValueError('Choose a recovery file with the .fsearch suffix.')
+                if not recovery_path.parent.is_dir():
+                    raise ValueError('The recovery file folder does not exist.')
+                if grid.total * 40 > MAX_SCORE_BYTES:
+                    raise ValueError('This grid exceeds the 512 MiB recovery-file limit. Reduce the grid or clear the optional recovery file.')
+        except Exception as exc:
+            messagebox.showerror("Inverse Design Error", str(exc))
+            return
+
+        checkpoint = copy.deepcopy(self._inverse_checkpoint) if resume else None
+        if resume and checkpoint is None:
+            messagebox.showerror("Inverse Design", "There is no interrupted analysis to resume.")
+            return
+        if recovery_path is not None and not resume and recovery_path.exists():
+            from uuid import uuid4
+            recovery_path = recovery_path.with_name(
+                f'{recovery_path.stem}-fresh-{uuid4().hex[:12]}.fsearch')
+            self.inverse_recovery_path.setText(str(recovery_path))
+        self._inverse_stop_event.clear()
+        self._inverse_active = True
+        self._inverse_progress = (checkpoint['next_index'] if checkpoint else 0, grid.total, 'Analyzing')
+        completed = {}
+        band_sweep = not self.inv_freq_mode_var.get().lower().startswith('discrete')
+        if self._is_inverse_tab_active():
+            self.inverse_workspace_tabs.setCurrentIndex(0)
+
+        def report_progress(index, total, phase):
+            self._inverse_progress = (index, total, phase)
+
+        request = InverseSearchRequest(
+            layer_snapshot=layer_snapshot,
+            target_freqs=target_freqs,
+            target_angles=target_angles,
+            wave_pol=wave_pol,
+            uncertainty_cfg=uncertainty_cfg,
+            score_mode=score_mode,
+            checkpoint=checkpoint,
+            grid=grid,
+            top_n=top_n,
+            target_freq_desc=target_freq_desc,
+            a_start=a_start,
+            a_stop=a_stop,
+            numpy_available=NUMPY_AVAILABLE,
+            requirement_db=requirement_db,
+        )
+
+        def worker():
+            from .search_checkpoint import save_checkpoint
+            first_write = True
+
+            def publish_checkpoint(state):
+                nonlocal first_write
+                save_checkpoint(recovery_path, state, overwrite=resume or not first_write)
+                first_write = False
+
+            result, checkpoint_result = run_inverse_search(
+                request, stop_requested=self._inverse_stop_event.is_set,
+                progress=report_progress, score_candidate=self._score_inverse_candidate,
+                read_table=read_material_table, compute_metrics=compute_angle_metrics_many,
+                checkpoint_callback=publish_checkpoint
+                if recovery_path is not None else None,
+            )
+            completed.update(checkpoint_result)
+            return result
+
+        def on_success(result: tuple[list[InverseCandidate], str, list[float], list[list[list[float]]]]) -> None:
+            self._inverse_active = False
+            self._inverse_checkpoint = completed
+            self._inverse_result_identity = completed["identity"]
+            self.inv_extend_btn.setEnabled(self._inverse_can_resume())
+            self.inverse_candidates, msg, freqs_plot, samples_plot = result
+            self.inverse_plot_freqs = freqs_plot
+            self.inverse_plot_samples = samples_plot
+            self.inverse_result_metadata = {
+                'band_sweep': band_sweep,
+                'scores': completed['score_rows'][::5],
+                'score_mode': score_mode,
+                'requirement_db': requirement_db,
+                'layer_labels': [layer_material_label(layer) if not layer.is_sheet else 'Sheet' for layer in layer_snapshot],
+                'total': grid.total,
+                'complete': completed['next_index'] == grid.total,
+                'angles': list(target_angles),
+                'scales': build_uncertainty_scales(uncertainty_cfg),
+            }
+            self._inverse_summary = msg
+            if requirement_db is not None:
+                self.inv_target_db.setValue(requirement_db)
+                self.inv_curve_mode.setCurrentIndex(0)
+            self.inv_setup_status.setText(msg.splitlines()[0])
+            self.inv_result_status.setText(
+                f"{'Complete' if completed['next_index'] == grid.total else 'Incomplete'} · "
+                f"{completed['next_index']:,} / {grid.total:,} combinations analyzed · "
+                f"{len(self.inverse_candidates)} retained · {target_freq_desc} · "
+                f"{a_start:g}–{a_stop:g}° {wave_pol.upper()}"
+            )
+            # A new result set gets a fresh selection and default overlays.
+            from PySide6.QtCore import QSignalBlocker
+            blocker = QSignalBlocker(self.inv_results_list)
+            self.inv_results_list.setRowCount(0)
+            self._refresh_inverse_results_list()
+            del blocker
+            self._inverse_page_index = 1
+            if self._is_inverse_tab_active():
+                self.inverse_workspace_tabs.setCurrentIndex(1)
+            self._update_plot()
+
+        self._run_background_task("Inverse Design", worker, on_success, "Inverse Design Error")
+
+    def _bind_mix_input_invalidation(self) -> None:
+        """Prevent results from silently surviving a changed design problem."""
+        string_inputs = (
+            self.mix_rule_var,
+            self.mix_objective_var,
+            self.mix_thickness_var,
+            self.mix_freq_mode_var,
+            self.mix_freq_list_var,
+            self.mix_target_start_var,
+            self.mix_target_stop_var,
+            self.mix_target_step_var,
+            self.mix_prop_source_var,
+            self.mix_prop_eps_re_var,
+            self.mix_prop_eps_im_var,
+            self.mix_prop_mu_re_var,
+            self.mix_prop_mu_im_var,
+            self.mix_prop_file_var,
+            self.mix_prop_weps_var,
+            self.mix_prop_wmu_var,
+            self.mix_perf_metric_var,
+            self.mix_perf_target_var,
+            self.mix_perf_angle_start_var,
+            self.mix_perf_angle_stop_var,
+            self.mix_perf_angle_step_var,
+            self.mix_perf_wave_pol_var,
+            self.mix_max_evals_var,
+            self.mix_top_n_var,
+            self.mix_seed_var,
+            self.mix_score_mode_var,
+            self.mix_unc_t_pct_var,
+            self.mix_unc_eps_pct_var,
+            self.mix_unc_mu_pct_var,
+        )
+        boolean_inputs = (self.mix_refine_var, self.mix_uncertainty_var)
+        for var in string_inputs:
+            var.valueChanged.connect(lambda _value: self._invalidate_mix_results())
+        for var in boolean_inputs:
+            var.valueChanged.connect(lambda _value: self._invalidate_mix_results())
+
+    def _sync_mix_freq_mode_state(self) -> None:
+        mode = self.mix_freq_mode_var.get().strip().lower()
+        band_enabled = mode.startswith("band")
+        for entry in (
+            self.mix_target_start_entry,
+            self.mix_target_stop_entry,
+            self.mix_target_step_entry,
+        ):
+            if entry is not None:
+                entry.setEnabled(band_enabled)
+        if self.mix_freq_list_entry is not None:
+            self.mix_freq_list_entry.setEnabled(not band_enabled)
+
+    def _sync_mix_uncertainty_state(self) -> None:
+        enabled = self.mix_uncertainty_var.get()
+        for entry in (self.mix_unc_t_entry, self.mix_unc_eps_entry, self.mix_unc_mu_entry):
+            if entry is not None:
+                entry.setEnabled(enabled)
+
+    def _mix_objective_is_property(self) -> bool:
+        text = self.mix_objective_var.get().strip().lower()
+        return "target properties" in text or text.startswith("match properties")
+
+    def _mix_objective_is_performance(self) -> bool:
+        return "performance" in self.mix_objective_var.get().strip().lower()
+
+
+    def _sync_mix_objective_state(self) -> None:
+        property_mode = self._mix_objective_is_property()
+        performance_mode = self._mix_objective_is_performance()
+        inverse = property_mode or performance_mode
+        if self.mix_prop_frame is not None:
+            self.mix_prop_frame.setVisible(property_mode)
+        if self.mix_perf_frame is not None:
+            self.mix_perf_frame.setVisible(performance_mode)
+        if self.mix_search_frame is not None:
+            self.mix_search_frame.setVisible(inverse)
+        if self.mix_run_btn is not None:
+            self.mix_run_btn.setVisible(inverse)
+        if self.mix_preview_btn is not None:
+            self.mix_preview_btn.setText(
+                "Preview current recipe" if inverse else "Calculate recipe"
+            )
+        if self.mix_workflow_help_label is not None:
+            if property_mode:
+                help_text = (
+                    "Inverse workflow: set a target ε/μ and allowable volume-% "
+                    "range for each material. FREDDY searches the bounded "
+                    "volume-fraction simplex and reports the best recipes."
+                )
+            elif performance_mode:
+                help_text = (
+                    "Performance workflow: choose a reflection, absorption, or "
+                    "transmission requirement over frequency and incidence angle. "
+                    "FREDDY searches recipes whose worst grid point meets it."
+                )
+            else:
+                help_text = (
+                    "Forward workflow: enter relative volume amounts for the "
+                    "known recipe. FREDDY normalizes them to volume percent and "
+                    "predicts the effective ε/μ over the selected band."
+                )
+            self.mix_workflow_help_label.setText(help_text)
+        self._sync_mix_prop_source_state()
+        self._on_mix_performance_metric_changed()
+        self._on_mix_model_changed()
+
+    def _sync_mix_prop_source_state(self) -> None:
+        prop = self._mix_objective_is_property()
+        use_file = self.mix_prop_source_var.get().strip().lower().startswith("material")
+        for entry in self.mix_prop_const_entries:
+            entry.setEnabled(prop and not use_file)
+        if self.mix_prop_file_entry is not None:
+            self.mix_prop_file_entry.setEnabled(prop and use_file)
+        if self.mix_prop_browse_btn is not None:
+            self.mix_prop_browse_btn.setEnabled(prop and use_file)
+
+    def _on_mix_performance_metric_changed(self) -> None:
+        metric_label = self.mix_perf_metric_var.get()
+        spec = MIX_PERFORMANCE_SPEC_BY_LABEL.get(metric_label)
+        previous = getattr(self, "_mix_last_perf_metric", None)
+        if spec is not None and previous is not None and previous != metric_label:
+            # A percent target is not a sensible carry-over from a dB target (or
+            # vice versa). Start a newly selected metric from its documented
+            # default; the user can then edit it explicitly.
+            self.mix_perf_target_var.set(str(spec["default_target"]))
+        self._mix_last_perf_metric = metric_label
+        if spec is None:
+            text = "Select a supported performance metric."
+        elif spec["direction"] == "at_most":
+            text = f"Requirement: every point must be ≤ target {spec['unit']}"
+        else:
+            text = f"Requirement: every point must be ≥ target {spec['unit']}"
+        if self.mix_perf_requirement_label is not None:
+            self.mix_perf_requirement_label.setText(text)
+
+    def _on_mix_model_changed(self) -> None:
+        try:
+            rule = normalize_mix_rule(self.mix_rule_var.get())
+            description = MIX_RULE_DESCRIPTIONS[rule]
+        except Exception as exc:
+            description = str(exc)
+        if self.mix_model_help_label is not None:
+            self.mix_model_help_label.setText("Model assumptions: " + description)
+        self._refresh_mix_components_list()
+        self._update_plot()
+
+    def _browse_mix_prop_file(self) -> None:
+        p = filedialog.askopenfilename(title="Select target material file", parent=self, filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")])
+        if p:
+            self.mix_prop_file_var.set(p)
+
+    def _coerce_mix_component(self, raw: dict) -> dict:
+        result = {
+            "file": str(raw.get("file", "")).strip(),
+            "parts": float(raw.get("parts", 1.0)),
+            "min": float(raw.get("min", 0.0)),
+            "max": float(raw.get("max", 100.0)),
+            "density": float(raw.get("density", 0.0)),
+            "units": "volume_percent",
+        }
+        numeric = (result["parts"], result["min"], result["max"], result["density"])
+        if any(not math.isfinite(value) for value in numeric):
+            raise ValueError("Material recipe fields must be finite.")
+        if result["parts"] < 0 or result["density"] < 0:
+            raise ValueError("Recipe amount and density must be >= 0.")
+        if not (0 <= result["min"] <= result["max"] <= 100):
+            raise ValueError("Inverse volume bounds must satisfy 0 <= min <= max <= 100%.")
+        return result
+
+    def _refresh_mix_components_list(self) -> None:
+        if self.mix_list is None:
+            return
+        row = self.mix_list.currentRow()
+        self.mix_list.clear()
+        total = sum(max(0.0, float(c.get("parts", 0.0))) for c in self.mix_components)
+        try:
+            rule = normalize_mix_rule(self.mix_rule_var.get())
+        except Exception:
+            rule = ""
+        for i, c in enumerate(self.mix_components, start=1):
+            parts = float(c.get("parts", 0.0))
+            frac = (parts / total * 100.0) if total > 0 else 0.0
+            name = Path(str(c.get("file", ""))).name or str(c.get("file", ""))
+            density = float(c.get("density", 0.0))
+            density_text = f" | ρ={density:g} g/cc" if density > 0 else ""
+            role = "HOST | " if rule == "maxwell-garnett" and i == 1 else ""
+            self.mix_list.addItem(
+                f"{i}. {role}{name} | recipe {frac:.1f} vol% "
+                f"(amount {parts:g}) | inverse bounds "
+                f"{float(c.get('min', 0.0)):g}–{float(c.get('max', 100.0)):g} vol%"
+                f"{density_text}"
+            )
+        if 0 <= row < len(self.mix_components):
+            self.mix_list.setCurrentRow(row)
+
+    def _mix_selected_idx(self) -> int | None:
+        if self.mix_list is None:
+            return None
+        row = self.mix_list.currentRow()
+        if row < 0 or row >= len(self.mix_components):
+            return None
+        return row
+
+    def _invalidate_mix_results(self) -> None:
+        self._mix_input_revision += 1
+        self._refresh_mix_budget()
+        self.mix_candidates = []
+        self.mix_plot_data = []
+        self.mix_preview = None
+        self._refresh_mix_results_list()
+        if self.mix_summary_label is not None:
+            self.mix_summary_label.setText(
+                "A material-mix input changed. Recalculate before using these results."
+            )
+
+    def _add_mix_component(self) -> None:
+        dlg = MixComponentDialog(self, presets=BUILTIN_MATERIAL_PRESETS)
+        dlg.exec()
+        if dlg.result is not None:
+            self.mix_components.append(dlg.result)
+            self._invalidate_mix_results()
+            self._refresh_mix_components_list()
+            if self.mix_list is not None:
+                self.mix_list.setCurrentRow(len(self.mix_components) - 1)
+
+    def _edit_mix_component(self) -> None:
+        idx = self._mix_selected_idx()
+        if idx is None:
+            messagebox.showwarning("Material Mix", "Select a component to edit.")
+            return
+        dlg = MixComponentDialog(
+            self, initial=self.mix_components[idx], presets=BUILTIN_MATERIAL_PRESETS
+        )
+        dlg.exec()
+        if dlg.result is not None:
+            self.mix_components[idx] = dlg.result
+            self._invalidate_mix_results()
+            self._refresh_mix_components_list()
+            if self.mix_list is not None:
+                self.mix_list.setCurrentRow(idx)
+
+    def _remove_mix_component(self) -> None:
+        idx = self._mix_selected_idx()
+        if idx is None:
+            messagebox.showwarning("Material Mix", "Select a component to remove.")
+            return
+        del self.mix_components[idx]
+        self._invalidate_mix_results()
+        self._refresh_mix_components_list()
+
+    def _parse_mix_freqs(self) -> tuple[list[float], str]:
+        mode = self.mix_freq_mode_var.get().strip().lower()
+        if mode.startswith("discrete"):
+            target_freqs = self._parse_inverse_discrete_freqs(self.mix_freq_list_var.get())
+            desc = "Discrete GHz: " + ", ".join(f"{v:g}" for v in target_freqs)
+        else:
+            f_start = float(self.mix_target_start_var.get().strip())
+            f_stop = float(self.mix_target_stop_var.get().strip())
+            f_step = float(self.mix_target_step_var.get().strip())
+            target_freqs = make_frequency_sweep(f_start, f_stop, f_step)
+            desc = f"Band GHz: {f_start:g}-{f_stop:g} (step {f_step:g})"
+        return target_freqs, desc
+
+    def _parse_mix_property_target(
+        self, grid: list[float]
+    ) -> tuple[list[complex], list[complex], float, float, str]:
+        """Resolve the property-design target onto ``grid``. Returns
+        (target_eps, target_mu, eps_weight, mu_weight, description)."""
+        w_eps = float(self.mix_prop_weps_var.get().strip())
+        w_mu = float(self.mix_prop_wmu_var.get().strip())
+        if w_eps < 0 or w_mu < 0 or (w_eps + w_mu) <= 0:
+            raise ValueError("Property weights must be >= 0 and not both zero.")
+        source = self.mix_prop_source_var.get().strip().lower()
+        if source.startswith("material"):
+            path = self.mix_prop_file_var.get().strip()
+            if not path:
+                raise ValueError(
+                    "Select a target material CSV "
+                    "(5 columns: frequency_hz,eps_real,eps_imag,mu_real,mu_imag)."
+                )
+            table = read_material_table(Path(path))
+            validate_sweep_coverage(grid, table, "target material")
+            target_eps = interp_complex_many(grid, table.freq_ghz, table.eps_r)
+            target_mu = interp_complex_many(grid, table.freq_ghz, table.mu_r)
+            desc = f"file {Path(path).name}"
+        else:
+            eps_c = complex(
+                float(self.mix_prop_eps_re_var.get().strip()),
+                float(self.mix_prop_eps_im_var.get().strip()),
+            )
+            mu_c = complex(
+                float(self.mix_prop_mu_re_var.get().strip()),
+                float(self.mix_prop_mu_im_var.get().strip()),
+            )
+            if not all(
+                math.isfinite(value)
+                for value in (eps_c.real, eps_c.imag, mu_c.real, mu_c.imag)
+            ):
+                raise ValueError("Target ε and μ must contain finite values.")
+            if abs(eps_c) <= 1e-12 or abs(mu_c) <= 1e-12:
+                raise ValueError("Target ε and μ must be non-zero finite properties.")
+            if eps_c.imag > 0 or mu_c.imag > 0:
+                raise ValueError(
+                    "Target ε'' and μ'' must be <= 0 (loss is negative in this convention)."
+                )
+            target_eps = [eps_c] * len(grid)
+            target_mu = [mu_c] * len(grid)
+            desc = (
+                f"const ε={eps_c.real:g}{eps_c.imag:+g}j, "
+                f"μ={mu_c.real:g}{mu_c.imag:+g}j"
+            )
+        return target_eps, target_mu, w_eps, w_mu, desc
+
+    def _parse_mix_performance_target(self) -> dict:
+        spec = MIX_PERFORMANCE_SPEC_BY_LABEL.get(self.mix_perf_metric_var.get())
+        if spec is None:
+            raise ValueError("Select a supported stack-performance metric.")
+        target = float(self.mix_perf_target_var.get().strip())
+        if not math.isfinite(target):
+            raise ValueError("Performance threshold must be finite.")
+        if spec["unit"] == "%" and not 0.0 <= target <= 100.0:
+            raise ValueError("An absorption target must be between 0 and 100%.")
+        if spec["unit"] == "dB" and target > 0.0:
+            raise ValueError("Passive reflection/transmission thresholds must be <= 0 dB.")
+
+        angle_start = validate_incidence_angle(
+            float(self.mix_perf_angle_start_var.get().strip())
+        )
+        angle_stop = validate_incidence_angle(
+            float(self.mix_perf_angle_stop_var.get().strip())
+        )
+        if angle_stop < angle_start:
+            raise ValueError("Performance angle stop must be >= start.")
+        if abs(angle_stop - angle_start) <= 1e-12:
+            angles = [angle_start]
+        else:
+            angle_step = float(self.mix_perf_angle_step_var.get().strip())
+            angles = make_sweep(angle_start, angle_stop, angle_step)
+        wave_pol = normalize_wave_polarization(self.mix_perf_wave_pol_var.get())
+        return {
+            **spec,
+            "target": target,
+            "angles": angles,
+            "wave_pol": wave_pol,
+        }
+
+    @staticmethod
+    def _mix_performance_values(metrics: dict[str, list[float]], config: dict) -> list[float]:
+        return mix_performance_values(metrics, config)
+
+    @staticmethod
+    def _mix_performance_gap(values: list[float], config: dict) -> float:
+        return mix_performance_gap(values, config)
+
+    def _evaluate_mix_performance(
+        self,
+        table: MaterialTable,
+        thickness_in: float,
+        config: dict,
+        *,
+        thickness_scale: float = 1.0,
+        eps_scale: float = 1.0,
+        mu_scale: float = 1.0,
+        check_stop=lambda: None,
+    ) -> dict:
+        return evaluate_mix_performance(table, thickness_in, config, thickness_scale=thickness_scale, eps_scale=eps_scale, mu_scale=mu_scale, check_stop=check_stop)
+
+    def _load_mix_components(self) -> list[dict]:
+        if len(self.mix_components) < 2:
+            raise ValueError("Add at least two measured materials to make a blend.")
+        cache: dict[str, MaterialTable] = {}
+        out: list[dict] = []
+        for i, c in enumerate(self.mix_components, start=1):
+            path = str(c.get("file", "")).strip()
+            if not path:
+                raise ValueError(f"Component {i}: property file is required.")
+            key = str(Path(path))
+            if key not in cache:
+                cache[key] = read_material_table(Path(key))
+            entry = dict(c)
+            entry["table"] = cache[key]
+            out.append(entry)
+        return out
+
+    def _build_mix_display(
+        self,
+        components: list[MixComponent],
+        rule: str,
+        thickness_in: float,
+        grid_ghz: list[float],
+        target: dict | None = None,
+        performance: dict | None = None,
+        densities: list[float] | None = None,
+        component_names: list[str] | None = None,
+        check_stop=lambda: None,
+    ) -> dict:
+        # Synthesize on the frequency grid selected in the Material Mix tab.
+        # When a property target is given, also carry target curves and
+        # per-frequency mismatch.
+        # A model comparison at the band midpoint makes morphology sensitivity
+        # visible rather than implying that one mixing law is ground truth.
+        return build_mix_display(components, rule, thickness_in, grid_ghz, target, performance, densities, component_names, check_stop=check_stop)
+
+    def _preview_mix(self) -> None:
+        try:
+            loaded = self._load_mix_components()
+            rule = self.mix_rule_var.get()
+            normalize_mix_rule(rule)
+            thickness_in = float(self.mix_thickness_var.get().strip())
+            if thickness_in <= 0:
+                raise ValueError("Synthesized layer thickness must be > 0.")
+            target_freqs, _desc = self._parse_mix_freqs()
+            if self._mix_objective_is_property():
+                t_eps, t_mu, w_eps, w_mu, _tdesc = self._parse_mix_property_target(
+                    target_freqs
+                )
+                target = {
+                    "freqs": target_freqs,
+                    "eps": t_eps,
+                    "mu": t_mu,
+                    "w_eps": w_eps,
+                    "w_mu": w_mu,
+                }
+            else:
+                target = None
+            performance = (
+                self._parse_mix_performance_target()
+                if self._mix_objective_is_performance()
+                else None
+            )
+            components = [
+                MixComponent(table=c["table"], parts=float(c["parts"])) for c in loaded
+            ]
+            if sum(c.parts for c in components) <= 0:
+                raise ValueError("At least one component must have parts > 0 for a preview.")
+            display = self._build_mix_display(
+                components,
+                rule,
+                thickness_in,
+                target_freqs,
+                target=target,
+                performance=performance,
+                densities=[float(c.get("density", 0.0)) for c in loaded],
+                component_names=[Path(c["file"]).name for c in loaded],
+            )
+        except Exception as exc:
+            messagebox.showerror("Material Mix", str(exc))
+            return
+        self.mix_candidates = []
+        self.mix_plot_data = []
+        self.mix_preview = display
+        self._refresh_mix_results_list()
+        if self.mix_summary_label is not None:
+            self.mix_summary_label.setText(self._mix_display_summary(display))
+        self._update_plot()
+
+    def _mix_display_summary(self, display: dict) -> str:
+        fractions = display.get("fractions", [])
+        names = display.get("component_names", [])
+        recipe = " | ".join(
+            f"{name}: {100 * value:.1f}%"
+            for name, value in zip(names, fractions)
+        )
+        weight = display.get("weight_fractions")
+        weight_text = (
+            "\nWeight recipe: "
+            + " | ".join(
+                f"{name}: {100 * value:.1f}%"
+                for name, value in zip(names, weight)
+            )
+            if weight
+            else "\nWeight recipe unavailable (enter every density)"
+        )
+        density = display.get("density_gcc")
+        density_text = f" | blend density ≈ {density:.4g} g/cc" if density else ""
+        model = MIX_RULE_LABELS.get(display.get("model"), str(display.get("model", "")))
+        notes = " ".join(display.get("advisories", []))
+        summary = (
+            f"Selected model: {model}\nVolume recipe: {recipe}{weight_text}{density_text}\n"
+            f"Applicability: {notes}"
+        )
+        performance = display.get("performance")
+        if performance is not None:
+            relation = "≤" if performance["direction"] == "at_most" else "≥"
+            status = "PASS" if performance["gap"] <= 0.0 else "MISS"
+            summary += (
+                f"\nPerformance: {performance['label']} {relation} "
+                f"{performance['target']:g} {performance['unit']} | "
+                f"worst requirement gap {performance['gap']:+.3f} "
+                f"{performance['unit']} ({status})"
+            )
+        return summary
+
+    def _refresh_mix_budget(self) -> None:
+        if self.mix_budget_note is None:
+            return
+        try:
+            samples = int(self.mix_max_evals_var.get())
+            kept = min(int(self.mix_top_n_var.get()), samples)
+            extra = kept * MIX_REFINE_MAX_EVALS if self.mix_refine_var.get() else 0
+            self.mix_budget_note.setText(
+                f'Up to {samples:,} recipe samples + {extra:,} refinement evaluations. '
+                f'Each evaluates the selected band, angles and tolerance corners. '
+                f'Keep at most {MAX_MIX_RETAINED} recipes. Stop search cancels without publishing a new result.')
+        except ValueError:
+            self.mix_budget_note.setText('Enter whole numbers for recipe samples and recipes kept.')
+
+    def _stop_mix_search(self) -> None:
+        self._mix_stop_event.set()
+        self.mix_stop_btn.setEnabled(False)
+        self.status_var.set('Stopping Material Mix search…')
+
+    def _run_mix_design(self) -> None:
+        """Find bounded recipes for a property or stack-performance target."""
+        if self.job_is_running():
+            return
+        property_mode = self._mix_objective_is_property()
+        performance_mode = self._mix_objective_is_performance()
+        if not (property_mode or performance_mode):
+            self._preview_mix()
+            return
+        try:
+            comp_snapshot = [
+                self._coerce_mix_component(component)
+                for component in self.mix_components
+            ]
+            if len(comp_snapshot) < 2:
+                raise ValueError("Add at least two measured materials.")
+            rule_norm = normalize_mix_rule(self.mix_rule_var.get())
+            target_freqs, target_desc = self._parse_mix_freqs()
+            target: dict | None = None
+            performance_config: dict | None = None
+            if property_mode:
+                target_eps, target_mu, w_eps, w_mu, prop_desc = (
+                    self._parse_mix_property_target(target_freqs)
+                )
+                target = {
+                    "freqs": target_freqs,
+                    "eps": target_eps,
+                    "mu": target_mu,
+                    "w_eps": w_eps,
+                    "w_mu": w_mu,
+                }
+            else:
+                performance_config = self._parse_mix_performance_target()
+                prop_desc = ""
+            thickness_in = float(self.mix_thickness_var.get().strip())
+            if not math.isfinite(thickness_in) or thickness_in <= 0:
+                raise ValueError("Stack-layer thickness must be finite and > 0.")
+            max_evals = int(self.mix_max_evals_var.get().strip())
+            top_n = int(self.mix_top_n_var.get().strip())
+            if max_evals < 1 or top_n < 1:
+                raise ValueError("Recipe samples and number kept must be >= 1.")
+            top_n = min(top_n, max_evals)
+            if top_n > MAX_MIX_RETAINED:
+                raise ValueError(f'Keep at most {MAX_MIX_RETAINED} recipes for comparison.')
+            score_mode = self.mix_score_mode_var.get().strip()
+            uncertainty_cfg = self._read_uncertainty_config(
+                self.mix_uncertainty_var,
+                self.mix_unc_t_pct_var,
+                self.mix_unc_eps_pct_var,
+                self.mix_unc_mu_pct_var,
+            )
+            if property_mode:
+                # Effective properties do not depend on a later layer thickness.
+                uncertainty_cfg = UncertaintyConfig(
+                    uncertainty_cfg.enabled,
+                    0.0,
+                    uncertainty_cfg.eps_pct,
+                    uncertainty_cfg.mu_pct,
+                )
+            lower = [component["min"] / 100.0 for component in comp_snapshot]
+            upper = [component["max"] / 100.0 for component in comp_snapshot]
+            validate_fraction_bounds(lower, upper)
+            seed_text = self.mix_seed_var.get().strip()
+            search_seed: int | None = int(seed_text) if seed_text else None
+            refine = bool(self.mix_refine_var.get())
+            if refine and (not NUMPY_AVAILABLE or not SCIPY_AVAILABLE):
+                raise ValueError(
+                    "Local material-recipe refinement requires NumPy and SciPy."
+                )
+        except Exception as exc:
+            messagebox.showerror("Material Mix Error", str(exc))
+            return
+
+        request = MixSearchRequest(
+            uncertainty_cfg=uncertainty_cfg,
+            comp_snapshot=comp_snapshot,
+            target_freqs=target_freqs,
+            rule_norm=rule_norm,
+            property_mode=property_mode,
+            performance_mode=performance_mode,
+            target=target,
+            thickness_in=thickness_in,
+            performance_config=performance_config,
+            score_mode=score_mode,
+            search_seed=search_seed,
+            lower=lower,
+            upper=upper,
+            max_evals=max_evals,
+            top_n=top_n,
+            refine=refine,
+            prop_desc=prop_desc,
+            target_desc=target_desc,
+            numpy_available=NUMPY_AVAILABLE,
+        )
+
+        self._mix_stop_event.clear()
+        self._mix_active = True
+        self._mix_progress = None
+        input_revision = self._mix_input_revision
+
+        def progress(done, total, phase):
+            self._mix_progress = (done, total, phase)
+
+        def worker():
+            return run_mix_search(
+                request, evaluate_performance=self._evaluate_mix_performance,
+                build_display=self._build_mix_display, read_table=read_material_table,
+                optimizer=_scipy_optimize,
+                stop_requested=self._mix_stop_event.is_set, progress=progress,
+            )
+
+        def on_success(result: tuple[list[MixCandidate], list[dict], str]) -> None:
+            self._mix_active = False
+            if input_revision != self._mix_input_revision:
+                messagebox.showwarning('Material Mix', 'Inputs changed during the search. Recalculate before using results.')
+                return
+            self.mix_candidates, self.mix_plot_data, message = result
+            self.mix_preview = None
+            self._refresh_mix_results_list()
+            if self.mix_results_list is not None:
+                self.mix_results_list.setCurrentRow(0)
+            if self.mix_results_frame is not None:
+                self.mix_results_frame.expand()
+            if self.mix_summary_label is not None and self.mix_plot_data:
+                candidate = self.mix_candidates[0]
+                if candidate.objective_kind == "performance":
+                    status = "PASS" if candidate.worst_mean_db <= 0.0 else "MISS"
+                    score_text = (
+                        f"\nWorst uncertainty-corner gap: "
+                        f"{candidate.worst_mean_db:+.3f} {candidate.score_unit} "
+                        f"({status}; gap <= 0 passes)"
+                    )
+                else:
+                    score_text = f"\nBest target mismatch: {candidate.score_db:.3f}%"
+                self.mix_summary_label.setText(
+                    self._mix_display_summary(self.mix_plot_data[0]) + score_text
+                )
+            self._update_plot()
+            messagebox.showinfo("Material Mix", message)
+
+        self._run_background_task(
+            "Material Mix", worker, on_success, "Material Mix Error"
+        )
+
+    def _refresh_mix_results_list(self) -> None:
+        if self.mix_results_list is None:
+            return
+        self.mix_results_list.clear()
+        for i, c in enumerate(self.mix_candidates, start=1):
+            frac_text = " | ".join(
+                f"{Path(path).stem}: {fraction * 100:.0f}%"
+                for path, fraction in zip(c.component_files, c.fractions)
+            )
+            wt_text = (
+                " | wt=["
+                + " | ".join(
+                    f"{Path(path).stem}: {fraction * 100:.0f}%"
+                    for path, fraction in zip(c.component_files, c.weight_fractions)
+                )
+                + "]"
+                if c.weight_fractions
+                else ""
+            )
+            if c.objective_kind == "performance":
+                status = "PASS" if c.worst_mean_db <= 0.0 else "MISS"
+                score_text = (
+                    f"score={c.score_db:+.2f} {c.score_unit} | "
+                    f"nom gap={c.nominal_mean_db:+.2f} | "
+                    f"worst gap={c.worst_mean_db:+.2f} {status}"
+                )
+            else:
+                score_text = (
+                    f"err={c.score_db:.2f}% | nom={c.nominal_mean_db:.2f}% | "
+                    f"worst={c.worst_mean_db:.2f}%"
+                )
+            self.mix_results_list.addItem(
+                f"{i:02d}: {score_text} | vol=[{frac_text}]{wt_text}"
+            )
+
+    def _current_mix_material(self) -> tuple[MaterialTable, float, str]:
+        if self.mix_candidates:
+            idx = 0
+            if self.mix_results_list is not None and self.mix_results_list.currentRow() >= 0:
+                idx = self.mix_results_list.currentRow()
+            idx = max(0, min(idx, len(self.mix_candidates) - 1))
+            if idx >= len(self.mix_plot_data):
+                raise ValueError("Candidate frequency grid is unavailable; re-run the search.")
+            display = self.mix_plot_data[idx]
+            label = f"blend candidate #{idx + 1}"
+        elif self.mix_preview is not None:
+            display = self.mix_preview
+            label = "previewed blend"
+        else:
+            raise ValueError("Preview a blend or run a search first.")
+        # The plotted properties, recipe and thickness are one captured result.
+        # Export/apply must not reread mutable CSV files or current controls.
+        table = MaterialTable(
+            list(display["freqs"]),
+            [complex(re, im) for re, im in zip(display["eps_re"], display["eps_im"])],
+            [complex(re, im) for re, im in zip(display["mu_re"], display["mu_im"])],
+        )
+        return table, float(display["thickness_in"]), label
+
+    def _export_mix_material(self) -> None:
+        try:
+            table, _thickness, label = self._current_mix_material()
+        except Exception as exc:
+            messagebox.showerror("Material Mix", str(exc))
+            return
+        path_str = filedialog.asksaveasfilename(
+            title="Export mixed material",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+        )
+        if not path_str:
+            return
+        try:
+            write_material_table(Path(path_str), table)
+            self._publish_nominal_artifact("material", Path(path_str))
+        except Exception as exc:
+            messagebox.showerror("Material Mix", str(exc))
+            return
+        messagebox.showinfo("Material Mix", f"Exported {label} to:\n{path_str}")
+
+    def _apply_mix_as_layer(self) -> None:
+        try:
+            table, thickness_in, label = self._current_mix_material()
+        except Exception as exc:
+            messagebox.showerror("Material Mix", str(exc))
+            return
+        path_str = filedialog.asksaveasfilename(
+            title="Save mixed material for the new layer",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+        )
+        if not path_str:
+            return
+        try:
+            write_material_table(Path(path_str), table)
+            self._publish_nominal_artifact("material", Path(path_str))
+            if thickness_in <= 0:
+                thickness_in = 0.125
+            self.layers.append(
+                LayerConfig(
+                    thickness_in=thickness_in,
+                    anisotropic=False,
+                    file_0deg=path_str,
+                    file_90deg="",
+                    polarization_deg=0.0,
+                )
+            )
+            self._refresh_layers()
+        except Exception as exc:
+            messagebox.showerror("Material Mix", str(exc))
+            return
+        messagebox.showinfo(
+            "Material Mix",
+            f"Saved {label} and added it as a new layer:\n{path_str}",
+        )
+
+    def _draw_mix_placeholder(self, text: str) -> None:
+        if not MPL_AVAILABLE or self.ax_heatmap is None or self.canvas is None:
+            return
+        if self.heatmap_cbar is not None:
+            self.heatmap_cbar.remove()
+            self.heatmap_cbar = None
+        colors = self._colors
+        self.ax_heatmap.clear()
+        self.ax_heatmap.set_title("Synthesized Material")
+        self.ax_heatmap.text(
+            0.5,
+            0.5,
+            text,
+            ha="center",
+            va="center",
+            transform=self.ax_heatmap.transAxes,
+            color=colors["muted_text"],
+        )
+        self._style_plot_axis(self.ax_heatmap)
+        self.ax_heatmap.grid(False)
+        for ax, title in (
+            (self.ax_freq_slice, "Loss tangent"),
+            (self.ax_angle_slice, "Model sensitivity"),
+        ):
+            if ax is not None:
+                ax.clear()
+                ax.set_title(title, fontsize=9, pad=2)
+                self._style_plot_axis(ax)
+                ax.grid(False)
+        self.canvas.draw_idle()
+
+    @staticmethod
+    def _mix_plot_edges(values: list[float]) -> list[float]:
+        """Convert monotonic sample centers to plotting-cell edges."""
+        if len(values) == 1:
+            span = max(0.5, abs(values[0]) * 0.02)
+            return [values[0] - span, values[0] + span]
+        mids = [0.5 * (a + b) for a, b in zip(values[:-1], values[1:])]
+        return [values[0] - (mids[0] - values[0]), *mids, values[-1] + (values[-1] - mids[-1])]
+
+    def _draw_mix_performance_plot(
+        self, data: dict, performance: dict, subtitle: str, selected_idx: int
+    ) -> None:
+        """Draw the selected blend's full frequency/angle requirement grid."""
+        colors = self._colors
+        freqs = [float(value) for value in performance["freqs"]]
+        angles = [float(value) for value in performance["angles"]]
+        grid = performance["grid"]
+        direction = performance["direction"]
+        target = float(performance["target"])
+        unit = performance["unit"]
+        relation = "≤" if direction == "at_most" else "≥"
+
+        try:
+            cmin, cmax = self._get_color_limits()
+        except ValueError as exc:
+            messagebox.showerror("Colorbar", f"{exc}\nShowing the automatic color scale.")
+            cmin = cmax = None
+        self.ax_heatmap.clear()
+        image = self.ax_heatmap.pcolormesh(
+            self._mix_plot_edges(angles),
+            self._mix_plot_edges(freqs),
+            grid,
+            shading="flat",
+            cmap="viridis",
+            vmin=cmin,
+            vmax=cmax,
+        )
+        flat_grid = [value for row in grid for value in row]
+        if (
+            len(freqs) >= 2
+            and len(angles) >= 2
+            and min(flat_grid) <= target <= max(flat_grid)
+        ):
+            contour = self.ax_heatmap.contour(
+                angles,
+                freqs,
+                grid,
+                levels=[target],
+                colors=[colors["plot_worst"]],
+                linewidths=1.4,
+            )
+            if contour.allsegs and any(len(segment) > 0 for segment in contour.allsegs[0]):
+                self.ax_heatmap.clabel(contour, fmt={target: f"target {target:g}"}, fontsize=7)
+        self.ax_heatmap.set_title(f"{performance['label']} ({subtitle})")
+        self.ax_heatmap.set_xlabel("Incidence angle (deg)")
+        self.ax_heatmap.set_ylabel("Frequency (GHz)")
+        self._style_plot_axis(self.ax_heatmap)
+        self.ax_heatmap.grid(False)
+        self.heatmap_cbar = self.fig.colorbar(
+            image, ax=self.ax_heatmap, extend="neither" if cmin is None else "both"
+        )
+        self.heatmap_cbar.set_label(f"{performance['label']} [{unit}]")
+        style_colorbar(self.heatmap_cbar, colors)
+
+        reducer = max if direction == "at_most" else min
+        worst_by_freq = [reducer(row) for row in grid]
+        worst_by_angle = [
+            reducer(grid[freq_index][angle_index] for freq_index in range(len(freqs)))
+            for angle_index in range(len(angles))
+        ]
+
+        self.ax_freq_slice.clear()
+        self.ax_freq_slice.plot(
+            freqs,
+            worst_by_freq,
+            color=colors["plot_line_freq"],
+            linewidth=1.8,
+            label="worst angle",
+        )
+        self.ax_freq_slice.axhline(
+            target,
+            color=colors["plot_worst"],
+            linewidth=1.2,
+            linestyle="--",
+            label=f"target {relation} {target:g}",
+        )
+        self.ax_freq_slice.set_title("Worst angle at each frequency", fontsize=9, pad=2)
+        self.ax_freq_slice.set_xlabel("Frequency (GHz)", fontsize=8)
+        self.ax_freq_slice.set_ylabel(unit, fontsize=8)
+        self._style_plot_axis(self.ax_freq_slice)
+        self.ax_freq_slice.grid(True, color=colors["plot_grid"], alpha=0.3)
+        self.ax_freq_slice.legend(loc="best", fontsize=7)
+
+        self.ax_angle_slice.clear()
+        self.ax_angle_slice.plot(
+            angles,
+            worst_by_angle,
+            color=colors["plot_line_angle"],
+            linewidth=1.8,
+            label="worst frequency",
+        )
+        self.ax_angle_slice.axhline(
+            target,
+            color=colors["plot_worst"],
+            linewidth=1.2,
+            linestyle="--",
+            label=f"target {relation} {target:g}",
+        )
+        self.ax_angle_slice.set_title("Worst frequency at each angle", fontsize=9, pad=2)
+        self.ax_angle_slice.set_xlabel("Incidence angle (deg)", fontsize=8)
+        self.ax_angle_slice.set_ylabel(unit, fontsize=8)
+        self._style_plot_axis(self.ax_angle_slice)
+        self.ax_angle_slice.grid(True, color=colors["plot_grid"], alpha=0.3)
+        self.ax_angle_slice.legend(loc="best", fontsize=7)
+
+        if self.mix_summary_label is not None:
+            summary = self._mix_display_summary(data)
+            if self.mix_candidates and 0 <= selected_idx < len(self.mix_candidates):
+                candidate = self.mix_candidates[selected_idx]
+                status = "PASS" if candidate.worst_mean_db <= 0.0 else "MISS"
+                summary += (
+                    f"\nSearch score: {candidate.score_db:+.3f} "
+                    f"{candidate.score_unit}; worst gap "
+                    f"{candidate.worst_mean_db:+.3f} {candidate.score_unit} "
+                    f"({status}; gap ≤ 0 passes)"
+                )
+            self.mix_summary_label.setText(summary)
+        self.canvas.draw_idle()
+
+    def _update_mix_plot(self) -> None:
+        if (
+            not MPL_AVAILABLE
+            or self.ax_heatmap is None
+            or self.ax_freq_slice is None
+            or self.ax_angle_slice is None
+            or self.canvas is None
+        ):
+            return
+        if self.heatmap_cbar is not None:
+            self.heatmap_cbar.remove()
+            self.heatmap_cbar = None
+
+        data: dict | None = None
+        subtitle = ""
+        selected_idx = 0
+        if self.mix_candidates and self.mix_plot_data:
+            if self.mix_results_list is not None and self.mix_results_list.currentRow() >= 0:
+                selected_idx = self.mix_results_list.currentRow()
+            selected_idx = max(0, min(selected_idx, len(self.mix_plot_data) - 1))
+            data = self.mix_plot_data[selected_idx]
+            subtitle = f"candidate #{selected_idx + 1}"
+        elif self.mix_preview is not None:
+            data = self.mix_preview
+            subtitle = "preview"
+
+        if data is None:
+            self._draw_mix_placeholder(
+                "Preview a blend or run a search to view synthesized ε/μ."
+            )
+            return
+
+        colors = self._colors
+        freqs = data["freqs"]
+
+        performance = data.get("performance")
+        if performance is not None:
+            self._draw_mix_performance_plot(
+                data, performance, subtitle, selected_idx
+            )
+            return
+
+        has_target = "target_freqs" in data
+
+        self.ax_heatmap.clear()
+        self.ax_heatmap.plot(freqs, data["eps_re"], color=colors["plot_line_freq"], linewidth=1.8, label="eps'")
+        self.ax_heatmap.plot(freqs, data["eps_im"], color=colors["plot_worst"], linewidth=1.4, linestyle="--", label="eps''")
+        self.ax_heatmap.plot(freqs, data["mu_re"], color=colors["plot_line_angle"], linewidth=1.8, label="mu'")
+        self.ax_heatmap.plot(freqs, data["mu_im"], color=colors["plot_crosshair"], linewidth=1.4, linestyle="--", label="mu''")
+        if has_target:
+            tf = data["target_freqs"]
+            for key, color, label in (
+                ("target_eps_re", "plot_line_freq", "target eps'"),
+                ("target_eps_im", "plot_worst", "target eps''"),
+                ("target_mu_re", "plot_line_angle", "target mu'"),
+                ("target_mu_im", "plot_crosshair", "target mu''"),
+            ):
+                self.ax_heatmap.plot(
+                    tf,
+                    data[key],
+                    color=colors[color],
+                    linewidth=1.2,
+                    linestyle=":",
+                    alpha=0.75,
+                    label=label,
+                )
+        self.ax_heatmap.set_title(
+            f"Synthesized ε/μ vs target ({subtitle})" if has_target
+            else f"Synthesized ε/μ ({subtitle})"
+        )
+        self.ax_heatmap.set_xlabel("Frequency (GHz)")
+        self.ax_heatmap.set_ylabel("Relative ε, μ")
+        self._style_plot_axis(self.ax_heatmap)
+        self.ax_heatmap.grid(True, color=colors["plot_grid"], alpha=0.3)
+        self.ax_heatmap.legend(loc="best", fontsize=7, ncol=2 if has_target else 1)
+
+        self.ax_freq_slice.clear()
+        if has_target and data.get("err_pct"):
+            self.ax_freq_slice.plot(
+                data["target_freqs"],
+                data["err_pct"],
+                color=colors["plot_line_angle"],
+                linewidth=1.8,
+            )
+            self.ax_freq_slice.set_title("Property match error", fontsize=9, pad=2)
+            self.ax_freq_slice.set_ylabel("Mismatch (%)", fontsize=8)
+        else:
+            self.ax_freq_slice.plot(
+                freqs,
+                data["loss_tan_eps"],
+                color=colors["plot_line_freq"],
+                linewidth=1.8,
+                label="tan δε",
+            )
+            self.ax_freq_slice.plot(
+                freqs,
+                data["loss_tan_mu"],
+                color=colors["plot_line_angle"],
+                linewidth=1.8,
+                label="tan δμ",
+            )
+            self.ax_freq_slice.set_title("Effective loss tangent", fontsize=9, pad=2)
+            self.ax_freq_slice.set_ylabel("Loss tangent", fontsize=8)
+            self.ax_freq_slice.legend(loc="best", fontsize=7)
+        self.ax_freq_slice.set_xlabel("Frequency (GHz)", fontsize=8)
+        self._style_plot_axis(self.ax_freq_slice)
+        self.ax_freq_slice.grid(True, color=colors["plot_grid"], alpha=0.3)
+
+        self.ax_angle_slice.clear()
+        if self.mix_candidates:
+            score_unit = "%"
+            ranks = list(range(1, len(self.mix_candidates) + 1))
+            scores = [c.score_db for c in self.mix_candidates]
+            self.ax_angle_slice.bar(ranks, scores, color=colors["plot_line_freq"], alpha=0.7)
+            if 0 <= selected_idx < len(ranks):
+                self.ax_angle_slice.bar(
+                    [ranks[selected_idx]],
+                    [scores[selected_idx]],
+                    color=colors["plot_line_angle"],
+                    zorder=3,
+                )
+            self.ax_angle_slice.set_title("Blend scores by rank", fontsize=9, pad=2)
+            self.ax_angle_slice.set_xlabel("Candidate rank", fontsize=8)
+            self.ax_angle_slice.set_ylabel(f"Score ({score_unit})", fontsize=8)
+        else:
+            comparisons = data.get("model_comparison", [])
+            if comparisons:
+                positions = list(range(len(comparisons)))
+                width = 0.38
+                self.ax_angle_slice.bar(
+                    [position - width / 2 for position in positions],
+                    [entry["eps_re"] for entry in comparisons],
+                    width=width,
+                    color=colors["plot_line_freq"],
+                    alpha=0.75,
+                    label="ε′",
+                )
+                self.ax_angle_slice.bar(
+                    [position + width / 2 for position in positions],
+                    [entry["mu_re"] for entry in comparisons],
+                    width=width,
+                    color=colors["plot_line_angle"],
+                    alpha=0.75,
+                    label="μ′",
+                )
+                self.ax_angle_slice.set_xticks(positions)
+                self.ax_angle_slice.set_xticklabels(
+                    [entry["label"] for entry in comparisons],
+                    rotation=28,
+                    ha="right",
+                    fontsize=6,
+                )
+                self.ax_angle_slice.set_title(
+                    f"Model sensitivity @ {data['comparison_frequency']:g} GHz",
+                    fontsize=9,
+                    pad=2,
+                )
+                self.ax_angle_slice.set_ylabel("Real effective property", fontsize=8)
+                self.ax_angle_slice.legend(loc="best", fontsize=7)
+            else:
+                self.ax_angle_slice.set_title(
+                    "No alternate models applicable", fontsize=9, pad=2
+                )
+        self._style_plot_axis(self.ax_angle_slice)
+        self.ax_angle_slice.grid(True, color=colors["plot_grid"], alpha=0.3)
+
+        if self.mix_summary_label is not None:
+            summary = self._mix_display_summary(data)
+            if self.mix_candidates and 0 <= selected_idx < len(self.mix_candidates):
+                candidate = self.mix_candidates[selected_idx]
+                summary += f"\nTarget mismatch: {candidate.score_db:.3f}%"
+            self.mix_summary_label.setText(summary)
+
+        self.canvas.draw_idle()
+
+    def _export_ibc_batch(self) -> None:
+        try:
+            if not self.layers:
+                raise ValueError("Add at least one layer.")
+            layer_index = self._selected_ibc_batch_layer_index()
+            plan = self._plan_ibc_batch()
+            layer_snapshot = self._snapshot_layers()
+            # The selected layer is overwritten for every output. Seed only
+            # the frozen worker snapshot so loading does not depend on its
+            # current nominal thickness, while the live stack stays unchanged.
+            layer_snapshot[layer_index].thickness_in = plan[0].thickness_in
+            frequency_start = float(self.f_start_var.get().strip())
+            frequency_stop = float(self.f_stop_var.get().strip())
+            frequency_step = float(self.f_step_var.get().strip())
+            frequency_count = ibc_batch_frequency_count(
+                frequency_start,
+                frequency_stop,
+                frequency_step,
+            )
+            # Enforce the combined work bound before make_frequency_sweep
+            # allocates a potentially enormous list.
+            validate_ibc_batch_workload(len(plan), frequency_count)
+            frequencies = make_frequency_sweep(
+                frequency_start,
+                frequency_stop,
+                frequency_step,
+            )
+        except Exception as exc:
+            messagebox.showerror("IBC Batch", str(exc), parent=self)
+            return
+
+        if not self._confirm_output_replacements(
+            [item.path for item in plan], operation="IBC Batch"
+        ):
+            return
+
+        if len(plan) > 1:
+            # A multi-file export cannot honestly replace the host's singular
+            # attachable artifact. Clear it as soon as this batch starts so a
+            # previous unrelated nominal export cannot be attached afterward.
+            self.nominal_artifact_cleared.emit()
+
+        def worker() -> dict[str, object]:
+            loaded_layers = self._load_layers(layer_snapshot)
+            import numpy as np
+            impedance = np.empty((len(frequencies), len(plan)), dtype=complex)
+            indices = {item.path: i for i, item in enumerate(plan)}
+            expected_hashes = [''] * len(plan)
+            def capture(item, values):
+                impedance[:, indices[item.path]] = values
+                expected_hashes[indices[item.path]] = expected_ibc_digest(frequencies, values)
+            count = export_pec_ibc_thickness_batch(
+                plan, loaded_layers, layer_index, frequencies, on_result=capture
+            )
+            if any(file_digest(item.path) != expected_hashes[i] for i, item in enumerate(plan)):
+                raise ValueError('An exported IBC changed during publication. Re-export before comparing or attaching it.')
+            analysis = SweepResult(list(frequencies), [float(item.thickness_value) for item in plan],
+                f'Thickness ({plan[0].thickness_unit})',
+                f'IBC Batch · Layer {layer_index + 1} · {len(plan)} thicknesses · {frequencies[0]:g}–{frequencies[-1]:g} GHz · PEC · normal incidence',
+                {'TE': {'metal_loss_db': reflection_from_impedance(impedance)}},
+                impedance=impedance, files=[item.path.resolve() for item in plan],
+                file_hashes=expected_hashes, layers=stack_description(layer_snapshot))
+            analysis.summary = f'Exported {count} IBC files to {plan[0].path.parent.resolve()}. Each contains {len(frequencies)} frequency points.\nOnly the selected layer thickness was varied.'
+            return {"count": count, "frequency_count": len(frequencies), "analysis": analysis}
+
+        def on_success(result: dict[str, object]) -> None:
+            # A multi-file batch has no single honest "current" artifact for
+            # GHOST. Only a one-file batch is unambiguous enough to publish via
+            # the host's singular nominal-artifact signal.
+            if len(plan) == 1:
+                try:
+                    self._publish_nominal_artifact("ibc", plan[0].path)
+                except Exception as exc:
+                    messagebox.showerror(
+                        "Attachable IBC Export",
+                        "The IBC CSV was written but could not be made available "
+                        f"to GHOST:\n{exc}",
+                        parent=self,
+                    )
+            folder = plan[0].path.parent.resolve()
+            first = plan[0].path.name
+            last = plan[-1].path.name
+            detail = first if len(plan) == 1 else f"{first}\nthrough\n{last}"
+            message = (
+                f"Wrote {int(result['count'])} nominal PEC-backed IBC CSV(s), "
+                f"each with {int(result['frequency_count'])} frequency points, to:\n"
+                f"{folder}\n\n{detail}"
+            )
+            if len(plan) > 1:
+                message += (
+                    "\n\nNo one batch file was auto-selected for GHOST; choose "
+                    "the thickness-specific CSV you want to attach."
+                )
+            result['analysis'].summary = message
+            self._show_analysis_result('IBC Batch', result['analysis'])
+
+        self._run_background_task(
+            "IBC Batch", worker, on_success, "IBC Batch Error"
+        )
+
+    def _check_ghost_coating(self) -> None:
+        try:
+            if normalize_backing(self.backing_var.get()) != "pec":
+                raise ValueError("Select PEC backing for a coating on a GHOST conductor.")
+            if not self.layers:
+                raise ValueError("Add the coating layers first.")
+            snapshot = self._snapshot_layers()
+            frequencies = make_frequency_sweep(float(self.f_start_var.get()),
+                                              float(self.f_stop_var.get()),
+                                              float(self.f_step_var.get()))
+        except Exception as exc:
+            messagebox.showerror("GHOST coating check", str(exc))
+            return
+        from .ghost_coating import assess_scalar_coating, coating_report_text
+
+        def worker():
+            return assess_scalar_coating(frequencies, self._load_layers(snapshot), include_details=True)
+
+        def on_success(report):
+            context = f'GHOST coating check · PEC · {frequencies[0]:g}–{frequencies[-1]:g} GHz · TE and TM'
+            self.analysis_panels['Impedance'].set_coating(report, context)
+            self._open_analysis_results('Impedance')
+
+        self._run_background_task("GHOST coating check", worker, on_success, "GHOST coating check")
+
+    def _compute_impedance(self) -> None:
+        try:
+            if not self.layers:
+                raise ValueError("Add at least one layer.")
+
+            layer_snapshot = self._snapshot_layers()
+            output_path = Path(self.output_var.get().strip())
+            _validate_csv_path(output_path)
+            uncertainty = self._read_uncertainty_config(
+                self.uncertainty_var,
+                self.unc_t_pct_var,
+                self.unc_eps_pct_var,
+                self.unc_mu_pct_var,
+            )
+            uncertainty_has_bounds = uncertainty.enabled and any(
+                value > 0
+                for value in (
+                    uncertainty.thickness_pct,
+                    uncertainty.eps_pct,
+                    uncertainty.mu_pct,
+                )
+            )
+            f_start = float(self.f_start_var.get().strip())
+            f_stop = float(self.f_stop_var.get().strip())
+            f_step = float(self.f_step_var.get().strip())
+            freqs = make_frequency_sweep(f_start, f_stop, f_step)
+            backing = normalize_backing(self.backing_var.get())
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+            return
+
+        planned_outputs = [output_path]
+        if uncertainty_has_bounds:
+            planned_outputs.append(uncertainty_report_path(output_path))
+        if not self._confirm_output_replacements(
+            planned_outputs, operation="Impedance"
+        ):
+            return
+
+        # Impedance is a broadside (normal-incidence) solve; polarization is unused.
+        wave_pol = normalize_wave_polarization("TE")
+
+        def worker() -> dict[str, object]:
+            loaded_layers = self._load_layers(layer_snapshot)
+            capture = {}
+            n, summary = self._compute_frequency_mode(
+                output_path,
+                loaded_layers,
+                backing,
+                uncertainty,
+                freqs,
+                wave_pol,
+                capture=capture,
+            )
+            metrics = compute_angle_metrics_many(freqs, 0., loaded_layers, wave_pol)
+            analysis = impedance_result(freqs, capture, metrics, backing,
+                f'Impedance · {backing.upper()} backing · normal incidence · {freqs[0]:g}–{freqs[-1]:g} GHz · {tolerance_description(uncertainty)}')
+            analysis.summary = summary + f'\nExport: {output_path.resolve()}'
+            analysis.layers = stack_description(layer_snapshot)
+            return {"count": n, "summary": summary, "analysis": analysis}
+
+        def on_success(result: dict[str, object]) -> None:
+            self._show_analysis_result('Impedance', result['analysis'])
+            # Only the PEC-backed broadside result is a physically suitable
+            # one-sided IBC for a closed Type 2 GHOST body. Air-backed and all
+            # other analysis products intentionally never enter the handoff.
+            if backing == "pec":
+                try:
+                    self._publish_nominal_artifact("ibc", output_path)
+                except Exception as exc:
+                    messagebox.showerror(
+                        "Attachable IBC Export",
+                        "The nominal CSV was written but could not be made "
+                        f"available to GHOST:\n{exc}",
+                    )
+            message = (
+                f"Wrote {int(result['count'])} nominal solver-compatible "
+                f"frequency points to:\n{output_path}"
+            )
+            if uncertainty_has_bounds:
+                message += (
+                    "\n\nUncertainty bounds were written separately to:\n"
+                    f"{uncertainty_report_path(output_path)}"
+                )
+            if backing == "air":
+                messagebox.showwarning(
+                    "Complete — air-backed analysis caution",
+                    message
+                    + "\n\nThis air-terminated input impedance is a planar "
+                    "analysis result. It is not generally a physically "
+                    "equivalent one-sided IBC for a closed transmitting RCS "
+                    "body. Use PEC backing for a coating collapsed onto a "
+                    "Type 2 conductor, or export/model dielectric layers "
+                    "explicitly.",
+                )
+            self.status_var.set(f'Impedance complete: {output_path}')
+
+        self._run_background_task("Impedance", worker, on_success, "Error")
+
+    def _compute_off_angle(self) -> None:
+        try:
+            if not self.layers:
+                raise ValueError("Add at least one layer.")
+
+            layer_snapshot = self._snapshot_layers()
+            output_path = Path(self.angle_output_var.get().strip())
+            _validate_csv_path(output_path)
+            uncertainty = self._read_uncertainty_config(
+                self.angle_uncertainty_var,
+                self.angle_unc_t_pct_var,
+                self.angle_unc_eps_pct_var,
+                self.angle_unc_mu_pct_var,
+            )
+            f_start = float(self.angle_f_start_var.get().strip())
+            f_stop = float(self.angle_f_stop_var.get().strip())
+            f_step = float(self.angle_f_step_var.get().strip())
+            freqs = make_frequency_sweep(f_start, f_stop, f_step)
+            wave_pol = normalize_wave_polarization(self.wave_pol_var.get())
+
+            a_start = float(self.angle_start_var.get().strip())
+            a_stop = float(self.angle_stop_var.get().strip())
+            a_start = validate_incidence_angle(a_start)
+            a_stop = validate_incidence_angle(a_stop)
+            if a_stop < a_start:
+                raise ValueError("Angle stop must be >= start.")
+            if abs(a_stop - a_start) <= 1e-12:
+                angles = [a_start]
+            else:
+                a_step = float(self.angle_step_var.get().strip())
+                angles = make_sweep(a_start, a_stop, a_step)
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+            return
+
+        if not self._confirm_output_replacements(
+            [output_path], operation="Off-Angle"
+        ):
+            return
+
+        compare_both = self.angle_compare_both.isChecked()
+        def worker() -> dict[str, object]:
+            loaded_layers = self._load_layers(layer_snapshot)
+            other_pol = 'tm' if wave_pol == 'te' else 'te'
+            secondary = None
+            comparison_note = ''
+            if compare_both and any(layer.anisotropic for layer in loaded_layers) and max(angles) > 1e-12:
+                comparison_note = 'TM comparison unavailable for this directional stack at oblique angles. TE remains supported.'
+            elif compare_both:
+                secondary = extra_polarization(lambda t, e, m: self._compute_heatmap_data(
+                    loaded_layers, other_pol, angles, freqs=freqs,
+                    thickness_scale=t, eps_scale=e, mu_scale=m), uncertainty)
+            n, out, env_min, env_max, summary = self._compute_angle_mode(
+                output_path,
+                loaded_layers,
+                uncertainty,
+                angles,
+                freqs,
+                wave_pol,
+            )
+            pol = wave_pol.upper()
+            analysis = SweepResult(list(freqs), list(angles), 'Incidence angle (deg)',
+                f'Off Angle · {freqs[0]:g}–{freqs[-1]:g} GHz · {angles[0]:g}–{angles[-1]:g}° · ' +
+                ('TE and TM' if secondary is not None else pol) + ' · ' + tolerance_description(uncertainty)
+                + (' · TM comparison unavailable' if comparison_note else ''),
+                {pol: grid_metrics(out)}, polarization=pol,
+                lower={pol: grid_metrics(env_min)} if env_min else {},
+                upper={pol: grid_metrics(env_max)} if env_max else {},
+                summary=summary + f'\nExport: {output_path.resolve()} ({pol} only). Comparison polarization remains in Results.\n' + comparison_note,
+                layers=stack_description(layer_snapshot))
+            if secondary is not None:
+                analysis.metrics[other_pol.upper()] = secondary[0]
+                if secondary[1]:
+                    analysis.lower[other_pol.upper()] = secondary[1]
+                    analysis.upper[other_pol.upper()] = secondary[2]
+            return {
+                "analysis": analysis,
+                "count": n,
+                "summary": summary,
+            }
+
+        def on_success(result: dict[str, object]) -> None:
+            self._show_analysis_result('Off Angle', result['analysis'])
+
+        self._run_background_task("Off Angle", worker, on_success, "Error")
+
+    def _compute_thickness(self) -> None:
+        try:
+            if not self.layers:
+                raise ValueError("Add at least one layer.")
+
+            layer_idx = self._selected_thickness_layer_index()
+            layer_snapshot = self._snapshot_layers()
+            output_path = Path(self.thk_output_var.get().strip())
+            _validate_csv_path(output_path)
+            uncertainty = self._read_uncertainty_config(
+                self.thk_uncertainty_var,
+                self.thk_unc_t_pct_var,
+                self.thk_unc_eps_pct_var,
+                self.thk_unc_mu_pct_var,
+            )
+            f_start = float(self.thk_f_start_var.get().strip())
+            f_stop = float(self.thk_f_stop_var.get().strip())
+            f_step = float(self.thk_f_step_var.get().strip())
+            freqs = make_frequency_sweep(f_start, f_stop, f_step)
+            wave_pol = normalize_wave_polarization(self.thk_wave_pol_var.get())
+
+            angle_deg = float(self.thk_angle_var.get().strip())
+            angle_deg = validate_incidence_angle(angle_deg)
+
+            t_start = float(self.thk_start_var.get().strip())
+            t_stop = float(self.thk_stop_var.get().strip())
+            if t_start <= 0:
+                raise ValueError("Thickness start must be > 0 in.")
+            if t_stop < t_start:
+                raise ValueError("Thickness stop must be >= start.")
+            if abs(t_stop - t_start) <= 1e-12:
+                thicknesses = [t_start]
+            else:
+                t_step = float(self.thk_step_var.get().strip())
+                thicknesses = make_sweep(t_start, t_stop, t_step)
+            # The swept layer's own thickness is overwritten per column, so a
+            # zero-thickness placeholder in the stack is not an error here.
+            layer_snapshot[layer_idx].thickness_in = t_start
+        except Exception as exc:
+            messagebox.showerror("Error", str(exc))
+            return
+
+        if not self._confirm_output_replacements(
+            [output_path], operation="Thickness"
+        ):
+            return
+
+        def worker() -> dict[str, object]:
+            loaded_layers = self._load_layers(layer_snapshot)
+            n, out, env_min, env_max, summary = self._compute_thickness_mode(
+                output_path,
+                loaded_layers,
+                layer_idx,
+                uncertainty,
+                thicknesses,
+                freqs,
+                wave_pol,
+                angle_deg,
+            )
+            pol = wave_pol.upper()
+            analysis = SweepResult(list(freqs), list(thicknesses), 'Thickness (in)',
+                f'Thickness · Layer {layer_idx + 1} · {freqs[0]:g}–{freqs[-1]:g} GHz · {angle_deg:g}° {pol} · {tolerance_description(uncertainty)}',
+                {pol: grid_metrics(out)}, polarization=pol,
+                lower={pol: grid_metrics(env_min)} if env_min else {},
+                upper={pol: grid_metrics(env_max)} if env_max else {},
+                summary=summary + f'\nExport: {output_path.resolve()}', layers=stack_description(layer_snapshot))
+            return {
+                "analysis": analysis,
+                "count": n,
+                "summary": summary,
+            }
+
+        def on_success(result: dict[str, object]) -> None:
+            self._show_analysis_result('Thickness', result['analysis'])
+
+        self._run_background_task("Thickness", worker, on_success, "Error")
+
+
+def main() -> None:
+    if not QT_AVAILABLE:
+        raise SystemExit(
+            "PySide6 is not available. Install PySide6 to run the GUI."
+        )
+    app = QApplication.instance() or QApplication(sys.argv)
+    gui = ImpedanceGui()
+    gui.show()
+    app.exec()
+
+
+if __name__ == "__main__":
+    main()

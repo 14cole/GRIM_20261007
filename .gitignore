@@ -1,0 +1,21 @@
+# Audit reports and audit working folders (at any depth).
+*Audit*/
+*audit*/
+
+# Python caches and local environments.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Machine-local and temporary files.
+*.assembly.lock
+*.tmp
+Thumbs.db
+.DS_Store
+.env
+.env.*
+!.env.example
