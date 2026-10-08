@@ -51,7 +51,6 @@ from ghost_backend.io.grim import (
     _ensure_grim_ext,
     _suffix_for_incidence,
     compute_dbke_from_linear,
-    export_result_to_grim,
 )
 from ghost_backend.twod.solver import (
     solve_monostatic_rcs_2d_certified,
@@ -2085,50 +2084,9 @@ class SolverTab(RunSetupMixin, QWidget):
             return export_run(result, _planned_export_paths(result, output_path),
                 lambda single, path: self._export_result_files(single, path, source_path=source_path, history=history))
 
-        if _result_kind(result) != "bor":
-            return export_result_to_grim(
-                result,
-                output_path,
-                source_path=source_path,
-                history=history,
-                preserve_raw_complex_amplitude=True,
-            )
-        context = self.last_solve_context
-        if not isinstance(context, dict) or context.get("solver_kind") != "bor":
-            raise ValueError(
-                "The BoR solve context is unavailable; re-run the body before "
-                "exporting it."
-            )
-        from ghost_backend.assembly.fields import (
-            bodies_from_bor_solver_result,
-            bor_solver_diagnostics_by_frequency,
-            bor_output_profile,
-            bor_output_profile_metadata,
-            save_monostatic_grim,
-        )
-
-        bodies = bodies_from_bor_solver_result(result)
-        profile = bor_output_profile(
-            context["snapshot"], str(context["units"])
-        )
-        radar_grid = context.get("radar_grid")
-        if radar_grid is None:
-            raise ValueError("The BoR radar grid is unavailable; re-run the body before exporting it.")
-        written = save_monostatic_grim(
-            bodies,
-            profile,
-            output_path,
-            azimuths_deg=radar_grid["azimuths_deg"],
-            elevations_deg=radar_grid["elevations_deg"],
-            axis_az_deg=radar_grid["axis_az_deg"],
-            axis_el_deg=radar_grid["axis_el_deg"],
-            roll_deg=radar_grid["roll_deg"],
-            source_path=source_path,
-            history=history,
-            solver_diagnostics=bor_solver_diagnostics_by_frequency(result),
-            artifact_metadata=bor_output_profile_metadata(context["snapshot"]),
-        )
-        return [written]
+        from ghost_backend.io.solver_export import export_solver_result
+        return export_solver_result(result, output_path, source_path=source_path,
+                                    history=history, context=self.last_solve_context)
 
     def _recover_completed_run(self):
         if self._job_is_active():

@@ -23,7 +23,16 @@ from ghost_backend.twod import solver
 from ghost_backend.twod.samples import compact_samples
 from ghost_backend.io.grim import export_result_to_grim
 from test_sweep_preparation import rectangle
-from test_pipeline_performance import small_result
+from test_pipeline_performance import small_result as _small_result
+
+
+def small_result(frequency, certified=True):
+    """A small, physically consistent result that can also be exported."""
+    value = _small_result(frequency, certified)
+    value.update(polarizations=['VV','HH'], polarization_mapping={'VV':'TE','HH':'TM'})
+    for row in value['samples']:
+        row['rcs_linear'] = (row['rcs_amp_real']**2+row['rcs_amp_imag']**2)/(4*2*np.pi*frequency*1e9/299792458.)
+    return value
 
 
 def arguments():
@@ -48,6 +57,10 @@ class RecoveryTests(unittest.TestCase):
         first.save(1.,small_result(1.))
         self.assertEqual(second.completed(),[])
         self.assertTrue((first.directory/'inputs/geometry.geo').is_file())
+        from ghost_backend.geometry.io import parse_geometry
+        _,segments,_,_=parse_geometry((first.directory/'inputs/geometry.geo').read_text())
+        self.assertEqual(len(segments),len(arguments()['geometry_snapshot']['segments']))
+        self.assertIn('meters',(first.directory/'README.txt').read_text())
     def test_material_original_changes_do_not_change_captured_worker_inputs(self):
         csv='frequency_hz,eps_real,eps_imag,mu_real,mu_imag\n1000000000,3,-0.1,1,0\n2000000000,3,-0.1,1,0\n'
         material=self.root/'material.csv';material.write_text(csv)
@@ -132,7 +145,7 @@ class RecoveryTests(unittest.TestCase):
         run=self.create()
         script = '''import os, sys
 sys.path.insert(0, sys.argv[2])
-from test_pipeline_performance import small_result
+from test_run_recovery import small_result
 from ghost_backend.execution.recovery import RecoveryRun
 run=RecoveryRun.open(sys.argv[1])
 run.save(1.,small_result(1.))
@@ -145,6 +158,10 @@ os._exit(23)
         recovered=RecoveryRun.open(run.directory).result()
         self.assertEqual(recovered['metadata']['run_recovery']['completed'],1)
         self.assertEqual(recovered['metadata']['remaining_frequencies_ghz'],[2.])
+        paths=list((run.directory/'completed').glob('*.grim'))
+        self.assertEqual(len(paths),1)
+        with np.load(paths[0],allow_pickle=False) as data:
+            np.testing.assert_array_equal(data['frequencies'],[1.])
 
     def test_cleanup_waits_for_every_view_and_preserves_changed_final_file(self):
         run=self.create();run.save(1.,small_result(1.));run.save(2.,small_result(2.))
@@ -172,12 +189,52 @@ os._exit(23)
         self.assertEqual(run.completed(),[1.,2.])
         self.assertEqual(list(run.directory.glob('export_*')),[])
 
+    def test_native_write_failure_keeps_prior_grim_and_internal_completed_data(self):
+        run=self.create();run.save(1.,small_result(1.))
+        paths=list((run.directory/'completed').glob('*.grim'))
+        before=paths[0].read_bytes()
+        with mock.patch('ghost_backend.io.grim.np.savez_compressed',side_effect=OSError('disk full')):
+            with self.assertRaisesRegex(OSError,'disk full'):
+                run.export_completed_frequency(2.,small_result(2.))
+        self.assertEqual(paths[0].read_bytes(),before)
+        self.assertEqual(list((run.directory/'completed').glob('*.grim')),paths)
+        self.assertEqual(run.completed(),[1.])
+        with mock.patch('ghost_backend.io.solver_export.export_solver_result',side_effect=OSError('disk full')):
+            with self.assertRaisesRegex(OSError,'disk full'):
+                run.save(2.,small_result(2.))
+        self.assertEqual(run.completed(),[1.,2.])
+        # A later explicit export can recover this already computed frequency.
+        saved=run.export_completed_frequency(2.)
+        self.assertTrue(Path(saved[0]).is_file())
+
 
 class NumericalRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)
         self.options=validate_options(dict(factorization='dense',mesh_strategy='global',assembly_threads=1,blas_threads=1))
+
+    def check_native_results(self, run, reference_paths):
+        repository = Path(__file__).resolve().parents[4]
+        if (repository/'GRIM_Backend').is_dir():
+            sys.path.insert(0,str(repository))
+        from GRIM_Backend.io.loaders import load_dataset, is_supported_path
+        native=list((run.directory/'completed').glob('*.grim'))
+        self.assertEqual(len(native),len(run.completed())*len(reference_paths))
+        for path in native:
+            self.assertTrue(is_supported_path(str(path)))
+            dataset=load_dataset(str(path))
+            self.assertEqual(len(dataset.frequencies),1)
+            frequency=float(dataset.frequencies[0])
+            with np.load(path,allow_pickle=False) as part:
+                matching=[p for p in reference_paths if (len(reference_paths)==1 or
+                          Path(p).stem.split('_inc_')[-1]==path.stem.split('_inc_')[-1])]
+                self.assertEqual(len(matching),1)
+                with np.load(matching[0],allow_pickle=False) as reference:
+                    index=int(np.flatnonzero(reference['frequencies']==frequency)[0])
+                    for key in ('rcs_amp_real','rcs_amp_imag'):
+                        np.testing.assert_allclose(part[key],reference[key][:,:,index:index+1,:],rtol=5e-12,atol=2e-14)
+                self.assertEqual(dataset.rcs_power.shape,part['rcs_power'].shape)
     def test_bor_preflight_prices_only_the_active_frequency_output(self):
         from ghost_backend.runs.setup import RunSetupMixin
         from ghost_backend.bor import dispatch
@@ -203,6 +260,7 @@ class NumericalRecoveryTests(unittest.TestCase):
         for key in ('rcs_amp_real','rcs_amp_imag'):
             np.testing.assert_allclose([r[key] for r in actual['samples']],[r[key] for r in expected['samples']],rtol=1e-12,atol=1e-13)
         [reference]=export_result_to_grim(expected,str(self.root/'reference.grim'))
+        self.check_native_results(run,[reference])
         with mock.patch.object(DiskSamples,'__iter__',side_effect=AssertionError('whole run read by exporter')):
             [written]=export_run(actual,[str(self.root/'joined.grim')],lambda value,path:export_result_to_grim(value,path))
         with np.load(reference,allow_pickle=False) as a,np.load(written,allow_pickle=False) as b:
@@ -240,7 +298,13 @@ class NumericalRecoveryTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs['frequency_count']==1 for call in estimate.call_args_list))
         tab=workspace.solver_tab;tab.last_solve_context=context
         [reference]=tab._export_result_files(expected,str(self.root/'reference.grim'),source_path='',history='test')
+        self.check_native_results(run,[reference])
         [written]=tab._export_result_files(actual,str(self.root/'joined.grim'),source_path='',history='test')
+        api_run=RecoveryRun.create(self.root/'Run_Recovery',args,args['bor_options'],'double',False,solver_kind='bor')
+        api_run.save(.6,run.load(.6))
+        from GRIM_Backend.io.loaders import load_dataset
+        api_file=next((api_run.directory/'completed').glob('*.grim'))
+        np.testing.assert_array_equal(load_dataset(api_file).frequencies,[.6])
         with np.load(reference,allow_pickle=False) as a,np.load(written,allow_pickle=False) as b:
             for key in a.files:
                 if key=='solver_metadata_json':continue
@@ -296,6 +360,7 @@ class NumericalRecoveryTests(unittest.TestCase):
             expected=run_fresh(solver.solve_bistatic_rcs_2d_survey,args,self.options,'double',False,frequency_workers=1)
             actual=run_fresh(solver.solve_bistatic_rcs_2d_survey,args,self.options,'double',False,frequency_workers=1,recovery=run)
         reference=export_result_to_grim(expected,str(self.root/'reference.grim'))
+        self.check_native_results(run,reference)
         from ghost_backend.ui.solver import _planned_export_paths
         written=export_run(actual,_planned_export_paths(actual,str(self.root/'joined.grim')),
                            lambda value,path:export_result_to_grim(value,path))

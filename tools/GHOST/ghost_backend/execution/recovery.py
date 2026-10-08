@@ -10,6 +10,7 @@ import tempfile
 import threading
 import uuid
 import weakref
+import zipfile
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
@@ -114,6 +115,23 @@ class RecoveryRun:
                 frequencies_ghz=list(map(float, arguments['frequencies_ghz'])), input_files=files,
                 input_sha256=hashlib.sha256(json_bytes(files)).hexdigest(), exports=[])
             atomic_bytes(directory/'run.json', json_bytes(manifest))
+            (directory/'completed').mkdir()
+            atomic_bytes(directory/'README.txt', (
+                'COMPLETED FREQUENCY RESULTS\n\n'
+                'Open or drag completed/*.grim into the GRIM results viewer. Each file\n'
+                'contains one completed frequency and all solved polarization channels.\n'
+                'Bistatic results have a separate file for each incidence angle.\n\n'
+                'To run the geometry again, open inputs/geometry.geo in the solver.\n'
+                'Keep the material CSV files alongside it. Geometry units: '
+                + str(arguments.get('geometry_units', 'inches')) + '.\n\n'
+                'To recover/export a combined sweep, use Solver > Tools > Recover\n'
+                'Completed Run and select run.json. Missing frequencies are not filled.\n'
+                'The frequencies/*.npz files are internal recovery records; renaming\n'
+                'them to .grim does not convert them.\n\n'
+                'After a verified complete final export, this entire run folder is\n'
+                'removed once its solver result is released. Copy any individual\n'
+                'frequency .grim files elsewhere if you want to keep those too.\n'
+            ).encode('utf-8'))
             return cls(directory, manifest)
         except BaseException as exc:
             atomic_bytes(directory/'capture_failed.txt', str(exc).encode('utf-8'))
@@ -158,6 +176,42 @@ class RecoveryRun:
             **{p:len(result['co_solved_samples'][p]) for p in ('VV','HH')})
         self.store.save(frequency, value)
         self.load(frequency)
+        self.export_completed_frequency(frequency, result)
+
+    def export_completed_frequency(self, frequency, result=None):
+        """Publish a native, directly loadable result without loading the sweep."""
+        from ghost_backend.io.solver_export import export_solver_result
+        request = self.request()
+        result = self.load(frequency) if result is None else result
+        result = dict(result, metadata=dict(result.get('metadata') or {}))
+        result['metadata']['recovery_frequency'] = dict(
+            run_id=self.manifest['run_id'], input_sha256=self.manifest['input_sha256'],
+            frequency_ghz=float(frequency), requested_frequency_count=len(self.manifest['frequencies_ghz']))
+        context = dict(request.get('context') or {})
+        # API callers may request body aspects without a desktop radar grid.
+        # Preserve that axis through the same mapping used by BoR run recipes.
+        if self.manifest['solver_kind'] == 'bor':
+            arguments = request['arguments']
+            context.update(solver_kind='bor', snapshot=arguments['geometry_snapshot'],
+                           units=arguments.get('geometry_units', 'inches'))
+            if context.get('radar_grid') is None:
+                context['radar_grid'] = dict(azimuths_deg=[0.],
+                    elevations_deg=sorted({90.-float(x) for x in arguments['elevations_deg']}),
+                    axis_az_deg=0., axis_el_deg=90., roll_deg=0.)
+        directory = self.directory/'completed'
+        directory.mkdir(exist_ok=True)
+        output = directory/(self.store._path(frequency).stem+'.grim')
+        paths = export_solver_result(result, str(output), context=context,
+            source_path=self.manifest['source_path'],
+            history='Completed frequency from recovery run '+self.manifest['run_id'])
+        for path in paths:
+            with zipfile.ZipFile(path) as archive:
+                if archive.testzip() is not None:
+                    raise IOError('Completed frequency GRIM file failed verification: '+str(path))
+            with np.load(path, allow_pickle=False) as payload:
+                if not np.array_equal(payload['frequencies'], [float(frequency)]):
+                    raise IOError('Completed GRIM file contains an unexpected frequency: '+str(path))
+        return paths
 
     def completed(self):
         return [f for f in dict.fromkeys(self.manifest['frequencies_ghz']) if self.store.available(f)]

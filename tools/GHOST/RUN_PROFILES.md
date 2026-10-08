@@ -96,13 +96,24 @@ Documents/GRIM Outputs directory. The folder contains:
 
 - `inputs/`: the captured geometry, material CSV contents and solve settings.
   Workers read these captured copies, so later edits to the original files do
-  not change an active run.
-- `frequencies/`: completed frequency outputs plus checksum records. Files
+  not change an active run. Open `inputs/geometry.geo` in the solver to run it
+  again, using the units recorded in `README.txt`; keep its material CSVs beside it.
+- `completed/`: ordinary `.grim` files written as each frequency finishes.
+  Open or drag these into GRIM's results viewer just like a final export;
+  `run.json` is not needed for viewing an individual file. BoR files preserve
+  the requested radar grid and embedded body model. Bistatic runs have one
+  file per frequency and incidence angle.
+- `frequencies/`: internal recovery records plus checksums. Files
   are flushed and published atomically; incomplete or damaged outputs are
   excluded from recovery.
 - `run.json`: the run's identity, requested frequencies, input checksums and
   status. Completion is checked against the actual frequency files, so an
   abrupt process exit does not require a final status update.
+
+The `.npz` records support exact solver-result recovery and should not be
+renamed to `.grim`. The directly loadable files are in `completed/`. Older
+recovery folders from before this feature can still be opened through
+**Recover Completed Run** and exported using **Export Last Result**.
 
 In the Solver tab's Tools section, choose **Recover Completed Run** and open
 that run's `run.json`. Completed frequencies become available for plotting
@@ -116,6 +127,10 @@ grid in memory. Successful complete exports are verified before publication
 is recorded. Their recovery folders are removed when the result is no longer
 being viewed, provided the final exported files still match their checksums.
 Interrupted, unexported, partially exported and failed-export runs are kept.
+The cleanup includes `completed/`, so copy individual frequency `.grim`
+files elsewhere if you want to retain them separately from the final export.
+Writing these native files adds per-frequency disk space and I/O; it does not
+retain completed frequencies in RAM or rerun the numerical solver.
 
 Solve-time output memory is limited to active frequencies; result viewing
 loads one frequency at a time. Solver matrices, run metadata and arrays used
