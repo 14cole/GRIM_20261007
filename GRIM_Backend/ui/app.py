@@ -2031,7 +2031,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         previous = self._plot_contexts.get(self._active_plot_tab)
         if previous is not None:
             if tab_key != self._active_plot_tab:
-                previous.spatial_overlays.stop_drawing()
+                previous.spatial_overlays.stop_interaction()
             for field in PlotContext.__dataclass_fields__:
                 if hasattr(self, field):
                     setattr(previous, field, getattr(self, field))

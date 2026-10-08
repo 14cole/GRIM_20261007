@@ -10,7 +10,8 @@ from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QLineEdit, QMenu
 
 from GRIM_Backend.plotting.overlay_data import (
-    axes_signature, project_points, read_overlay_points, supports_overlays,
+    axes_signature, format_coordinate, measurement_text, project_points,
+    read_overlay_points, supports_overlays,
 )
 from test_plot_analysis_features import _WindowCase
 
@@ -49,6 +50,21 @@ def test_projection_and_mixed_axes_have_explicit_units():
     assert supports_overlays(ax)
     ax.set_ylabel('Power (dB)')
     assert not supports_overlays(ax)
+
+
+def test_measurements_convert_length_units_and_do_not_combine_mixed_quantities():
+    ax = Figure().add_subplot()
+    ax.set_xlabel('Cross-Range (in)'); ax.set_ylabel('Range (ft)')
+    label, detail = measurement_text([0., 0.], [.0254, .3048], ax)
+    assert label == 'Length: 12.04159 in'
+    assert 'ΔX: 1.00000 in' in detail and 'ΔY: 1.00000 ft' in detail
+    ax.set_xlabel('Azimuth (deg)')
+    label, detail = measurement_text([90., 0.], [100., .3048], ax)
+    assert 'Length' not in label
+    assert 'ΔX: 10.00000 deg' in detail and 'ΔY: 1.00000 ft' in detail
+    assert format_coordinate(-1e-8) == '0.00000'
+    with pytest.raises(ValueError):
+        measurement_text([0.,0.],[np.nan,1.],ax)
 
 
 class SpatialOverlayTests(_WindowCase):
@@ -181,6 +197,152 @@ class SpatialOverlayTests(_WindowCase):
         with self.assertRaises(ValueError):
             panel.set_point(item, 0, float('nan'), 2)
 
+    def test_editor_shows_five_decimals_without_rounding_unchanged_coordinates(self):
+        panel, (ax,) = self.make_axes(unit='in')
+        item = panel.add_points([[1.23456789123456,-2.98765432198765],[2.,3.]],length_unit='in')
+        original = item.points.copy()
+        class UnchangedDialog(QDialog):
+            def exec(dialog):
+                x,y = dialog.findChildren(QLineEdit)
+                assert x.text() == '1.23457' and y.text() == '-2.98765'
+                dialog.findChild(QDialogButtonBox).accepted.emit()
+                return QDialog.Accepted
+        with mock.patch('GRIM_Backend.ui.spatial_overlays.QDialog', UnchangedDialog):
+            panel.edit_point(item,0)
+        np.testing.assert_array_equal(item.points, original)
+        class OneCoordinateDialog(QDialog):
+            def exec(dialog):
+                dialog.findChildren(QLineEdit)[0].setText('2.25')
+                dialog.findChild(QDialogButtonBox).accepted.emit()
+                return QDialog.Accepted
+        with mock.patch('GRIM_Backend.ui.spatial_overlays.QDialog', OneCoordinateDialog):
+            panel.edit_point(item,0)
+        assert item.points[0,0] == 2.25*.0254
+        assert item.points[0,1] == original[0,1]
+
+    def test_click_line_measures_only_the_selected_segment_and_tracks_edits(self):
+        panel, (ax,) = self.make_axes()
+        item = panel.add_points([[-3.,-1.],[0.,3.],[3.,3.]])
+        limits = ax.get_xlim(), ax.get_ylim()
+        image = ax.images[0].get_array().copy()
+        self.event(ax,-1.5,1.)
+        assert panel.measurement == ((item,0),(item,1))
+        assert 'Length: 5.00000 m' in panel.measure_label.text()
+        assert len(panel.measure_artists) == 2
+        panel.set_point(item,1,0.,-1.)
+        assert 'Length: 3.00000 m' in panel.measure_label.text()
+        assert (ax.get_xlim(),ax.get_ylim()) == limits
+        np.testing.assert_array_equal(ax.images[0].get_array(),image)
+        panel.remove_point(item,0)
+        assert panel.measurement is None and not panel.measure_artists
+
+    def test_measure_two_points_on_different_overlays_does_not_drag_or_draw(self):
+        panel, (ax,) = self.make_axes()
+        first = panel.add_points([[-2.,-1.]])
+        second = panel.add_points([[1.,3.]])
+        panel.draw_button.setChecked(True)
+        panel.measure_button.setChecked(True)
+        assert not panel.draw_button.isChecked()
+        self.event(ax,-2.,-1.)
+        self.event(ax,0.,0.,'motion_notify_event')
+        self.event(ax,0.,0.,'button_release_event')
+        np.testing.assert_array_equal(first.points,[[-2.,-1.]])
+        assert panel.measure_start == (first,0)
+        self.event(ax,1.,3.)
+        assert panel.measurement == ((first,0),(second,0))
+        assert 'Length: 5.00000 m' in panel.measure_label.text()
+        panel.on_key(KeyEvent('key_press_event',self.window.plot_canvas,key='escape'))
+        assert not panel.measure_button.isChecked()
+        assert panel.measurement is not None
+        panel.clear_measure_button.click()
+        assert not panel.measure_artists and panel.measurement is None
+
+    def test_measurement_tracks_unit_redraws_visibility_and_tab_switches(self):
+        panel, (ax,) = self.make_axes()
+        item = panel.add_points([[0.,0.],[.03,.04]])
+        panel.measure_between((item,0),(item,1))
+        assert 'Length: 0.05000 m' in panel.measure_label.text()
+        panel,(ax,) = self.make_axes(unit='cm')
+        assert 'Length: 5.00000 cm' in panel.measure_label.text()
+        np.testing.assert_allclose(panel.measure_artists[0].get_xydata(),[[0.,0.],[3.,4.]])
+        panel.set_style(item,visible=False)
+        assert not panel.measure_artists and not panel.measure_label.text()
+        panel.set_style(item,visible=True)
+        assert 'Length: 5.00000 cm' in panel.measure_label.text()
+        panel.measure_button.setChecked(True)
+        self.window.main_tabs.setCurrentWidget(self.window.tab_simple_plots)
+        assert not panel.measure_button.isChecked()
+        assert self.window.spatial_overlays.measurement is None
+        self.window.main_tabs.setCurrentWidget(self.window.tab_isar)
+        assert panel.measurement is not None
+        self.window._clear_plot()
+        assert panel.measurement is None and not panel.measure_artists
+
+    def test_measurement_does_not_bridge_blank_lines_or_panels(self):
+        panel,axes = self.make_axes(multiple=True)
+        item = panel.add_points([[-4.,0.],[-3.,0.],[np.nan,np.nan],[3.,0.],[4.,0.]],ax=axes[0])
+        self.event(axes[0],0.,0.)
+        assert panel.measurement is None
+        self.event(axes[0],-3.5,0.)
+        assert panel.measurement == ((item,0),(item,1))
+        panel.set_style(item,linestyle='None')
+        panel.clear_measurement()
+        self.event(axes[0],-3.5,0.)
+        assert panel.measurement is None
+        other=panel.add_points([[0.,0.]],ax=axes[1])
+        panel._start_measurement(item,0)
+        self.event(axes[1],0.,0.)
+        assert panel.measurement is None and panel.measure_start == (item,0)
+        assert 'same panel' in self.window.status.currentMessage()
+
+    def test_navigation_and_measurement_modes_are_exclusive(self):
+        panel,(ax,) = self.make_axes()
+        for name in ('btn_pan','btn_zoom_box','btn_markers'):
+            button=getattr(self.window,name)
+            if button is None:
+                continue
+            button.setChecked(True)
+            panel.measure_button.setChecked(True)
+            assert not button.isChecked()
+            button.setChecked(True)
+            assert not panel.measure_button.isChecked()
+            button.setChecked(False)
+        item=panel.add_points([[0.,0.],[1.,1.]])
+        panel._start_measurement(item,0)
+        panel.hide()
+        assert panel.measure_start is None and not panel.measure_button.isChecked()
+
+    def test_right_click_measurement_actions_and_plotting_marker_mode(self):
+        panel,(ax,) = self.make_axes()
+        item=panel.add_points([[-2.,-1.],[1.,3.]])
+        self.window.plot_canvas.draw()
+        def choose_at(x,y,text):
+            px,py=ax.transData.transform([x,y])
+            ratio=self.window.plot_canvas.device_pixel_ratio
+            pos=QPoint(round(px/ratio),round((self.window.plot_figure.bbox.height-py)/ratio))
+            class CaptureMenu(QMenu):
+                def exec(menu,_pos):
+                    next(action for action in menu.actions() if action.text()==text).trigger()
+            with mock.patch('GRIM_Backend.ui.spatial_overlays.QMenu',CaptureMenu):
+                assert panel.context_menu(pos)
+        choose_at(-.5,1.,'Measure segment')
+        assert 'Length: 5.00000 m' in panel.measure_label.text()
+        choose_at(-2.,-1.,'Measure from this point')
+        self.app.processEvents();self.window.plot_canvas.draw()
+        choose_at(1.,3.,'Measure to this point')
+        assert panel.measurement==((item,0),(item,1))
+        self.window.main_tabs.setCurrentWidget(self.window.tab_simple_plots)
+        self.window.plot_figure.clear()
+        ax=self.window.plot_figure.add_subplot()
+        ax.set_xlabel('Cross-Range (m)');ax.set_ylabel('Range (m)')
+        self.window.plot_ax=ax
+        panel=self.window.spatial_overlays;panel.refresh()
+        panel.measure_button.setChecked(True)
+        self.window.btn_markers.setChecked(True)
+        assert not panel.measure_button.isChecked()
+        panel.measure_button.setChecked(True)
+        assert not self.window.btn_markers.isChecked()
+
     def test_save_reload_preserves_segments_and_clear_removes_overlays(self):
         import tempfile
         panel, (ax,) = self.make_axes(unit='ft')
@@ -235,7 +397,9 @@ class SpatialOverlayTests(_WindowCase):
     def test_export_includes_annotation_without_recording_inaccurate_replay(self):
         import tempfile
         panel, (ax,) = self.make_axes()
-        panel.add_points([[-1,-1],[1,1]])
+        item=panel.add_points([[-1,-1],[1,1]])
+        panel.measure_between((item,0),(item,1))
+        assert panel.measure_artists[1].get_text()=='Length: 2.82843 m'
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/'annotated.png'
             with mock.patch.object(self.window,'_isar_figure_is_current',return_value=True), mock.patch(

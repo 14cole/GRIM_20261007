@@ -94,6 +94,34 @@ def supports_overlays(ax) -> bool:
     )
 
 
+def format_coordinate(value: float) -> str:
+    """Five display decimals, without changing the stored coordinate."""
+    text = f"{float(value):.5f}"
+    return "0.00000" if text == "-0.00000" else text
+
+
+def measurement_text(first, second, ax) -> tuple[str, str]:
+    """Measure in physical coordinates; never combine angle/frequency with length."""
+    points = np.asarray([first, second], dtype=float)
+    if points.shape != (2, 2) or not np.all(np.isfinite(points)):
+        raise ValueError("Choose two finite overlay points.")
+    with np.errstate(over="ignore", invalid="ignore"):
+        delta = points[1] - points[0]
+    if not np.all(np.isfinite(delta)):
+        raise ValueError("These coordinates are too large to measure.")
+    axes = [axis_info(ax, axis) for axis in ("x", "y")]
+    deltas = [f"Δ{axis.upper()}: {format_coordinate(value / scale)} {unit}".rstrip()
+              for axis, value, (_, unit, scale) in zip(("x", "y"), delta, axes)]
+    if all(unit in LENGTH_UNITS for _, unit, _ in axes):
+        with np.errstate(over="ignore"):
+            distance = float(np.hypot(*delta)) / axes[0][2]
+        if not np.isfinite(distance):
+            raise ValueError("These coordinates are too large to measure.")
+        label = f"Length: {format_coordinate(distance)} {axes[0][1]}"
+        return label, "   |   ".join([label, *deltas])
+    return "\n".join(deltas), "   |   ".join(deltas)
+
+
 def project_points(points, plane: str, ax, length_unit: str) -> np.ndarray:
     points = np.asarray(points, dtype=float)
     if points.ndim != 2 or points.shape[1] not in (2, 3):

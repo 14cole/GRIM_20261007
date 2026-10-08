@@ -248,7 +248,7 @@ class PlotMarkersMixin:
 
     def _on_markers_toggled(self, checked: bool) -> None:
         if checked and getattr(self, "spatial_overlays", None) is not None:
-            self.spatial_overlays.stop_drawing()
+            self.spatial_overlays.stop_interaction()
         self._marker_drag = None
         if not checked:
             return

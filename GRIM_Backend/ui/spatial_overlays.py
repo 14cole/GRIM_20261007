@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
 from GRIM_Backend.plotting.dataset_style import LINE_TYPES
 from GRIM_Backend.plotting.overlay_data import (
     LENGTH_UNITS, MAX_POINTS, PLANES, OverlayPath, axes_scales, axes_signature,
-    axis_info, project_points, read_overlay_points, supports_overlays,
+    axis_info, format_coordinate, measurement_text, project_points,
+    read_overlay_points, supports_overlays,
 )
 
 
@@ -32,6 +33,8 @@ class SpatialOverlayPanel(QWidget):
         self.paths: list[OverlayPath] = []
         self.axes = []
         self.active = self.drawing = self.drag = None
+        self.measure_start = self.measurement = None
+        self.measure_artists = []
         self._drawing_number = 0
         self.setObjectName("spatialOverlayPanel")
         layout = QVBoxLayout(self)
@@ -41,11 +44,15 @@ class SpatialOverlayPanel(QWidget):
         self.load_button = QPushButton("Load overlay…")
         self.draw_button = QPushButton("Draw points")
         self.draw_button.setCheckable(True)
+        self.measure_button = QPushButton("Measure")
+        self.measure_button.setCheckable(True)
+        self.measure_button.setToolTip("Click a line segment, or click two overlay points to measure between them.")
         self.panel_combo = QComboBox()
         self.panel_combo.setMinimumContentsLength(8)
         self.panel_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         row.addWidget(self.load_button)
         row.addWidget(self.draw_button)
+        row.addWidget(self.measure_button)
         row.addWidget(QLabel("Panel"))
         row.addWidget(self.panel_combo, 1)
         layout.addLayout(row)
@@ -81,8 +88,18 @@ class SpatialOverlayPanel(QWidget):
         self.help_label = QLabel("Plot an image with a distance axis to load or draw an overlay.")
         self.help_label.setWordWrap(True)
         layout.addWidget(self.help_label)
+        row = QHBoxLayout()
+        self.measure_label = QLabel("")
+        self.measure_label.setWordWrap(True)
+        self.clear_measure_button = QPushButton("Clear measurement")
+        self.clear_measure_button.setEnabled(False)
+        row.addWidget(self.measure_label, 1)
+        row.addWidget(self.clear_measure_button)
+        layout.addLayout(row)
         self.load_button.clicked.connect(self.load_file)
         self.draw_button.toggled.connect(self._toggle_drawing)
+        self.measure_button.toggled.connect(self._toggle_measuring)
+        self.clear_measure_button.clicked.connect(self.clear_measurement)
         self.panel_combo.currentIndexChanged.connect(self._select_panel)
         self.path_combo.currentIndexChanged.connect(self._select_path)
         self.remove_button.clicked.connect(self.remove_active)
@@ -143,14 +160,19 @@ class SpatialOverlayPanel(QWidget):
         self.panel_combo.blockSignals(False)
         self.load_button.setEnabled(bool(self.axes))
         self.draw_button.setEnabled(bool(self.axes))
+        self.measure_button.setEnabled(bool(self.axes))
         if not self.axes:
-            self.stop_drawing()
+            self.stop_interaction()
+        elif self.measure_start is not None and self._axis(self.measure_start[0]) is None:
+            self.measure_start = None
         for item in self.paths:
             self._render(item)
         self._refresh_choices()
+        self._render_measurement()
         self.help_label.setText(
             "Click Draw points, then click to connect points; Escape finishes. "
-            "Drag a point to move it; right-click a point or line to edit."
+            "Drag a point to move it; right-click to edit. Click a line for its length, "
+            "or choose Measure and click two points."
             if self.axes else "Plot an image with a distance axis to load or draw an overlay."
         )
         self.canvas.draw_idle()
@@ -169,11 +191,11 @@ class SpatialOverlayPanel(QWidget):
         self._sync_controls()
 
     def _select_panel(self, *_):
-        self.stop_drawing()
+        self.stop_interaction()
         self._refresh_choices()
 
     def _select_path(self, *_):
-        self.stop_drawing()
+        self.stop_interaction()
         self.active = self.path_combo.currentData()
         self._sync_controls()
 
@@ -206,6 +228,7 @@ class SpatialOverlayPanel(QWidget):
             setattr(item, key, value)
         self._render(item)
         self._sync_controls()
+        self._render_measurement()
         self.canvas.draw_idle()
 
     def choose_color(self):
@@ -276,7 +299,7 @@ class SpatialOverlayPanel(QWidget):
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
         if dialog.exec() == QDialog.Accepted:
-            self.stop_drawing()
+            self.stop_interaction()
             item = self.add_points(points, name=Path(filename).stem, plane=plane.currentText(),
                                    length_unit=unit.currentText(), ax=ax)
             count = int(np.count_nonzero(np.isfinite(item.points[:, 0])))
@@ -286,6 +309,7 @@ class SpatialOverlayPanel(QWidget):
         self.drag = self.drawing = None
         self.draw_button.setText("Finish drawing" if checked else "Draw points")
         if checked:
+            self.stop_measuring()
             for name in ("btn_pan", "btn_zoom_box", "btn_markers"):
                 self.owner._uncheck_silently(getattr(self.owner, name, None))
             self.owner._clear_pan_drag()
@@ -298,8 +322,117 @@ class SpatialOverlayPanel(QWidget):
         self.drag = self.drawing = None
         self.draw_button.setChecked(False)
 
-    def hideEvent(self, event):
+    def _toggle_measuring(self, checked):
+        self.drag = self.measure_start = None
+        self.measure_button.setText("Finish measuring" if checked else "Measure")
+        if checked:
+            self.stop_drawing()
+            for name in ("btn_pan", "btn_zoom_box", "btn_markers"):
+                self.owner._uncheck_silently(getattr(self.owner, name, None))
+            self.owner._clear_pan_drag()
+            self.owner._clear_zoom_box_drag()
+            self.owner._marker_drag = None
+            self.canvas.setFocus(Qt.OtherFocusReason)
+            self.owner.status.showMessage("Measure: click a line segment, or click two overlay points in the same panel. Escape finishes.")
+        self._render_measurement()
+        self.canvas.draw_idle()
+
+    def stop_measuring(self):
+        self.measure_start = None
+        self.measure_button.setChecked(False)
+
+    def stop_interaction(self):
+        """Release mouse ownership when navigating, hiding, or switching tabs."""
         self.stop_drawing()
+        self.stop_measuring()
+
+    def clear_measurement(self):
+        self.measure_start = self.measurement = None
+        self._render_measurement()
+        self.canvas.draw_idle()
+
+    def _clear_measurement_for(self, item):
+        references = ([self.measure_start] if self.measure_start is not None else [])
+        references += list(self.measurement or ())
+        if any(path is item for path, _index in references):
+            self.clear_measurement()
+
+    def _render_measurement(self):
+        for artist in self.measure_artists:
+            try:
+                artist.remove()
+            except (ValueError, AttributeError, NotImplementedError):
+                pass
+        self.measure_artists.clear()
+        self.measure_label.clear()
+        self.clear_measure_button.setEnabled(self.measurement is not None or self.measure_start is not None)
+        references = [self.measure_start] if self.measure_start is not None else self.measurement
+        if not references:
+            return
+        ax = self._axis(references[0][0])
+        if ax is None or any(item not in self.paths or not item.visible or self._axis(item) is not ax
+                             or not 0 <= index < len(item.points) for item, index in references):
+            return
+        points = np.array([item.points[index] for item, index in references])
+        if not np.all(np.isfinite(points)):
+            return
+        xy = points / axes_scales(ax)
+        color = references[0][0].color
+        line = Line2D(xy[:, 0], xy[:, 1], color=color, linestyle="--", linewidth=1.5,
+                      marker="o", markersize=9, markerfacecolor="none", markeredgewidth=2,
+                      zorder=40, label="_spatial_overlay_measurement")
+        line._grim_spatial_overlay = True
+        ax.add_artist(line)
+        self.measure_artists.append(line)
+        if len(references) == 1:
+            xunit, yunit = (axis_info(ax, axis)[1] for axis in ("x", "y"))
+            self.measure_label.setText(f"First point: X {format_coordinate(xy[0, 0])} {xunit}, "
+                                      f"Y {format_coordinate(xy[0, 1])} {yunit}. Click the second point.")
+            return
+        try:
+            label, details = measurement_text(*points, ax)
+        except ValueError as exc:
+            self.measure_label.setText(str(exc))
+            return
+        self.measure_label.setText(details)
+        text = ax.annotate(label, xy=xy[0]*.5+xy[1]*.5, xytext=(8, 8), textcoords="offset points",
+                           color=ax.xaxis.label.get_color(), fontsize=9, zorder=41,
+                           bbox=dict(boxstyle="round,pad=0.3", facecolor=ax.get_facecolor(),
+                                     edgecolor=color, alpha=.95))
+        text._grim_spatial_overlay = True
+        self.measure_artists.append(text)
+
+    def _start_measurement(self, item, index):
+        self.show_controls()
+        self.measure_button.setChecked(True)
+        self.measurement = None
+        self.measure_start = (item, index)
+        self._activate(item)
+        self._render_measurement()
+        self.canvas.draw_idle()
+
+    def measure_between(self, first, second):
+        ax = self._axis(first[0])
+        if ax is None or self._axis(second[0]) is not ax:
+            self.owner.status.showMessage("Choose the second point in the same panel.")
+            return
+        try:
+            _label, details = measurement_text(first[0].points[first[1]], second[0].points[second[1]], ax)
+        except ValueError as exc:
+            self.owner.status.showMessage(str(exc))
+            return
+        self.measure_start = None
+        self.measurement = (first, second)
+        self._render_measurement()
+        self.owner.status.showMessage(details)
+        self.canvas.draw_idle()
+
+    def _measure_segment(self, item, index):
+        self._activate(item)
+        self.measure_between((item, index), (item, index+1))
+
+    def hideEvent(self, event):
+        self.stop_interaction()
         super().hideEvent(event)
 
     def show_controls(self):
@@ -329,10 +462,40 @@ class SpatialOverlayPanel(QWidget):
         if best is not None:
             return best[1], best[2]
         if include_lines:
-            for item in candidates:
-                if item.artist is not None and item.artist.axes is event.inaxes and item.artist.contains(event)[0]:
-                    return item, None
+            segment = self._hit_segment(event)
+            if segment is not None:
+                return segment[0], None
         return None
+
+    def _hit_segment(self, event, only=None):
+        """Nearest displayed segment in pixels, excluding blank-line gaps."""
+        if event.inaxes not in self.axes or event.x is None or event.y is None:
+            return None
+        candidates = [only] if only is not None else ([self.active] if self.active is not None else []) + [
+            item for item in reversed(self.paths) if item is not self.active]
+        best = None
+        target = np.array([event.x, event.y])
+        for item in candidates:
+            line = item.artist
+            if (line is None or line.axes is not event.inaxes or not line.get_visible()
+                    or item.linestyle == "None" or len(item.points) < 2):
+                continue
+            pixels = line.axes.transData.transform(item.points / axes_scales(line.axes))
+            valid = np.all(np.isfinite(pixels), axis=1)
+            indices = np.flatnonzero(valid[:-1] & valid[1:])
+            if not len(indices):
+                continue
+            start, end = pixels[indices], pixels[indices+1]
+            delta = end-start
+            square = np.einsum("ij,ij->i", delta, delta)
+            fraction = np.divide(np.einsum("ij,ij->i", target-start, delta), square,
+                                 out=np.zeros_like(square), where=square>0)
+            closest = start + np.clip(fraction, 0., 1.)[:, None]*delta
+            distance = np.hypot(*(closest-target).T)
+            index = int(np.argmin(distance))
+            if distance[index] <= 7 and (best is None or distance[index] < best[0]):
+                best = distance[index], item, int(indices[index])
+        return None if best is None else best[1:]
 
     def _activate(self, item):
         self.active = item
@@ -348,11 +511,27 @@ class SpatialOverlayPanel(QWidget):
                for name in ("btn_pan", "btn_zoom_box", "btn_markers")):
             return False
         hit = self._hit(event)
+        if self.measure_button.isChecked():
+            if hit is not None:
+                if self.measure_start is None:
+                    self._start_measurement(*hit)
+                else:
+                    self.measure_between(self.measure_start, hit)
+            else:
+                segment = self._hit_segment(event)
+                if segment is not None:
+                    self._measure_segment(*segment)
+            return event.inaxes in self.axes
         if hit is not None:
             item, index = hit
             self._activate(item)
             self.drag = (item, index, event.inaxes)
             return True
+        if not self.draw_button.isChecked():
+            segment = self._hit_segment(event)
+            if segment is not None:
+                self._measure_segment(*segment)
+                return True
         if not self.draw_button.isChecked() or event.inaxes not in self.axes:
             return False
         if event.xdata is None or event.ydata is None or not np.all(np.isfinite([event.xdata, event.ydata])):
@@ -381,10 +560,16 @@ class SpatialOverlayPanel(QWidget):
         ax = self._axis(item)
         if ax is None or not np.all(np.isfinite([x, y])):
             raise ValueError("Both coordinates must be finite numbers on the current plot.")
-        item.points[index] = np.array([x, y]) * axes_scales(ax)
+        self._set_stored_point(item, index, np.array([x, y]) * axes_scales(ax))
+
+    def _set_stored_point(self, item, index, point):
+        if not np.all(np.isfinite(point)):
+            raise ValueError("Both coordinates must be finite numbers on the current plot.")
+        item.points[index] = point
         if item.artist is not None:
-            xy = item.points / axes_scales(ax)
+            xy = item.points / axes_scales(self._axis(item))
             item.artist.set_data(xy[:, 0], xy[:, 1])
+        self._render_measurement()
         self.canvas.draw_idle()
 
     def on_motion(self, event):
@@ -403,8 +588,8 @@ class SpatialOverlayPanel(QWidget):
         return True
 
     def on_key(self, event):
-        if event.key == "escape" and self.draw_button.isChecked():
-            self.stop_drawing()
+        if event.key == "escape":
+            self.stop_interaction()
 
     def edit_point(self, item, index):
         ax = self._axis(item)
@@ -414,15 +599,22 @@ class SpatialOverlayPanel(QWidget):
         dialog.setWindowTitle(f"Edit point {index + 1} — {item.name}")
         form = QFormLayout(dialog)
         xy = item.points[index] / axes_scales(ax)
-        fields = [QLineEdit(format(float(value), ".17g")) for value in xy]
+        displayed = [format_coordinate(value) for value in xy]
+        fields = [QLineEdit(value) for value in displayed]
         for axis, field in zip(("x", "y"), fields):
             name, unit, _ = axis_info(ax, axis)
             form.addRow(f"{axis.upper()}: {name} ({unit})", field)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         def apply():
             try:
-                x, y = (float(field.text()) for field in fields)
-                self.set_point(item, index, x, y)
+                point = item.points[index].copy()
+                edited = False
+                for column, field in enumerate(fields):
+                    if field.text().strip() != displayed[column]:
+                        point[column] = float(field.text()) * axes_scales(ax)[column]
+                        edited = True
+                if edited:
+                    self._set_stored_point(item, index, point)
             except ValueError as exc:
                 QMessageBox.warning(dialog, "Invalid coordinates", str(exc))
                 return
@@ -434,6 +626,7 @@ class SpatialOverlayPanel(QWidget):
 
     def remove_point(self, item, index):
         self.drag = None
+        self._clear_measurement_for(item)
         item.points = np.delete(item.points, index, axis=0)
         if not np.any(np.isfinite(item.points)):
             self.active = item
@@ -444,7 +637,8 @@ class SpatialOverlayPanel(QWidget):
 
     def context_menu(self, pos):
         x, y = self.canvas.mouseEventCoords(pos)
-        hit = self._hit(MouseEvent("button_press_event", self.canvas, x, y, button=3), include_lines=True)
+        event = MouseEvent("button_press_event", self.canvas, x, y, button=3)
+        hit = self._hit(event, include_lines=True)
         if hit is None:
             return False
         self.stop_drawing()
@@ -455,6 +649,13 @@ class SpatialOverlayPanel(QWidget):
         if index is not None:
             menu.addAction("Edit coordinates…", lambda: self.edit_point(item, index))
             menu.addAction("Remove point", lambda: self.remove_point(item, index))
+            menu.addAction("Measure from this point", lambda: self._start_measurement(item, index))
+            if self.measure_start is not None:
+                first = self.measure_start
+                menu.addAction("Measure to this point", lambda: self.measure_between(first, (item, index)))
+        segment = self._hit_segment(event, only=item)
+        if segment is not None:
+            menu.addAction("Measure segment", lambda: self._measure_segment(*segment))
         style_menu = menu.addMenu("Line type")
         for label, style in (*LINE_TYPES, ("Points only", "None")):
             action = style_menu.addAction(label)
@@ -471,8 +672,9 @@ class SpatialOverlayPanel(QWidget):
         return True
 
     def remove_active(self):
-        self.stop_drawing()
+        self.stop_interaction()
         if self.active is not None:
+            self._clear_measurement_for(self.active)
             self._detach(self.active)
             self.paths.remove(self.active)
             self.active = None
@@ -480,7 +682,8 @@ class SpatialOverlayPanel(QWidget):
             self.canvas.draw_idle()
 
     def clear(self):
-        self.stop_drawing()
+        self.stop_interaction()
+        self.clear_measurement()
         for item in self.paths:
             self._detach(item)
         self.paths.clear()

@@ -1033,7 +1033,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     def _start_plot_render(self) -> None:
         overlays = getattr(self, "spatial_overlays", None)
         if overlays is not None:
-            overlays.stop_drawing()
+            overlays.stop_interaction()
         controls = getattr(self, "delta_map_controls", None)
         if controls is not None and self.last_plot_mode != "delta_map":
             controls.hide()
@@ -1402,7 +1402,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _on_zoom_box_toggled(self, checked: bool) -> None:
         if checked and getattr(self, "spatial_overlays", None) is not None:
-            self.spatial_overlays.stop_drawing()
+            self.spatial_overlays.stop_interaction()
         if not checked:
             self._clear_zoom_box_drag()
             return
@@ -1417,7 +1417,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _on_pan_toggled(self, checked: bool) -> None:
         if checked and getattr(self, "spatial_overlays", None) is not None:
-            self.spatial_overlays.stop_drawing()
+            self.spatial_overlays.stop_interaction()
         if not checked:
             self._clear_pan_drag()
             return
