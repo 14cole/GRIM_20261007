@@ -109,10 +109,11 @@ class RunSetupMixin:
             self.lbl_run_dimensions.setText(str(exc))
 
     def _run_setup_summary(self, snapshot, base_dir, value, checkpoint=None,
-                           forecast_frequencies=None):
+                           forecast_frequencies=None, output_frequency_count=None):
         if value['schema'] == 'grim.bor-run-setup':
             from ghost_backend.runs.bor_setup import resource_summary
-            return resource_summary(snapshot, base_dir, value, checkpoint, forecast_frequencies)
+            return resource_summary(snapshot, base_dir, value, checkpoint, forecast_frequencies,
+                                    output_frequency_count=output_frequency_count)
         from ghost_backend.twod.preparation import prepare_geometry
         _, result, library, _ = prepare_geometry(snapshot, base_dir, value['units'])
         validate_material_coverage(snapshot, library, value['frequencies_ghz'], checkpoint)

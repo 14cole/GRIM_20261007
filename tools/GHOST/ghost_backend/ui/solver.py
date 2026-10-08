@@ -432,6 +432,8 @@ class _SolveWorker(QObject):
         execution_options=None,
         bor_options=None,
         checkpoint_directory=None,
+        recovery_root=None,
+        recovery_context=None,
     ):
         super().__init__()
         self.solver_kind = str(solver_kind)
@@ -451,7 +453,12 @@ class _SolveWorker(QObject):
         from ghost_backend.execution.options import validate_options, from_environment
         self.execution_options = (validate_options(execution_options if execution_options is not None else from_environment())
                                   if self.solver_kind == '2d' else None)
-        self.checkpoint_directory = checkpoint_directory
+        # Accepted for older callers only. Desktop runs always compute fresh;
+        # a supplied legacy cache directory must never enable persistence.
+        self.checkpoint_directory = None
+        self.recovery_root = recovery_root
+        self.recovery_context = copy.deepcopy(recovery_context or {})
+        self.recovery = None
         self.preflight_setup = preflight_setup
         self.preflight_only = preflight_only
         self.cfie_alpha = float(cfie_alpha)
@@ -482,15 +489,12 @@ class _SolveWorker(QObject):
         kwargs = self._bor_arguments()
         solve = (solve_monostatic_rcs_bor_certified if self.mesh_certification
                  else solve_monostatic_rcs_bor_survey)
-        if self.checkpoint_directory:
-            from ghost_backend.bor.checkpoints import run_checkpointed
-            return run_checkpointed(solve, kwargs, self.checkpoint_directory,
-                                    self.bor_options, self.mesh_certification,
-                                    frequency_workers='auto')
-        return solve(**kwargs)
+        from ghost_backend.execution.fresh_sweep import run_fresh
+        return run_fresh(solve, kwargs, self.bor_options, 'double', self.mesh_certification,
+                         solver_kind='bor', frequency_workers='auto', recovery=self.recovery)
 
     def _bor_arguments(self):
-        """One request definition for checkpoint probing and actual execution."""
+        """One request definition for input capture and actual execution."""
         kwargs = dict(
             geometry_snapshot=self.snapshot,
             frequencies_ghz=self.frequencies,
@@ -542,7 +546,11 @@ class _SolveWorker(QObject):
             )
             if self.mesh_certification:
                 bistatic_kwargs["mesh_convergence_policy"] = mesh_policy
-            return solve_bistatic(**bistatic_kwargs)
+            if self.recovery is None:
+                return solve_bistatic(**bistatic_kwargs)
+            from ghost_backend.execution.fresh_sweep import run_fresh
+            return run_fresh(solve_bistatic, bistatic_kwargs, self.execution_options, self.lu_precision,
+                             self.mesh_certification, frequency_workers=1, recovery=self.recovery)
         if self.scattering_mode != "monostatic":
             raise ValueError(
                 f"Unsupported 2-D scattering mode {self.scattering_mode!r}."
@@ -553,15 +561,12 @@ class _SolveWorker(QObject):
             else solve_monostatic_rcs_2d_survey
         )
         monostatic_kwargs = self._monostatic_2d_arguments(snapshot, progress_callback)
-        if self.checkpoint_directory:
-            from ghost_backend.twod.checkpoints import run_checkpointed
-            return run_checkpointed(solve_monostatic, monostatic_kwargs, self.checkpoint_directory,
-                self.execution_options, self.lu_precision, self.mesh_certification,
-                frequency_workers='auto')
-        return solve_monostatic(**monostatic_kwargs)
+        from ghost_backend.execution.fresh_sweep import run_fresh
+        return run_fresh(solve_monostatic, monostatic_kwargs, self.execution_options,
+                         self.lu_precision, self.mesh_certification, frequency_workers='auto', recovery=self.recovery)
 
     def _monostatic_2d_arguments(self, snapshot, progress_callback):
-        """Keep preflight checkpoint identities identical to the solver request."""
+        """Capture the full numerical request for a fresh run."""
         monostatic_kwargs = dict(
             max_panels=_2d_panel_limit(),
             solver_method=self.solver_method,
@@ -578,18 +583,6 @@ class _SolveWorker(QObject):
             monostatic_kwargs["mesh_convergence_policy"] = self.mesh_policy
         return monostatic_kwargs
 
-    def _forecast_frequencies(self, checkpoint):
-        if self.preflight_only or not self.checkpoint_directory or self.scattering_mode != 'monostatic':
-            return None
-        from ghost_backend.twod.checkpoints import missing_frequencies
-        if self.solver_kind == 'bor':
-            arguments, options, precision = self._bor_arguments(), self.bor_options, 'double'
-        else:
-            arguments = self._monostatic_2d_arguments(self.snapshot, self._on_progress)
-            options, precision = self.execution_options, self.lu_precision
-        return missing_frequencies(arguments, self.checkpoint_directory, options, precision,
-            self.mesh_certification, solver_kind=self.solver_kind, checkpoint=checkpoint)
-
     @Slot()
     def run(self):
         from ghost_backend.execution.options import execution_scope, validate_for_run
@@ -600,11 +593,36 @@ class _SolveWorker(QObject):
                     return self._execute_run()
             return self._execute_run()
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(self._recovery_message(str(exc)))
+
+    def _recovery_message(self, message):
+        if self.recovery is not None:
+            if self.recovery.manifest['state'] == 'running':
+                try:
+                    self.recovery.status('interrupted' if self.abort_event is not None and self.abort_event.is_set()
+                                         else 'failed', message)
+                except OSError:
+                    pass
+            return str(message) + '\nCompleted frequencies are available in: ' + str(self.recovery.directory)
+        return str(message)
 
     def _execute_run(self):
         from ghost_backend.execution.metrics import progress_listener
         from ghost_backend.twod.preparation import preparation_scope, sweep_mesh_scope
+        if self.recovery_root and not self.preflight_only:
+            from ghost_backend.execution.recovery import RecoveryRun
+            arguments = self._bor_arguments() if self.solver_kind=='bor' else self._monostatic_2d_arguments(self.snapshot, self._on_progress)
+            if self.scattering_mode=='bistatic':
+                arguments['incidence_angles_deg'] = arguments.pop('elevations_deg')
+                arguments['observation_angles_deg'] = self.observation_angles
+                arguments.pop('solver_method', None)
+            self.recovery = RecoveryRun.create(self.recovery_root, arguments,
+                self.bor_options if self.solver_kind=='bor' else self.execution_options,
+                self.lu_precision, self.mesh_certification, solver_kind=self.solver_kind,
+                source_path=self.source_path, context=self.recovery_context)
+            captured = self.recovery.arguments({})
+            self.snapshot, self.base_dir = captured['geometry_snapshot'], captured['material_base_dir']
+            self.progress.emit(0, 'Recovery folder: ' + str(self.recovery.directory))
         with preparation_scope(), sweep_mesh_scope(self.frequencies), progress_listener(self.telemetry.emit):
             return self._execute_profiled_run()
 
@@ -616,8 +634,9 @@ class _SolveWorker(QObject):
                 def checkpoint():
                     if self.abort_event is not None and self.abort_event.is_set():
                         raise InterruptedError('Setup check canceled.')
+                planning = {'output_frequency_count':1} if self.recovery is not None and self.solver_kind=='bor' else {}
                 summary = RunSetupMixin._run_setup_summary(None, self.snapshot, self.base_dir,
-                    self.preflight_setup, checkpoint, self._forecast_frequencies(checkpoint))
+                    self.preflight_setup, checkpoint, **planning)
                 if self.abort_event is not None and self.abort_event.is_set():
                     raise InterruptedError('Setup check canceled.')
                 self.setup_checked.emit(summary)
@@ -631,13 +650,13 @@ class _SolveWorker(QObject):
             if self.abort_event is not None and self.abort_event.is_set():
                 raise InterruptedError("Solve canceled by user.")
         except InterruptedError as exc:
-            self.canceled.emit((str(exc) or "Solve canceled by user.") + (" Completed frequency checkpoints were retained." if self.checkpoint_directory else ""))
+            self.canceled.emit(self._recovery_message(str(exc) or "Solve canceled by user."))
             return
         except Exception as exc:
             if self.abort_event is not None and self.abort_event.is_set():
-                self.canceled.emit("Solve canceled by user.")
+                self.canceled.emit(self._recovery_message("Solve canceled by user."))
                 return
-            self.error.emit(str(exc))
+            self.error.emit(self._recovery_message(str(exc)))
             return
         metadata = dict(result.get("metadata", {}) or {})
         metadata.setdefault("geometry_units_in", self.units)
@@ -1131,6 +1150,8 @@ class SolverTab(RunSetupMixin, QWidget):
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setEnabled(False)
         self.btn_export = QPushButton("Export Last Result")
+        self.btn_recover = QPushButton("Recover Completed Run")
+        self.btn_recover.setToolTip('Open completed frequencies from an interrupted run. This does not resume a solve.')
         self.btn_currents = QPushButton("Boundary Densities")
         self.btn_currents.setToolTip(
             "Plot VV/HH boundary-integral density magnitude and phase on the "
@@ -1140,6 +1161,7 @@ class SolverTab(RunSetupMixin, QWidget):
         btn_row.addWidget(self.btn_run)
         btn_row.addWidget(self.btn_cancel)
         btn_row.addWidget(self.btn_export)
+        tools_form.addRow(self.btn_recover)
         tools_form.addRow(self.btn_currents)
         outer.addLayout(btn_row)
 
@@ -1158,6 +1180,7 @@ class SolverTab(RunSetupMixin, QWidget):
         self.btn_run.clicked.connect(self._run_solver)
         self.btn_cancel.clicked.connect(self._cancel_solver)
         self.btn_export.clicked.connect(self._export_last_result)
+        self.btn_recover.clicked.connect(self._recover_completed_run)
         self.btn_currents.clicked.connect(self._compute_currents)
         self.btn_tools.toggled.connect(self._toggle_tools)
         self.cmb_freq_mode.currentIndexChanged.connect(self._update_mode_enables)
@@ -1506,6 +1529,7 @@ class SolverTab(RunSetupMixin, QWidget):
         self.lbl_obs_angles.setVisible(is_bistatic)
         self.edit_obs_angles.setVisible(is_bistatic)
         self.btn_run.setEnabled(not busy)
+        self.btn_recover.setEnabled(not busy)
         self.run_preflight_button.setEnabled(not busy)
         self._sync_export_state()
         self.btn_currents.setEnabled(not busy and not is_bor)
@@ -1910,7 +1934,7 @@ class SolverTab(RunSetupMixin, QWidget):
     @Slot(str)
     def _on_solver_error(self, message: 'str'):
         if self._abort_event is not None and self._abort_event.is_set():
-            self._on_solver_canceled("Solve canceled by user.")
+            self._on_solver_canceled(message)
             return
         self._pending_solve_context = None
         self.progress.setValue(0)
@@ -2017,9 +2041,8 @@ class SolverTab(RunSetupMixin, QWidget):
             execution_options=preflight_setup.get("execution_options"),
             preflight_setup=preflight_setup,
             bor_options=self.bor_options_widget.value(),
-            # Completed monostatic frequencies are kept for 2D and BoR resume.
-            checkpoint_directory=(str(Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation)) / 'ghost-frequency-checkpoints')
-                if scatter_mode == 'monostatic' else None),
+            recovery_root=str((Path(source_path).resolve().parent if source_path else self._documents_output_dir()) / 'Run_Recovery'),
+            recovery_context=copy.deepcopy(self._pending_solve_context),
         )
         worker.moveToThread(thread)
 
@@ -2056,6 +2079,11 @@ class SolverTab(RunSetupMixin, QWidget):
         history: 'str',
     ) -> 'List[str]':
         """Publish a generic 2-D field or a feature-ready BoR body file."""
+
+        if result.get('_recovery_run'):
+            from ghost_backend.execution.recovery_export import export_run
+            return export_run(result, _planned_export_paths(result, output_path),
+                lambda single, path: self._export_result_files(single, path, source_path=source_path, history=history))
 
         if _result_kind(result) != "bor":
             return export_result_to_grim(
@@ -2101,6 +2129,31 @@ class SolverTab(RunSetupMixin, QWidget):
             artifact_metadata=bor_output_profile_metadata(context["snapshot"]),
         )
         return [written]
+
+    def _recover_completed_run(self):
+        if self._job_is_active():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, 'Recover Completed Run',
+            str(self._documents_output_dir()), 'Recovery manifest (run.json)')
+        if not path:
+            return
+        try:
+            from ghost_backend.execution.recovery import RecoveryRun
+            run = RecoveryRun.open(Path(path).parent)
+            result = run.result()
+            request = run.request()
+            self.last_result = result
+            self.last_source_path = run.manifest['source_path']
+            self.last_solve_context = dict(request['context'], uses_geometry_tab=False, geometry_stale=False)
+            self._last_result_stale = False
+            self._sync_export_state()
+            self._select_result_view('rcs')
+            info = result['metadata']['run_recovery']
+            self.lbl_status.setText('Recovered {} of {} frequencies. Missing frequencies were not filled or solved. '
+                'Use Export Last Result to export the completed data. Folder: {}'.format(
+                    info['completed'], info['requested'], run.directory))
+        except Exception as exc:
+            QMessageBox.warning(self, 'Recovery Error', str(exc))
 
     def _export_last_result(self):
         if self._job_is_active():

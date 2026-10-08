@@ -1,4 +1,4 @@
-"""Captured validation, new controls, and real checkpointed desktop workers."""
+"""Captured validation, new controls, and fresh desktop workers."""
 import os
 import sys
 import tempfile
@@ -95,13 +95,13 @@ class PipelineGUI(unittest.TestCase):
             self.assertEqual((record['solver_method'],record['execution_options']['mesh_strategy']),('direct','global'))
         finally:workspace.close()
 
-    def test_real_desktop_sweep_checkpoint_resume_and_preparation(self):
+    def test_real_desktop_sweep_recomputes_and_ignores_legacy_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             kwargs=dict(snapshot=fixture('pec',48),source_path='',base_dir='',frequencies=[.6,.8],
                 elevations=[0.,90.],units='meters',quality_thresholds=DEFAULT_QUALITY,
                 solver_method='experimental_cpu',mesh_certification=True,
                 execution_options={'factorization':'adaptive'},checkpoint_directory=directory)
-            for expected_reused in (0,2):
+            for repeat in range(2):
                 worker=_SolveWorker(**kwargs)
                 completed,errors=[],[]
                 worker.finished.connect(lambda result,path:completed.append(result))
@@ -111,10 +111,11 @@ class PipelineGUI(unittest.TestCase):
                 self.assertEqual(len(completed),1)
                 result=completed[0]
                 self.assertTrue(result['metadata']['mesh_convergence_certified'])
-                self.assertEqual(result['metadata']['frequency_checkpoints']['reused'],expected_reused)
-                if expected_reused:
-                    self.assertEqual(result['metadata']['runtime_profile']['stage_seconds'],{})
-                    self.assertIsNone(result['metadata']['runtime_profile']['sampled_peak_process_rss_bytes'])
+                self.assertNotIn('frequency_checkpoints', result['metadata'])
+                self.assertEqual(result['metadata']['frequency_execution']['computed_frequencies'], 2)
+                self.assertEqual(result['metadata']['frequency_execution']['reused_frequencies'], 0)
+                self.assertGreater(result['metadata']['runtime_profile']['stage_calls']['factorization'], 0)
+                self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 if __name__=='__main__':unittest.main()

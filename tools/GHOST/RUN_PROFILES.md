@@ -42,7 +42,7 @@ Monostatic runs:
   2048, then the available reservation. Explicit integer `blas_threads` values
   are caps and are never widened. `linear_algebra_execution` records the actual
   library pools used; these thresholds are a policy, not a speed guarantee.
-- **Frequency scheduling.** Desktop checkpointed sweeps can run two
+- **Frequency scheduling.** Desktop sweeps can run two
   frequencies at once when the predicted work justifies startup and their
   combined CPU and RAM reservations fit. Larger units run first; results
   retain the requested frequency order. These workers share the total CPU
@@ -54,11 +54,11 @@ Monostatic runs:
   polarization partner supplies its actual storage size. Assembly workers
   persist for the run and refresh their geometry and coefficients before each
   operator; their retained memory is included in later phase forecasts.
-- **Checkpoints.** Completed frequencies are saved to the application cache
-  and reused when an identical run is repeated or resumed. They require
-  matching geometry, angles, material file contents, certification settings
-  and solver source. An interrupted frequency restarts from its beginning.
-  Checkpoints do not replace exporting the final result.
+- **Run recovery.** Every Start Run computes fresh results. Each completed
+  frequency is saved in this run's unique recovery folder with both
+  polarizations and its accuracy information. Parallel workers save directly
+  to disk and release their completed fields instead of sending a growing
+  collection to the GUI. Earlier runs are never reused by Start Run.
 
 Bistatic runs use dense LU on the global linear mesh, with the same validated
 CPU kernel tables and native far assembly as monostatic runs. Their bounded
@@ -88,6 +88,40 @@ build, run the most expensive units first, and admit concurrent solves against
 the machine's or node's memory. 2D drivers do not read JSON configuration
 files, and portable HPC bundles are for BoR requests.
 
+## Recovering an interrupted desktop run
+
+2D and BoR desktop runs create `Run_Recovery/run_<timestamp>_<unique ID>`
+beside the input geometry. Unsaved Geometry-tab inputs use the application's
+Documents/GRIM Outputs directory. The folder contains:
+
+- `inputs/`: the captured geometry, material CSV contents and solve settings.
+  Workers read these captured copies, so later edits to the original files do
+  not change an active run.
+- `frequencies/`: completed frequency outputs plus checksum records. Files
+  are flushed and published atomically; incomplete or damaged outputs are
+  excluded from recovery.
+- `run.json`: the run's identity, requested frequencies, input checksums and
+  status. Completion is checked against the actual frequency files, so an
+  abrupt process exit does not require a final status update.
+
+In the Solver tab's Tools section, choose **Recover Completed Run** and open
+that run's `run.json`. Completed frequencies become available for plotting
+and **Export Last Result**. Missing frequencies stay missing, and a partial
+export is marked as partial in its metadata. Recovery does not start or
+resume a solve; Start Run always starts a new run.
+
+Final `.grim` export joins frequency planes incrementally and includes the
+captured input files for provenance. It does not assemble the entire field
+grid in memory. Successful complete exports are verified before publication
+is recorded. Their recovery folders are removed when the result is no longer
+being viewed, provided the final exported files still match their checksums.
+Interrupted, unexported, partially exported and failed-export runs are kept.
+
+Solve-time output memory is limited to active frequencies; result viewing
+loads one frequency at a time. Solver matrices, run metadata and arrays used
+for a particular plot still require memory. Recovery preserves completed
+frequencies, not an unfinished frequency's matrix or factorization.
+
 ## Status reporting
 
 The status text reports assembly, factorization, angle solving and mesh
@@ -106,9 +140,18 @@ Public 2D solve functions still accept `execution_options` for tests,
 benchmarks and diagnostics. Production runs do not need it; they use
 `ghost_backend.execution.options.automatic_run(scattering)`.
 
-`run_checkpointed(..., frequency_workers='auto')` enables the desktop frequency
-scheduler; its API default remains `1`. Direct solve calls retain their normal
-sequential frequency loop.
+Every desktop Start Run computes fresh results for both 2D and BoR. Cross-run
+solve caching and automatic resume are disabled. Existing application-cache
+checkpoints are ignored. Run recovery is used only for explicit inspection
+and export of completed outputs, never to skip a requested calculation.
+
+`ghost_backend.execution.fresh_sweep.run_fresh(..., frequency_workers='auto')`
+retains the desktop's bounded parallel frequency scheduler. The desktop passes
+a newly created `RecoveryRun` as `recovery=...`; completed fields are saved
+and the returned sample sequences load a frequency only when needed. Without
+that argument, API results remain in memory and count against the run's RAM
+allowance. Direct solve calls retain their normal sequential frequency loop.
+Legacy explicit checkpoint utilities remain separate from desktop execution.
 
 Two explicit experimental execution options remain off in automatic runs:
 `compressed_far_method='verified_cur'` proposes low-rank far tiles but checks

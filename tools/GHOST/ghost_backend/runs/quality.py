@@ -118,11 +118,19 @@ def solver_report_text(metadata):
             checkpoints['completed'], checkpoints.get('persisted', checkpoints['completed']), checkpoints['reused']))
         lines.append('Checkpoint directory: ' + str(checkpoints['directory']))
         lines.extend(checkpoints.get('write_warnings', []))
+    execution = metadata.get('frequency_execution', {})
+    if execution.get('persistent_solve_cache') is False:
+        lines.append('Fresh calculation: {} frequencies computed; previous runs were not reused.'.format(
+            execution.get('computed_frequencies', 0)))
+    recovery = metadata.get('run_recovery')
+    if recovery:
+        lines.append('Run recovery: {} of {} frequencies saved in {}.'.format(
+            recovery['completed'], recovery['requested'], recovery['directory']))
     if metadata.get("survey_mode"):
         lines.append("Survey: the mesh-refinement comparison was not run.")
     profile = metadata.get("runtime_profile", {})
     if profile:
-        elapsed=metadata.get('execution_wall_seconds',profile['wall_seconds'])
+        elapsed=profile.get('wall_seconds', metadata.get('execution_wall_seconds', 0.))
         lines.append(f"Elapsed: {elapsed:.3f} s")
         for name, value in sorted(profile.get("stage_seconds", {}).items()):
             lines.append(f"  {name.replace('_', ' ')}: {value:.3f} s")

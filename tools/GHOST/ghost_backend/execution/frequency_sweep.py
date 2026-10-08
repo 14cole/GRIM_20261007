@@ -1,9 +1,10 @@
-"""Bounded spawned frequency workers for checkpointed desktop 2-D and BoR solves.
+"""Bounded spawned frequency workers for desktop 2-D and BoR solves.
 
-Each worker owns one numerical solve. Completed fields go straight to the
-verified checkpoint store; only a disk-write failure transfers them to the
-parent. CPU reservations exclude nested tile pools and RAM includes every
-idle interpreter, active solve and unsaved result.
+Each worker owns one numerical solve. Desktop recovery runs save completed
+fields directly in their unique run folder and return only completion metadata.
+The API also supports in-memory results and legacy explicit checkpoints.
+CPU reservations exclude nested tile pools; RAM includes idle interpreters,
+active solves and any retained results.
 """
 import multiprocessing as mp
 import os
@@ -34,6 +35,11 @@ def _initialize(stop, progress):
 
 
 def _compute(payload):
+    recovery = None
+    if payload.get('recovery_directory'):
+        from ghost_backend.execution.recovery import RecoveryRun
+        recovery = RecoveryRun.open(payload['recovery_directory'])
+        recovery.verify_inputs()
     is_bor = payload['solver'] in _BOR_SOLVERS
     if is_bor:
         from ghost_backend.bor import dispatch as solver
@@ -57,7 +63,8 @@ def _compute(payload):
             except queue.Full:
                 pass
             last_report[0] = now
-    arguments = dict(payload['arguments'], frequencies_ghz=[frequency],
+    captured = recovery.arguments(payload['arguments']) if recovery is not None else payload['arguments']
+    arguments = dict(captured, frequencies_ghz=[frequency],
                      abort_event=_STOP, progress_callback=report)
     if is_bor:
         # Each frequency's modal/near workers share this process's CPU grant.
@@ -72,6 +79,11 @@ def _compute(payload):
     profile = result.get('metadata', {}).get('runtime_profile')
     result.setdefault('metadata', {})['frequency_worker'] = dict(
         cpus=payload['cpus'], memory_reservation_gib=payload['memory_gib'])
+    if recovery is not None:
+        recovery.save(frequency, result)
+        return dict(frequency=frequency, profile=profile, result=None, warning=None)
+    if payload.get('directory') is None:
+        return dict(frequency=frequency, profile=profile, result=result, warning=None)
     try:
         store = FrequencyCheckpoints(payload['directory'], payload['identity'], payload['certified'])
         store.save(frequency, result)
@@ -93,7 +105,7 @@ def _solver_name(solve):
     return None
 
 
-def _plan_bor(arguments, options, certified, frequencies, workers, budget, cores):
+def _plan_bor(arguments, options, certified, frequencies, workers, budget, cores, output_frequency_count=None):
     """Use the solve's resource preview; convert decimal BoR GB to scheduler GiB."""
     from ghost_backend.bor.dispatch import estimate_bor_resources
     from ghost_backend.runs.quality import validate_mesh_convergence_policy
@@ -111,7 +123,8 @@ def _plan_bor(arguments, options, certified, frequencies, workers, budget, cores
             with execution_scope({}, assembly_threads=cpus, memory_budget_gib=budget):
                 candidate = estimate_bor_resources(arguments['geometry_snapshot'], frequency,
                     arguments['elevations_deg'], workers=mode_workers, mesh_certification=certified,
-                    frequency_count=len(arguments['frequencies_ghz']), bor_options=options, **controls)
+                    frequency_count=(len(arguments['frequencies_ghz']) if output_frequency_count is None
+                                     else output_frequency_count), bor_options=options, **controls)
         except MemoryError:
             continue
         # Keep the preview's safety margin, plus room for run-time cap extension.
@@ -173,7 +186,7 @@ def _close(executor, stop, failed):
 
 
 def compute_parallel(solve, arguments, directory, store, options, precision, certified,
-                     requested_workers, budget):
+                     requested_workers, budget, recovery_directory=None):
     """Return completed work, or None when the sequential path is preferable."""
     if requested_workers != 'auto' and (type(requested_workers) is not int or requested_workers < 1):
         raise ValueError('Frequency workers must be auto or a positive integer.')
@@ -192,18 +205,23 @@ def compute_parallel(solve, arguments, directory, store, options, precision, cer
     # BoR permits duplicate requested frequencies: solve each once, then the
     # checkpoint merger restores every occurrence in the requested grid.
     frequencies = list(dict.fromkeys(arguments['frequencies_ghz']))
-    existing = [f for f in frequencies if store.available(f)]
+    fresh = store is None
+    existing = [] if fresh else [f for f in frequencies if store.available(f)]
     missing = [f for f in frequencies if f not in existing]
     workers = min(cores, len(missing), AUTO_MAX_WORKERS if requested_workers == 'auto' else requested_workers)
     if workers < 2:
         return None
-    fallback_limit = min(64*1024**2, max(0., budget)*1024**3*.02)
-    available = budget - workers*WORKER_GIB - fallback_limit/1024**3
+    fallback_limit = (max(0., budget)*1024**3 if fresh
+                      else min(64*1024**2, max(0., budget)*1024**3*.02))
+    # API memory results reserve room for their transfer copy as they complete.
+    # Recovery workers return only metadata, so their retained field cost is zero.
+    available = budget - workers*WORKER_GIB - (0. if fresh else fallback_limit/1024**3)
     if available <= 0:
         return None
     try:
         planner = _plan_bor if is_bor else _plan
-        records = planner(arguments, options, certified, missing, workers, available, cores)
+        planning = {'output_frequency_count':1} if is_bor and recovery_directory is not None else {}
+        records = planner(arguments, options, certified, missing, workers, available, cores, **planning)
     except MemoryError:
         # The unpartitioned parent may admit a case that cannot reserve two
         # worker interpreters alongside its numerical workspace.
@@ -230,12 +248,14 @@ def compute_parallel(solve, arguments, directory, store, options, precision, cer
     try:
         while pending or running:
             if abort is not None and abort.is_set():
-                raise InterruptedError('Solve canceled; completed frequency checkpoints were retained.')
+                raise InterruptedError('Solve canceled; no result was published.' if fresh else
+                                       'Solve canceled; completed frequency checkpoints were retained.')
             used = sum(r['memory_gib'] for r in running.values())
             used_cpus = sum(r['cpus'] for r in running.values())
             for record in list(pending):
                 if abort is not None and abort.is_set():
-                    raise InterruptedError('Solve canceled; completed frequency checkpoints were retained.')
+                    raise InterruptedError('Solve canceled; no result was published.' if fresh else
+                                           'Solve canceled; completed frequency checkpoints were retained.')
                 if retained > fallback_limit:
                     pending.clear()
                     break
@@ -243,8 +263,11 @@ def compute_parallel(solve, arguments, directory, store, options, precision, cer
                         used+record['memory_gib']+retained/1024**3 > available):
                     continue
                 payload = dict(record, solver=name, arguments=clean, frequencies=frequencies,
-                               options=options, precision=precision, directory=str(directory),
-                               identity=store.identity, certified=certified)
+                               options=options, precision=precision,
+                               directory=None if fresh else str(directory),
+                               identity=None if fresh else store.identity, certified=certified)
+                if recovery_directory is not None:
+                    payload['recovery_directory'] = str(recovery_directory)
                 # Workers import only the backend, never replay a GUI __main__.
                 from ghost_backend.compressed.tile_processes import _without_main_module
                 from ghost_backend.execution.runtime import single_thread_worker_environment
@@ -281,8 +304,13 @@ def compute_parallel(solve, arguments, directory, store, options, precision, cer
                     profiles.append(value['profile'])
                 if value['result'] is not None:
                     unsaved[frequency] = value['result']
-                    warnings.append(value['warning'])
-                    retained = _retained_bytes(unsaved)
+                    if value['warning']:
+                        warnings.append(value['warning'])
+                    retained = _retained_bytes(unsaved) * (2 if fresh else 1)
+                # Future objects retain their result even after it has been
+                # transferred into the run's output collection.
+                del value
+            done.clear()
             while True:
                 try:
                     frequency, done_count, total, message = messages.get_nowait()

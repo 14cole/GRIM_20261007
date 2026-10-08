@@ -73,12 +73,13 @@ def driver_settings(value):
 
 
 @preparation_scope()
-def resource_summary(snapshot, base_dir, value, checkpoint=None, forecast_frequencies=None):
+def resource_summary(snapshot, base_dir, value, checkpoint=None, forecast_frequencies=None, output_frequency_count=None):
     import os
     from ghost_backend.bor.dispatch import estimate_bor_resources, resolve_automatic_plan
     from ghost_backend.runs.quality import accuracy_target_policy
     from ghost_backend.runs.setup import geometry_dimensions, validate_material_coverage
     value = validate_bor_setup(value)
+    output_count = len(value['frequencies_ghz']) if output_frequency_count is None else output_frequency_count
     from ghost_backend.assembly.fields import bor_output_profile
     bor_output_profile(snapshot, value["units"])
     policy = accuracy_target_policy(value['accuracy'])
@@ -105,7 +106,7 @@ def resource_summary(snapshot, base_dir, value, checkpoint=None, forecast_freque
                 elevations_deg=value['aspects_deg'], geometry_units=value['units'],
                 material_base_dir=base_dir, workers=workers,
                 mesh_certification=value['mesh_certification'], fine_factor=policy['fine_factor'],
-                check_abort=checkpoint))
+                check_abort=checkpoint, frequency_count=output_count))
         options['factorization'] = chosen
         if imposed is not None:
             assembly = dict(assembly=imposed)
@@ -117,7 +118,7 @@ def resource_summary(snapshot, base_dir, value, checkpoint=None, forecast_freque
         estimate = estimate_bor_resources(snapshot, frequency, value['aspects_deg'],
             geometry_units=value['units'], material_base_dir=base_dir,
             workers=workers,
-            frequency_count=len(value['frequencies_ghz']),
+            frequency_count=output_count,
             mesh_certification=value['mesh_certification'], fine_factor=policy['fine_factor'],
             bor_options=options, **assembly)
         peak = max(peak, estimate['estimated_peak_gb'])

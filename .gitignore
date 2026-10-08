@@ -19,3 +19,6 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Per-run solver recovery inputs and completed frequency outputs.
+Run_Recovery/

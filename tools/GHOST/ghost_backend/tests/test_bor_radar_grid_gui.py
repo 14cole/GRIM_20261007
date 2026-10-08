@@ -132,10 +132,14 @@ class BorRadarGridGuiTests(unittest.TestCase):
             worker.checkpoint_directory = checkpoints
             with mock.patch("ghost_backend.ui.solver.solve_monostatic_rcs_bor_survey",
                             side_effect=solve_frequency) as solve:
-                result = worker._run_bor()
-                self.assertEqual(solve.call_count, 2)
-                np.testing.assert_allclose(solve.call_args.kwargs["elevations_deg"], expected_aspects)
-                self.assertEqual(len(result["co_solved_samples"]["VV"]), len(channels["VV"]))
+                for repeat in range(2):
+                    result = worker._run_bor()
+                    self.assertEqual(solve.call_count, 2*(repeat+1))
+                    np.testing.assert_allclose(solve.call_args.kwargs["elevations_deg"], expected_aspects)
+                    self.assertEqual(len(result["co_solved_samples"]["VV"]), len(channels["VV"]))
+                    self.assertNotIn('frequency_checkpoints', result['metadata'])
+                    self.assertEqual(result['metadata']['frequency_execution']['reused_frequencies'], 0)
+                    self.assertEqual(list(Path(checkpoints).iterdir()), [])
         tab.last_solve_context = context
         tab._set_solving_state(False)
         tab.edit_elev_list.setText("0")
