@@ -343,6 +343,20 @@ class PythonRecorderTests(unittest.TestCase):
         self.assertEqual(default_figure.axes[0].get_xlabel(), "Cross-Range (in)")
         self.assertEqual(float(default_figure.axes[0].get_aspect()), 1.0)
 
+        # Exported/replayed figures must also keep explicit ranges fixed,
+        # including a colorbar and repeated draws at different output sizes.
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        canvas = FigureCanvasAgg(default_figure)
+        axis = default_figure.axes[0]
+        default_figure.colorbar(axis.images[0], ax=axis)
+        axis.set_xlim(-.4, .9)
+        axis.set_ylim(-.7, 1.2)
+        for width, height in ((9, 4), (6, 5), (9, 4)):
+            default_figure.set_size_inches(width, height)
+            canvas.draw()
+            np.testing.assert_allclose(axis.get_xlim(), [-.4, .9], rtol=0, atol=1e-10)
+            np.testing.assert_allclose(axis.get_ylim(), [-.7, 1.2], rtol=0, atol=1e-10)
+
         with mock.patch(
             "GRIM_Backend.plotting.modes.isar_mode.form_isar", return_value=([band], 0.01)
         ):

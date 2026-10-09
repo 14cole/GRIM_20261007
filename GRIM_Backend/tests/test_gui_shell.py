@@ -860,6 +860,7 @@ class UnifiedGuiShellTest(unittest.TestCase):
     def test_length_display_defaults_are_inches(self) -> None:
         for context in self.window._plot_contexts.values():
             self.assertEqual(context.combo_isar_units.currentText(), "in")
+        self.assertEqual(self.window._plot_contexts["plotting"].analysis_controls.range_unit(), "in")
         workspace = self.window.assembly_workspace
         self.assertEqual(workspace.cmb_display_units.currentData(), "Inches")
         self.assertEqual(workspace.scene_canvas.display_units, "Inches")

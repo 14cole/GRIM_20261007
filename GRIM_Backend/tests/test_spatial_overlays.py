@@ -13,6 +13,7 @@ from GRIM_Backend.plotting.overlay_data import (
     axes_signature, format_coordinate, measurement_text, project_points,
     read_overlay_points, supports_overlays,
 )
+from GRIM_Backend.plotting.modes import isar_render
 from test_plot_analysis_features import _WindowCase
 
 
@@ -210,6 +211,98 @@ class SpatialOverlayTests(_WindowCase):
                     panel.set_point(item, 0, .3*xhi, .3*yhi)
                     panel.clear_measurement()
                     send('motion_notify_event', .3*xhi, .3*yhi)
+
+    def test_real_isar_renderer_preserves_zoom_through_overlay_drag(self):
+        # The simple imshow fixture above has no colorbar. ISAR's real
+        # constrained layout with a colorbar used to expand both limits on
+        # every redraw when square aspect adjusted data limits.
+        window = self.window
+        panel, _ = self.make_axes()
+        panel.show_controls()
+        params = dict(dataset=self.datasets[0], unit_name='m', az_target_deg=None,
+                      elevation_deg=0., pol_idx=0, recon='accurate')
+        configurations = ((1, True, True, True), (2, True, True, True),
+                          (2, True, False, True), (1, False, True, True),
+                          (1, True, True, False))
+
+        def draw():
+            window._flush_hover()
+            self.app.processEvents()
+            window.plot_canvas.draw()
+
+        def send(kind, x, y, **kwargs):
+            event = MouseEvent(kind, window.plot_canvas,
+                               *ax.transData.transform([x, y]), **kwargs)
+            window.plot_canvas.callbacks.process(kind, event)
+            draw()
+
+        for count, colorbar, shared, square in configurations:
+            for zoom in ('wheel', 'box'):
+                with self.subTest(panels=count, colorbar=colorbar, shared=shared,
+                                  square=square, zoom=zoom):
+                    panel.clear()
+                    for widget, value in ((window.chk_colorbar, colorbar),
+                                          (window.chk_colorbar_shared, shared),
+                                          (window.chk_isar_square, square)):
+                        widget.blockSignals(True)
+                        widget.setChecked(value)
+                        widget.blockSignals(False)
+                    bands = [dict(magnitude=np.arange(129*129, dtype=np.float32).reshape(129, 129)+1,
+                                  x_range=np.linspace(-10, 10, 129),
+                                  y_range=np.linspace(-15, 15, 129),
+                                  az_values=np.linspace(i*30-10, i*30+10, 81),
+                                  resolved_reconstruction='accurate') for i in range(count)]
+                    isar_render.display_results(window, params, bands, .01)
+                    panel.refresh()
+                    axes = window.plot_axes or [window.plot_ax]
+                    ax = axes[-1]
+                    item = panel.add_points([[.25, .25], [.8, .8]], ax=ax)
+                    panel.measure_between((item, 0), (item, 1))
+                    for _ in range(3):
+                        draw()
+                    if zoom == 'wheel':
+                        send('scroll_event', .25, .25, button='up', step=7)
+                    else:
+                        window.btn_zoom_box.setChecked(True)
+                        send('button_press_event', -1., -1., button=MouseButton.LEFT)
+                        send('motion_notify_event', 1.5, 1.8, button=MouseButton.LEFT)
+                        send('button_release_event', 1.5, 1.8, button=MouseButton.LEFT)
+                        window.btn_zoom_box.setChecked(False)
+                    views = [(a.get_xlim(), a.get_ylim()) for a in axes]
+                    images = [a.images[0].get_array().copy() for a in axes]
+
+                    def assert_view():
+                        for a, (xlim, ylim) in zip(axes, views):
+                            np.testing.assert_allclose(a.get_xlim(), xlim, rtol=0, atol=1e-10)
+                            np.testing.assert_allclose(a.get_ylim(), ylim, rtol=0, atol=1e-10)
+                            if square:
+                                origin, xunit, yunit = a.transData.transform([[0, 0], [1, 0], [0, 1]])
+                                self.assertAlmostEqual(np.linalg.norm(xunit-origin),
+                                                       np.linalg.norm(yunit-origin), places=7)
+
+                    send('button_press_event', .25, .25, button=MouseButton.LEFT)
+                    self.assertIsNotNone(panel.drag)
+                    assert_view()
+                    for x, y in ((.5, .4), (.7, .5), (.3, .7), (.1, .2)):
+                        send('motion_notify_event', x, y, button=MouseButton.LEFT)
+                        assert_view()
+                        np.testing.assert_allclose(item.points[0], [x, y], atol=.03)
+                    send('button_release_event', .1, .2, button=MouseButton.LEFT)
+                    self.assertIsNone(panel.drag)
+                    assert_view()
+                    # A subsequent numeric edit or resize must not unlock the
+                    # limits and resume expanding after the mouse is released.
+                    panel.set_point(item, 0, .2, .3)
+                    draw()
+                    assert_view()
+                    window.resize(window.width(), window.height()+40)
+                    draw()
+                    assert_view()
+                    for a, image in zip(axes, images):
+                        np.testing.assert_array_equal(a.images[0].get_array(), image)
+                    # Deliberate navigation still changes the view normally.
+                    send('scroll_event', .25, .25, button='up', step=1)
+                    self.assertLess(np.ptp(ax.get_xlim()), np.ptp(views[-1][0]))
 
     def test_panel_binding_and_tab_isolation(self):
         panel, axes = self.make_axes(multiple=True)

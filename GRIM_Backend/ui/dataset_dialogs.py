@@ -1460,6 +1460,8 @@ class TimeGateDialog(QDialog):
     without a window so in-gate responses keep their calibrated level.
     """
 
+    _METERS_PER_INCH = 0.0254
+
     def __init__(self, dataset: RcsGrid, *, elevation_index: int = 0,
                  polarization_index: int = 0, parent=None) -> None:
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -1474,12 +1476,14 @@ class TimeGateDialog(QDialog):
         geometry = gate_geometry(dataset)
         self._half_range = 0.5 * geometry["unambiguous_m"]
         resolution = geometry["resolution_m"]
+        display_scale = 1.0 / self._METERS_PER_INCH
 
         layout = QVBoxLayout(self)
         intro = QLabel(
             "Keep (or remove) scatterers inside a down-range window, measured in "
-            "metres from the phase reference, positive away from the radar. "
-            f"Resolution {resolution:.4g} m; unambiguous range ±{self._half_range:.4g} m."
+            "inches from the phase reference, positive away from the radar. "
+            f"Resolution {resolution*display_scale:.4g} in; "
+            f"unambiguous range ±{self._half_range*display_scale:.4g} in."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -1487,17 +1491,20 @@ class TimeGateDialog(QDialog):
         grid = QGridLayout()
         default = min(self._half_range / 4.0, max(20.0 * resolution, 0.5))
 
-        def metres(value: float) -> QDoubleSpinBox:
+        def inches(value_m: float) -> QDoubleSpinBox:
             spin = QDoubleSpinBox()
-            spin.setDecimals(4)
-            spin.setRange(-self._half_range, self._half_range)
-            spin.setSingleStep(max(resolution, 1.0e-4))
-            spin.setSuffix(" m")
-            spin.setValue(value)
+            spin.setDecimals(5)
+            # Round inward so the editor cannot select a range just outside
+            # the physical limit when its decimal precision rounds up.
+            half = np.floor(self._half_range * display_scale * 1e5) / 1e5
+            spin.setRange(-half, half)
+            spin.setSingleStep(max(resolution * display_scale, 1.0e-5))
+            spin.setSuffix(" in")
+            spin.setValue(value_m * display_scale)
             return spin
 
-        self.spin_start = metres(-default)
-        self.spin_stop = metres(default)
+        self.spin_start = inches(-default)
+        self.spin_stop = inches(default)
         self.spin_taper = QDoubleSpinBox()
         self.spin_taper.setRange(0.0, 100.0)
         self.spin_taper.setDecimals(1)
@@ -1569,8 +1576,8 @@ class TimeGateDialog(QDialog):
 
     def get_params(self) -> dict:
         return {
-            "start_m": float(self.spin_start.value()),
-            "stop_m": float(self.spin_stop.value()),
+            "start_m": float(self.spin_start.value()) * self._METERS_PER_INCH,
+            "stop_m": float(self.spin_stop.value()) * self._METERS_PER_INCH,
             "taper": float(self.spin_taper.value()) / 100.0,
             "mode": str(self.combo_mode.currentData()),
             "compensate": bool(self.chk_compensate.isChecked()),
@@ -1604,17 +1611,19 @@ class TimeGateDialog(QDialog):
             self._canvas.draw_idle()
             return
         peak = float(np.nanmax(before)) if np.any(before > 0) else 1.0
+        ranges = ranges / self._METERS_PER_INCH
         with np.errstate(divide="ignore"):
             ax.plot(ranges, 10.0 * np.log10(before / peak), color="#8a8a8a",
                     linewidth=1.0, label="Before")
             if after is not None:
                 ax.plot(ranges, 10.0 * np.log10(after / peak), color="#1f77b4",
                         linewidth=1.2, label="After")
-        ax.axvspan(params["start_m"], params["stop_m"], color="#59a14f", alpha=0.18,
+        ax.axvspan(self.spin_start.value(), self.spin_stop.value(), color="#59a14f", alpha=0.18,
                    linewidth=0, label="Gate")
-        ax.set_xlim(-self._half_range, self._half_range)
+        half_inches = self._half_range / self._METERS_PER_INCH
+        ax.set_xlim(-half_inches, half_inches)
         ax.set_ylim(-80.0, 5.0)
-        ax.set_xlabel("Down range (m)")
+        ax.set_xlabel("Down range (in)")
         ax.set_ylabel("Relative level (dB)")
         ax.grid(True, alpha=0.3)
         ax.legend(loc="upper right", fontsize=8)

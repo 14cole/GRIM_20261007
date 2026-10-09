@@ -69,8 +69,10 @@ class PlotAnalysisControls(QObject):
         self.spin_range_subband.setValue(25.0)
         self.spin_range_subband.setKeyboardTracking(False)
         self.spin_range_subband.setToolTip(
-            "Width of each sliding sub-band. Narrower sub-bands show more "
-            "frequency detail but coarser down-range resolution."
+            "Width of each sliding window within the frequencies you select. "
+            "The plot shows each window's center frequency. Narrower windows "
+            "show more frequency detail but coarser down-range resolution. "
+            "100% uses the entire selection for one range profile."
         )
         self.combo_range_window = QComboBox()
         self.combo_range_window.addItems(
@@ -79,6 +81,7 @@ class PlotAnalysisControls(QObject):
         self.combo_range_window.setToolTip("Window applied to each sub-band before the inverse FFT.")
         self.combo_range_unit = QComboBox()
         self.combo_range_unit.addItems(["m", "cm", "mm", "in", "ft"])
+        self.combo_range_unit.setCurrentText("in")
 
         self.combo_pbp_band.currentIndexChanged.connect(self._pbp_band_changed)
         self.spin_range_subband.valueChanged.connect(lambda: self.changed.emit("range"))

@@ -621,7 +621,8 @@ def plot_datasets(
                 vmax=plot_vmax,
             )
             if bool(square_aspect):
-                axis.set_aspect("equal", adjustable="datalim")
+                # Match the GUI: redraws must preserve the requested limits.
+                axis.set_aspect("equal", adjustable="box")
             meshes.append(mesh)
 
         unit_name, _unit_scale = _length_unit(options["length_unit"])

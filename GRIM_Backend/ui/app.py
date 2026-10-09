@@ -1870,11 +1870,12 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                     "to copy the results table."
                 ),
                 "range_freq": (
-                    "Down-range profiles over sliding frequency sub-bands, averaged "
+                    "Down-range profiles over sliding sub-bands of the selected frequencies, averaged "
                     "over the selected azimuths and elevations. Point scatterers stay "
                     "at one range; cavities and travelling waves drift. Needs complex "
-                    "data on uniformly spaced frequencies; set the sub-band in Plot "
-                    "Settings."
+                    "data on uniformly spaced frequencies. The horizontal axis shows "
+                    "sub-band centers; set the width in Plot Settings (100% gives "
+                    "one profile using all selected frequencies)."
                 ),
                 "markers": (
                     "Click near a curve to drop a marker on the nearest data point; "

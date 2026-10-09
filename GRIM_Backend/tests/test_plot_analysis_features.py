@@ -14,7 +14,7 @@ import numpy as np
 from matplotlib.backend_bases import MouseButton, MouseEvent
 from PySide6.QtCore import QItemSelectionModel, QPoint, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMenu
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QLabel, QMenu
 
 import GRIM_Backend.ui.app as grim_cut_gui
 from GRIM_Backend.ui.dataset_actions import DATASET_PATH_ROLE
@@ -488,6 +488,38 @@ class TimeGateTests(unittest.TestCase):
 
 
 class TimeGateGuiTests(_WindowCase):
+    def test_preview_and_gate_coordinates_are_inches_with_physical_meter_parameters(self):
+        from GRIM_Backend.ui.dataset_dialogs import TimeGateDialog
+
+        grid = _point_grid((-.3, 0., 0.), azimuths=(0.,))
+        dialog = TimeGateDialog(grid, parent=self.window)
+        self.addCleanup(dialog.deleteLater)
+        dialog.spin_start.setValue(0.)
+        dialog.spin_stop.setValue(24.)
+        dialog._preview_timer.stop()
+        dialog.update_preview()
+        self.assertEqual(dialog.spin_start.suffix().strip(), 'in')
+        self.assertEqual(dialog.spin_stop.suffix().strip(), 'in')
+        self.assertEqual(dialog._axes.get_xlabel(), 'Down range (in)')
+        self.assertEqual(dialog.get_params()['start_m'], 0.)
+        self.assertAlmostEqual(dialog.get_params()['stop_m'], .6096)
+        self.assertTrue(dialog.btn_box.button(QDialogButtonBox.Ok).isEnabled())
+        before, after = dialog._axes.lines
+        for line in (before, after):
+            self.assertAlmostEqual(line.get_xdata()[np.nanargmax(line.get_ydata())],
+                                   .3/.0254, delta=.5)
+        gate = dialog._axes.patches[0]
+        self.assertAlmostEqual(gate.get_x(), 0.)
+        self.assertAlmostEqual(gate.get_width(), 24.)
+        half_m = gate_geometry(grid)['unambiguous_m']/2
+        np.testing.assert_allclose(dialog._axes.get_xlim(), [-half_m/.0254, half_m/.0254])
+        # Rounding at the spin-box limits must stay inside the valid gate.
+        dialog.spin_start.setValue(dialog.spin_start.minimum())
+        dialog.spin_stop.setValue(dialog.spin_stop.maximum())
+        dialog._preview_timer.stop()
+        dialog.update_preview()
+        self.assertTrue(dialog.btn_box.button(QDialogButtonBox.Ok).isEnabled())
+
     def test_button_creates_gated_rows_and_records_script(self):
         window = self.window
         self.assertTrue(window.btn_time_gate.isEnabled())
@@ -621,15 +653,16 @@ class RangeFrequencyTests(_WindowCase):
         self.plot("_plot_range_freq")
         self.assertIn("Range–frequency map updated", window.status.currentMessage())
         peaks, levels = self.peak_ranges()
-        np.testing.assert_allclose(peaks, 0.3, atol=0.03)
+        np.testing.assert_allclose(peaks, 0.3 / 0.0254, atol=1.2)
         np.testing.assert_allclose(levels, 10 * np.log10(2.0), atol=0.1)
-        self.assertEqual(window.plot_ax.get_ylabel(), "Down range (m)")
+        self.assertEqual(window.plot_ax.get_ylabel(), "Down range (in)")
         self.assertEqual(window.plot_ax.get_xlabel(), "Sub-band center frequency (GHz)")
         self.assertEqual(window.plot_colorbars[0].ax.get_ylabel(), "RCS range profile (dBsm)")
 
-        window.analysis_controls.combo_range_unit.setCurrentText("in")
+        window.analysis_controls.combo_range_unit.setCurrentText("m")
         peaks, _levels = self.peak_ranges()
-        np.testing.assert_allclose(peaks, 0.3 / 0.0254, atol=1.2)
+        np.testing.assert_allclose(peaks, 0.3, atol=0.03)
+        self.assertEqual(window.plot_ax.get_ylabel(), "Down range (m)")
         window.btn_slider.setChecked(True)
         window.plot_slider.combo_axis.setCurrentIndex(0)
         window._on_plot_slider_moved(3)
@@ -653,7 +686,51 @@ class RangeFrequencyTests(_WindowCase):
         starts = subband_starts(2001, 100)
         self.assertLessEqual(len(starts), 200)
         self.assertEqual(starts[0], 0)
-        self.assertLessEqual(starts[-1], 2001 - 100)
+        self.assertEqual(starts[-1], 2001 - 100)
+        self.assertTrue(np.all(np.diff(starts) > 0))
+        self.assertEqual(subband_starts(8, 8), [0])
+
+    def test_selected_frequencies_are_used_and_full_band_profile_is_visible(self):
+        from GRIM_Backend.plotting.modes import range_freq_mode
+
+        window = self.window
+        grid = _point_grid((-.3, 0., 0.), azimuths=(0.,))
+        self.select_new_row(grid, 'Selected band')
+        window.list_freq.blockSignals(True)
+        window.list_freq.clearSelection()
+        for index in range(10, 61):
+            window.list_freq.item(index).setSelected(True)
+        window.list_freq.blockSignals(False)
+        with mock.patch.object(range_freq_mode, 'range_frequency_map',
+                               wraps=range_freq_mode.range_frequency_map) as form:
+            self.plot('_plot_range_freq')
+        np.testing.assert_allclose(form.call_args.args[1], grid.frequencies[10:61]*1e9)
+        self.assertEqual(form.call_args.args[0].shape[-1], 51)
+        self.assertEqual(form.call_args.kwargs['width'], 13)
+        window.analysis_controls.spin_range_subband.setValue(100.)
+        window.plot_canvas.draw()
+        (mesh,) = window.plot_ax.collections
+        x, _y, image = mesh._grim_rectilinear_data
+        np.testing.assert_allclose(x, grid.frequencies[[10, 60]])
+        np.testing.assert_allclose(window.plot_ax.get_xlim(), x)
+        self.assertEqual(image.shape[1], 1)
+        self.assertIn('full selected band', window.plot_ax.get_title())
+        self.assertEqual(window.plot_ax.get_xlabel(), 'Selected band: Frequency (GHz)')
+        peaks, levels = self.peak_ranges()
+        np.testing.assert_allclose(peaks, .3/.0254, atol=1.2)
+        np.testing.assert_allclose(levels, 0., atol=.1)
+
+        # The minimum eight selected frequencies also produce one full-band
+        # column at the default 25% setting; it must have a nonzero width.
+        window.list_freq.blockSignals(True)
+        window.list_freq.clearSelection()
+        for index in range(8):
+            window.list_freq.item(index).setSelected(True)
+        window.list_freq.blockSignals(False)
+        window.analysis_controls.spin_range_subband.setValue(25.)
+        window.plot_canvas.draw()
+        (mesh,) = window.plot_ax.collections
+        np.testing.assert_allclose(mesh._grim_rectilinear_data[0], grid.frequencies[[0, 7]])
 
 
 if __name__ == "__main__":

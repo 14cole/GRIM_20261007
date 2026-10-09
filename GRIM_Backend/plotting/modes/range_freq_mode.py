@@ -25,10 +25,13 @@ RANGE_UNITS = {"m": 1.0, "cm": 100.0, "mm": 1000.0, "in": 1.0 / 0.0254, "ft": 1.
 
 
 def subband_starts(count: int, width: int, max_columns: int = MAX_COLUMNS) -> list[int]:
-    """Evenly stepped sub-band starts, at most ``max_columns`` of them."""
+    """Bounded sub-band starts including both ends of the selected sweep."""
+    if not 1 <= width <= count or max_columns < 1:
+        raise ValueError("Sub-band width and column limit must be positive and fit the selection.")
     positions = count - width + 1
-    step = max(1, int(np.ceil(positions / max_columns)))
-    return list(range(0, positions, step))
+    if positions > 1 and max_columns < 2:
+        raise ValueError("At least two columns are needed to cover both ends of the selection.")
+    return np.linspace(0, positions - 1, min(positions, max_columns), dtype=int).tolist()
 
 
 def range_frequency_map(sweeps, frequencies_hz, *, width: int, window: str):
@@ -103,7 +106,7 @@ def render(self) -> None:
     controls = getattr(self, "analysis_controls", None)
     percent = controls.range_subband_percent() if controls is not None else 25.0
     window = controls.range_window() if controls is not None else "Hanning"
-    unit = controls.range_unit() if controls is not None else "m"
+    unit = controls.range_unit() if controls is not None else "in"
     scale = RANGE_UNITS[unit]
 
     panels = []
@@ -158,6 +161,7 @@ def render(self) -> None:
             "resolution": C0 / (2.0 * step_hz * width) * scale,
             "width": width,
             "count": native.size,
+            "selected_band": self._plot_axis_values(reference, dataset, "frequency", native[[0, -1]]),
         })
 
     if not panels:
@@ -182,8 +186,16 @@ def render(self) -> None:
     meshes = []
     for ax, panel in zip(self.plot_axes, panels):
         self._style_axes(ax)
+        x, y = panel["x"], panel["y"]
+        if len(x) == 1:
+            # With 100% width (or only eight samples) this is one full-band
+            # profile. Center-only pcolormesh coordinates give it zero width,
+            # making a valid result invisible. Draw its selected band extent.
+            x = panel["selected_band"]
+            y = np.r_[y[0] - (y[1]-y[0])/2, (y[:-1]+y[1:])/2,
+                      y[-1] + (y[-1]-y[-2])/2]
         mesh = ax.pcolormesh(
-            panel["x"], panel["y"], panel["image"].T, shading="auto",
+            x, y, panel["image"].T, shading="auto",
             cmap=self._effective_colormap(), vmin=vmin, vmax=vmax,
         )
         coordinates = mesh.get_coordinates()
@@ -192,14 +204,19 @@ def render(self) -> None:
             mesh.get_array().reshape(panel["image"].T.shape),
         )
         meshes.append(mesh)
+        band_label = ("full selected band" if panel['width'] == panel['count']
+                      else f"sub-band {panel['width']}/{panel['count']} samples")
+        band_low, band_high = panel["selected_band"]
         ax.set_title(
-            f"{panel['name']} | Pol {panel['pol']}, mean of {panel['sweeps']} sweeps, "
-            f"sub-band {panel['width']}/{panel['count']} samples "
+            f"{panel['name']} | Pol {panel['pol']}, mean of {panel['sweeps']} sweeps\n"
+            f"Selected {band_low:g}–{band_high:g} {common.axis_unit(reference, 'frequency')} | "
+            f"{band_label} "
             f"({panel['resolution']:.3g} {unit} resolution)",
             color=self._current_plot_text(), fontsize=9,
         )
         frequency_label = self._plot_axis_label(reference, "frequency")
-        ax.set_xlabel("Sub-band center " + frequency_label[:1].lower() + frequency_label[1:])
+        ax.set_xlabel(("Selected band: " + frequency_label) if len(panel["x"]) == 1
+                      else "Sub-band center " + frequency_label[:1].lower() + frequency_label[1:])
         ax.set_ylabel(f"Down range ({unit})")
     if self.chk_colorbar.isChecked():
         colorbar = self.plot_figure.colorbar(meshes[-1], ax=self.plot_axes)
@@ -211,7 +228,8 @@ def render(self) -> None:
         )
         colorbar.ax.tick_params(colors=self._current_plot_text())
 
-    x_all = np.concatenate([panel["x"] for panel in panels])
+    x_all = np.concatenate([panel["selected_band"] if len(panel["x"]) == 1 else panel["x"]
+                            for panel in panels])
     y_all = np.concatenate([panel["y"] for panel in panels])
     for spin, value in (
         (self.spin_plot_xmin, float(np.min(x_all))), (self.spin_plot_xmax, float(np.max(x_all))),

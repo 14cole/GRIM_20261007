@@ -409,11 +409,12 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
             vmax=plot_vmax,
         )
         if square_aspect:
-            # adjustable="datalim" keeps the plot box at its current size and
-            # *expands* the visible data limits to maintain 1:1 cross-range /
-            # range scale. The opposite ("box") shrinks the box, which is
-            # what we don't want when range and cross-range extents differ.
-            ax.set_aspect("equal", adjustable="datalim")
+            # Preserve the selected coordinate limits on every redraw. With
+            # constrained layout and a colorbar, adjustable="datalim" can
+            # repeatedly expand them as the layout recalculates the axes box
+            # (for example on each overlay-drag frame). Adjust the box instead
+            # so distances stay 1:1 without changing the user's zoom.
+            ax.set_aspect("equal", adjustable="box")
         last_mesh = mesh
         self._isar_meshes.append(mesh)
         overall_x_min = min(overall_x_min, x_min)

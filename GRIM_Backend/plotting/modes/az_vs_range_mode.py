@@ -24,6 +24,7 @@ from .isar_mode import (
     _ifft,
 )
 from GRIM_Backend.isar.interpolation import resample_pair
+from GRIM_Backend.isar.geometry import angular_bands
 
 
 def _prepare_uniform_frequency_history(
@@ -104,45 +105,72 @@ def _range_display_values(dataset, magnitude: np.ndarray, *, linear: bool) -> np
 
 
 def _range_display_grid(azimuths, ranges, image, *, azimuth_width, max_side):
-    """Peak-pool with actual bin edges, leaving unmeasured angles blank.
+    """Draw contiguous selected samples with shared midpoint cell boundaries.
 
-    Each acquired angle occupies one native sampling-width cell centerd on
-    that angle. Pooling never crosses an angular gap. Partial final blocks
-    retain their real extent instead of stretching the image to fit.
+    Normal spacing changes and regular selection strides are not missing
+    sectors. Use ISAR's local-cadence gap detection to split real sectors, and
+    preserve their actual cell edges during peak pooling. Native sampling
+    width is only a fallback for a sector containing one sample.
     """
     azimuths = np.asarray(azimuths, dtype=float)
     ranges = np.asarray(ranges, dtype=float)
+    image = np.asarray(image)
     width = float(azimuth_width)
+    if (azimuths.ndim != 1 or not azimuths.size or not np.all(np.isfinite(azimuths))
+            or np.any(np.diff(azimuths) <= 0)):
+        raise ValueError("azimuth samples must be finite and strictly increasing")
+    if (ranges.ndim != 1 or ranges.size < 2 or not np.all(np.isfinite(ranges))
+            or np.any(np.diff(ranges) <= 0) or image.shape != (len(ranges), len(azimuths))):
+        raise ValueError("range image must match its increasing range and azimuth axes")
+    if not np.isfinite(width) or width <= 0 or max_side < 1:
+        raise ValueError("display sampling width and size limit must be positive")
+
     dy = float(ranges[1] - ranges[0])
     y_edges = np.r_[ranges - dy / 2.0, ranges[-1] + dy / 2.0]
     y_starts = np.arange(0, len(ranges), max(1, int(np.ceil(len(ranges) / max_side))))
     pooled = np.fmax.reduceat(image, y_starts, axis=0)
     y_edges = y_edges[np.r_[y_starts, len(ranges)]]
-    breaks = np.r_[0, np.flatnonzero(np.diff(azimuths) > width * (1 + 1e-6)) + 1,
-                   len(azimuths)]
-    # Reserve room for one transparent column per gap in the display budget.
-    max_blocks = max_side - (len(breaks) - 2)
-    if len(breaks) - 1 > max_blocks:
+
+    sectors = angular_bands(range(len(azimuths)), azimuths)
+    bounds = []
+    for sector in sectors:
+        centers = azimuths[sector]
+        if len(centers) == 1:
+            cell_edges = np.array([centers[0] - width/2, centers[0] + width/2])
+        else:
+            steps = np.diff(centers)
+            cell_edges = np.r_[centers[0] - steps[0]/2,
+                               centers[:-1] + steps/2, centers[-1] + steps[-1]/2]
+        bounds.append(cell_edges)
+    # A singleton's fallback width must not overlap an adjacent sector or
+    # hide a gap detected from the surrounding local acquisition cadence.
+    for i in range(len(sectors) - 1):
+        last = azimuths[sectors[i][-1]]
+        first = azimuths[sectors[i+1][0]]
+        gap = first - last
+        bounds[i][-1] = min(bounds[i][-1], last + gap/4)
+        bounds[i+1][0] = max(bounds[i+1][0], first - gap/4)
+
+    max_blocks = max_side - (len(sectors) - 1)
+    if len(sectors) > max_blocks:
         raise ValueError("too many disconnected azimuth samples; select fewer angles")
     stride = max(1, int(np.ceil(len(azimuths) / max_blocks)))
-    while True:
-        blocks = [(first, min(first + stride, end))
-                  for start, end in zip(breaks[:-1], breaks[1:])
-                  for first in range(start, end, stride)]
-        if len(blocks) <= max_blocks:
-            break
+    while sum((len(sector) + stride - 1)//stride for sector in sectors) > max_blocks:
         stride *= 2
-    edges = [float(azimuths[0] - width / 2)]
+    edges = [float(bounds[0][0])]
     columns = []
-    for first, end in blocks:
-        left = float(azimuths[first] - width / 2)
-        if left > edges[-1] + width * 1e-6:
+    block_count = 0
+    for i, (sector, cell_edges) in enumerate(zip(sectors, bounds)):
+        if i:
             columns.append(np.full(pooled.shape[0], np.nan))
-            edges.append(left)
-        columns.append(np.fmax.reduce(pooled[:, first:end], axis=1))
-        edges.append(float(azimuths[end - 1] + width / 2))
+            edges.append(float(cell_edges[0]))
+        for first in range(0, len(sector), stride):
+            end = min(first + stride, len(sector))
+            columns.append(np.fmax.reduce(pooled[:, sector[0]+first:sector[0]+end], axis=1))
+            edges.append(float(cell_edges[end]))
+            block_count += 1
     return np.asarray(edges), y_edges, np.column_stack(columns), (
-        len(y_starts) < len(ranges) or len(blocks) < len(azimuths)
+        len(y_starts) < len(ranges) or block_count < len(azimuths)
     )
 
 
@@ -317,6 +345,7 @@ def render(self) -> None:
     else:
         mesh = self.plot_ax.pcolormesh(
             x_edges, y_edges, display_for_plot, shading="flat", rasterized=True,
+            edgecolors="none", antialiased=False, snap=True,
             **color_options,
         )
 
