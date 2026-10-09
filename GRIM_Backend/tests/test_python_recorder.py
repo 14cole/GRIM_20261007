@@ -341,6 +341,17 @@ class PythonRecorderTests(unittest.TestCase):
             )
         self.assertEqual(form.call_args.kwargs["length_unit"], "in")
         self.assertEqual(default_figure.axes[0].get_xlabel(), "Cross-Range (in)")
+        self.assertEqual(float(default_figure.axes[0].get_aspect()), 1.0)
+
+        with mock.patch(
+            "GRIM_Backend.plotting.modes.isar_mode.form_isar", return_value=([band], 0.01)
+        ):
+            stretched = plot_datasets(
+                [("Dataset", grid)], mode="isar_image", azimuths=[-180.0, 0.0],
+                elevations=[0.0], frequencies=[9.0, 10.0], polarization="VV",
+                show_colorbar=False, square_aspect=False,
+            )
+        self.assertEqual(stretched.axes[0].get_aspect(), "auto")
 
     def test_identical_plot_specs_are_deduplicated(self):
         recorder = PythonScriptRecorder()

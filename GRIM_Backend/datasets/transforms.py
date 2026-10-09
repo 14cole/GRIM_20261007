@@ -1045,8 +1045,8 @@ def _gate_sweeps(sweeps, frequencies_hz, *, start_m, stop_m, taper, mode, compen
     gate = _gate_window(ranges, start_m, stop_m, taper, mode)
     gated = np.fft.fft(np.fft.ifft(sweeps, n=size, axis=-1) * gate, axis=-1)[..., :count]
     if compensate and mode == "keep":
-        centre = 0.5 * (start_m + stop_m)
-        point = np.exp(-4j * np.pi * frequencies_hz * centre / C0)
+        center = 0.5 * (start_m + stop_m)
+        point = np.exp(-4j * np.pi * frequencies_hz * center / C0)
         response = np.fft.fft(np.fft.ifft(point, n=size) * gate)[:count] / point
         response = np.where(np.abs(response) > 1.0e-3, response, 1.0)
         gated = gated / response
@@ -1096,7 +1096,7 @@ def time_gate(
     is the fraction of the gate width given to raised-cosine edges.
     ``mode="remove"`` keeps everything except the gate. ``compensate``
     (keep mode) divides out the gate's band-edge droop for a point at the
-    gate centre. Data declaring exp(-jwt) are conjugated around the gate;
+    gate center. Data declaring exp(-jwt) are conjugated around the gate;
     undeclared data follow GRIM's exp(+jwt) law. Sweeps with any missing
     sample are left missing.
     """
@@ -1208,7 +1208,7 @@ def down_range_profile(
 
 
 # --------------------------------------------------------------------------
-# Phase-centre translation
+# Phase-center translation
 # --------------------------------------------------------------------------
 
 
@@ -1243,15 +1243,28 @@ def translate_phase_center(
 
     offset = np.asarray([x_m, y_m, z_m], dtype=float)
     if not np.all(np.isfinite(offset)):
-        raise ValueError("the phase-centre offset must be finite")
+        raise ValueError("the phase-center offset must be finite")
     if not np.any(offset):
-        raise ValueError("the phase-centre offset is zero")
+        raise ValueError("the phase-center offset is zero")
     power = dataset.rcs_power
     phase_in = _authoritative_response_phase(dataset)
     if not np.any(np.isfinite(power) & np.isfinite(phase_in)):
-        raise ValueError("moving the phase centre needs complex (phase) data")
+        raise ValueError("moving the phase center needs complex (phase) data")
     azimuth = _angle_axis_radians(dataset, "azimuth")
     elevation = _angle_axis_radians(dataset, "elevation")
+    declarations = set()
+    for key in ("elevation_coordinate_convention", "sentri_elevation_convention"):
+        metadata = dataset.inspect_scalar_metadata(key)
+        if metadata.malformed_sources:
+            raise ValueError(f"{key} must be scalar")
+        declarations.update(value.strip().lower() for value in metadata.declarations)
+    if len(declarations) > 1:
+        raise ValueError("dataset declares contradictory elevation conventions")
+    convention = next(iter(declarations), "")
+    if convention == "sentri_theta_top_zero":
+        elevation = np.pi / 2.0 - elevation
+    elif convention not in {"", "grim_elevation_waterline_zero_top_positive"}:
+        raise ValueError(f"unsupported elevation convention {convention!r}")
     wavenumber = 2.0 * np.pi * np.asarray(
         dataset._frequency_value_to_hz(np.asarray(dataset.frequencies, dtype=float)),
         dtype=float,
@@ -1289,6 +1302,7 @@ def translate_phase_center(
             "total_offset_m": total.tolist(),
             "direction_convention": "coming-from radar u=(cos el cos az, cos el sin az, sin el)",
             "time_convention": "exp(-jwt)" if sign > 0 else "exp(+jwt)",
+            "source_elevation_convention": convention or "GRIM signed elevation (assumed)",
         },
         sort_keys=True,
     )
@@ -1300,6 +1314,22 @@ def translate_phase_center(
         text = str(np.asarray(declared).reshape(-1)[0].item()).strip()
         if text:
             container["phase_reference"] = f"{text}; {note}"
+    # The same translation applies to every contributing field. Carry its
+    # reference declarations forward so later coherent checks do not compare
+    # the new reference against unshifted lineage from an earlier combination.
+    if "coherent_source_conventions_json" in extra:
+        try:
+            record = json.loads(str(np.asarray(
+                extra["coherent_source_conventions_json"]
+            ).reshape(()).item()))
+            references = record.get("declared_values", {}).get("phase_reference")
+            if isinstance(references, list):
+                record["declared_values"]["phase_reference"] = [
+                    f"{reference}; {note}" for reference in references
+                ]
+                extra["coherent_source_conventions_json"] = json.dumps(record, sort_keys=True)
+        except (ValueError, TypeError, AttributeError):
+            pass
     return RcsGrid(
         dataset.azimuths,
         dataset.elevations,

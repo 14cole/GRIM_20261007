@@ -150,6 +150,67 @@ class SpatialOverlayTests(_WindowCase):
         panel.refresh()
         self.assertIsNotNone(item.artist)
 
+    def test_zoomed_point_drag_keeps_limits_and_layout_with_measurement_at_edge(self):
+        for square in (False, True):
+            for multiple in (False, True):
+                with self.subTest(square=square, multiple=multiple):
+                    panel, axes = self.make_axes(multiple=multiple)
+                    panel.clear()
+                    window = self.window
+                    window.plot_figure.set_layout_engine('constrained')
+                    for ax in axes:
+                        ax.set_aspect('equal' if square else 'auto', adjustable='datalim')
+                    panel.show_controls()
+                    ax = axes[-1]
+                    item = panel.add_points([[0, 0], [1, 1]], ax=ax)
+                    panel.measure_between((item, 0), (item, 1))
+                    window.btn_auto_scale.setChecked(True)
+                    self.app.processEvents()
+                    window.plot_canvas.draw()
+                    event = MouseEvent('scroll_event', window.plot_canvas,
+                                       *ax.transData.transform([0, 0]), button='up', step=5)
+                    window.plot_canvas.callbacks.process('scroll_event', event)
+                    self.app.processEvents()
+                    window.plot_canvas.draw()
+                    xhi, yhi = ax.get_xlim()[1], ax.get_ylim()[1]
+                    panel.set_point(item, 0, .9*xhi, .9*yhi)
+                    panel.set_point(item, 1, .99*xhi, .99*yhi)
+                    for _ in range(3):
+                        self.app.processEvents()
+                        window.plot_canvas.draw()
+                    views = [(a.get_xlim(), a.get_ylim(), a.get_position().bounds) for a in axes]
+                    images = [a.images[0].get_array().copy() for a in axes]
+                    data_limits = [a.dataLim.bounds for a in axes]
+                    original_label = panel.measure_label.text()
+
+                    def send(kind, x, y):
+                        event = MouseEvent(kind, window.plot_canvas,
+                                           *ax.transData.transform([x, y]), button=MouseButton.LEFT)
+                        window.plot_canvas.callbacks.process(kind, event)
+                        window._flush_hover()
+                        self.app.processEvents()
+                        window.plot_canvas.draw()
+                        for current, (xlim, ylim, bounds), data_lim in zip(axes, views, data_limits):
+                            np.testing.assert_allclose(current.get_xlim(), xlim, rtol=0, atol=1e-10)
+                            np.testing.assert_allclose(current.get_ylim(), ylim, rtol=0, atol=1e-10)
+                            np.testing.assert_allclose(current.get_position().bounds, bounds, rtol=0, atol=1e-6)
+                            np.testing.assert_array_equal(current.dataLim.bounds, data_lim)
+
+                    send('button_press_event', .9*xhi, .9*yhi)
+                    self.assertIsNotNone(panel.drag)
+                    for x, y in ((.95*xhi, .95*yhi), (.2*xhi, .2*yhi), (.98*xhi, .98*yhi)):
+                        send('motion_notify_event', x, y)
+                        np.testing.assert_allclose(item.points[0], [x, y], atol=.03)
+                    send('button_release_event', .98*xhi, .98*yhi)
+                    self.assertIsNone(panel.drag)
+                    self.assertNotEqual(panel.measure_label.text(), original_label)
+                    for current, image in zip(axes, images):
+                        np.testing.assert_array_equal(current.images[0].get_array(), image)
+                    # Numeric edits and measurement removal must preserve the same view.
+                    panel.set_point(item, 0, .3*xhi, .3*yhi)
+                    panel.clear_measurement()
+                    send('motion_notify_event', .3*xhi, .3*yhi)
+
     def test_panel_binding_and_tab_isolation(self):
         panel, axes = self.make_axes(multiple=True)
         self.assertEqual(len(panel.axes), 2)

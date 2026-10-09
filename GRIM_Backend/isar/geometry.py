@@ -89,3 +89,22 @@ def axis_edges(axis):
 def image_extent(band):
     """Full image boundary, retained even when magnitude is display-decimated."""
     return [*axis_edges(band["x_range"]), *axis_edges(band["y_range"])]
+
+
+def reduced_axis_edges(axis, max_side):
+    """Actual edges of max-pooled cells, including a partial final block."""
+    axis = np.asarray(axis, float)
+    step = axis[1] - axis[0]
+    stride = max(1, int(np.ceil(len(axis) / max_side)))
+    return np.r_[axis[np.arange(0, len(axis), stride)] - step/2, axis[-1] + step/2]
+
+
+def draw_image(ax, band, display, **options):
+    """Use a mesh only when display pooling leaves unequal cell widths."""
+    x, y = band.get('display_x_edges'), band.get('display_y_edges')
+    if x is not None and y is not None and not all(
+        np.allclose(np.diff(edges), np.diff(edges)[0], rtol=1e-7, atol=0) for edges in (x, y)
+    ):
+        return ax.pcolormesh(x, y, display.T, shading='flat', rasterized=True, **options)
+    return ax.imshow(display.T, extent=image_extent(band), origin='lower',
+                     aspect='auto', interpolation='nearest', **options)

@@ -4,7 +4,8 @@ from __future__ import annotations
 import numpy as np
 from . import common
 from . import isar_mode as computation
-from GRIM_Backend.isar.geometry import angular_bands, angular_sublooks, image_extent
+from GRIM_Backend.isar.geometry import angular_bands, angular_sublooks, image_extent, draw_image
+from GRIM_Backend.isar.quality import reconstruction_advisories
 
 
 def render(self) -> None:
@@ -389,7 +390,7 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
     )
 
     square_widget = getattr(self, "chk_isar_square", None)
-    square_aspect = bool(square_widget.isChecked()) if square_widget is not None else False
+    square_aspect = bool(square_widget.isChecked()) if square_widget is not None else True
 
     last_mesh = None
     self._isar_meshes = []
@@ -401,12 +402,8 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
         x_min, x_max, y_min, y_max = image_extent(br)
         # imshow on a uniform grid is several times faster than pcolormesh
         # for big arrays (1601-frequency datasets feel laggy with pcolormesh).
-        mesh = ax.imshow(
-            br["isar_display"].T,
-            extent=image_extent(br),
-            origin="lower",
-            aspect="auto",
-            interpolation="nearest",
+        mesh = draw_image(
+            ax, br, br["isar_display"],
             cmap=cmap,
             vmin=plot_vmin,
             vmax=plot_vmax,
@@ -659,6 +656,13 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
                 f"unambiguous |x|≤{sampling['cross_half_extent']:.3g}, "
                 f"|r|≤{sampling['range_half_extent']:.3g} {unit_name}"
             )
+    # Model checks concern physical accuracy, independently of FISTA convergence.
+    # Keep these at the front of the status so they are visible on small windows.
+    advisories = reconstruction_advisories(band_results)
+    if hasattr(self.status, 'setToolTip'):
+        self.status.setToolTip("\n".join(advisories))
+    if advisories:
+        parts.insert(0, "Accuracy notes: " + " | ".join(advisories) + " — ")
     if notes:
         parts.append(" — " + ", ".join(notes))
     self._show_plot_status("".join(parts))

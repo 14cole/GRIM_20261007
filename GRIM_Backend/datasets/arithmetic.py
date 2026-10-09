@@ -24,8 +24,8 @@ class GridArithmeticMixin:
 
         Args:
             other: Another RcsGrid with identical axes.
-            metadata_attested: Optional user-attestation record. Missing and
-                conflicting convention annotations are advisory without it.
+            metadata_attested: Record a user attestation when supplied.
+                Missing or conflicting conventions are advisory; samples are used as supplied.
 
         Returns:
             New RcsGrid with rcs = self.rcs + other.rcs.
@@ -83,8 +83,8 @@ class GridArithmeticMixin:
 
         Args:
             *grids: One or more RcsGrid instances.
-            metadata_attested: Optional user-attestation record. Missing and
-                conflicting convention annotations are advisory without it.
+            metadata_attested: Record a user attestation when supplied.
+                Missing or conflicting conventions are advisory; samples are used as supplied.
 
         Returns:
             New RcsGrid with rcs = self.rcs + sum(grid.rcs).
@@ -152,8 +152,8 @@ class GridArithmeticMixin:
 
         Args:
             other: Another RcsGrid with identical axes.
-            metadata_attested: Optional user-attestation record. Missing and
-                conflicting convention annotations are advisory without it.
+            metadata_attested: Record a user attestation when supplied.
+                Missing or conflicting conventions are advisory; samples are used as supplied.
             maximum_working_bytes: Optional cap for the newly retained result
                 arrays plus bounded arithmetic/QA scratch. By default GRIM uses
                 half of currently available physical memory (or the reviewed

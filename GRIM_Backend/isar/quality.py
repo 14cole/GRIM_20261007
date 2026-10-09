@@ -4,7 +4,52 @@ from __future__ import annotations
 import numpy as np
 
 C0 = 299_792_458.0
-ENGINE_VERSION = "2.0.0"
+ENGINE_VERSION = "2.1.0"
+
+
+def cartesian_support_scale(theta, frequency_hz):
+    """Fit a useful Cartesian rectangle inside a narrow polar annulus.
+
+    Retain the original aperture when at least a quarter of the frequency
+    bandwidth remains. Otherwise narrow U enough to retain half the bandwidth;
+    this trades cross-range resolution for a nondegenerate coherent image.
+    """
+    theta, freq = np.asarray(theta, float), np.asarray(frequency_hz, float)
+    psi = theta - theta.mean()
+    maximum_u = float(freq[0] * np.max(abs(np.sin(psi))))
+    width = float(freq[-1] - freq[0])
+    available_sq = float(freq[-1]**2 - maximum_u**2)
+    if available_sq >= (freq[0] + .25 * width)**2:
+        return 1.0
+    # Difference-of-squares form avoids loss of precision in narrow bands.
+    retained_v = freq[0] + .5 * width
+    limit_u = np.sqrt((freq[-1] - retained_v) * (freq[-1] + retained_v))
+    return float(min(1.0, limit_u / max(maximum_u, np.finfo(float).tiny)))
+
+
+def reconstruction_advisories(bands):
+    """Collect visible, nonblocking quality notes, including composite looks."""
+    notes, native_checks, unchecked = [], [], []
+    for band in bands:
+        for item in [band, *band.get('composite_look_diagnostics', [])]:
+            notes.extend(item.get('accuracy_plan', {}).get('warnings', []))
+            native = item.get('native_residual', {})
+            if native.get('status') == 'computed':
+                native_checks.append(native)
+            elif 'sparse' in band.get('resolved_reconstruction', '') and native.get('status') == 'not_computed':
+                unchecked.append('Sparse image accuracy was not checked against acquired measurements: '
+                                 + native.get('reason', 'check unavailable'))
+    priority = []
+    if native_checks:
+        worst = max(native_checks, key=lambda item: item['relative_complex_l2_residual'])
+        error = worst['relative_complex_l2_residual']
+        prefix = 'ACCURACY WARNING: ' if worst.get('high_model_mismatch') else ''
+        message = (f'{prefix}sparse acquired-data check: {error:.1%} worst relative complex-field error '
+                   f'({worst["sample_count"]:,} of {worst["source_sample_count"]:,} samples in that check).')
+        if worst.get('high_model_mismatch'):
+            message += ' Solver convergence does not certify image accuracy.'
+        priority.append(message)
+    return list(dict.fromkeys(priority + unchecked + notes))
 
 
 def scene_extents(value):
@@ -72,12 +117,19 @@ def plan_isar(azimuth_degrees, frequency_hz, *, elevation_degrees=0.0,
         warnings.append("The requested scene exceeds the native per-step sampling limit. Interpolation does not recover missing information.")
     elif max(az_step, freq_step) > np.pi / 2:
         warnings.append("Phase changes exceed π/2 per sample near the scene edge; interpolation amplitude loss can be significant.")
-    if selected in {"fft", "sparse"} and curvature > np.pi / 4:
+    if selected == "fft" and curvature > np.pi / 4:
         warnings.append("Fast-grid range-curvature error exceeds π/4 at the scene edge. Accurate PFA is recommended for coherent imaging.")
     if composite:
         warnings.append("This selection produces a qualitative maximum-magnitude composite with no coherent complex image.")
     if not composite and span >= 90:
         raise ValueError("A coherent PFA aperture must be narrower than 90°; choose composite or a narrower sector")
+    support_scale = 1.0
+    if not composite and selected in {'accurate', 'sparse'}:
+        support_scale = cartesian_support_scale(theta, freq)
+        if support_scale < 1:
+            warnings.append(f'Narrow-band Cartesian support reduces the cross-range spatial-frequency span '
+                            f'to {support_scale:.1%} of the full-aperture value; cross-range resolution is reduced. '
+                            'Use a wider frequency band or narrower aperture to retain full support.')
     return {
         "aperture_degrees": span, "center_degrees": float(np.mean(az)),
         "frequency_min_hz": float(freq[0]), "frequency_max_hz": float(freq[-1]),
@@ -89,6 +141,7 @@ def plan_isar(azimuth_degrees, frequency_hz, *, elevation_degrees=0.0,
         "max_native_frequency_phase_step_rad": float(freq_step),
         "native_step_check_passed": bool(max(az_step, freq_step) < np.pi),
         "recommended_reconstruction": recommended, "selected_reconstruction": selected,
+        "cartesian_support_scale": support_scale,
         "aperture_mode": mode, "image_kind": "maximum_magnitude_composite" if composite else "coherent",
         "warnings": warnings,
     }

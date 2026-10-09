@@ -585,7 +585,7 @@ class PhaseCenterGuiTests(_WindowCase):
                 self.app.processEvents()
                 time.sleep(0.005)
             self.app.processEvents()
-        self.assertIn("Phase centre created 1 dataset(s)", window.status.currentMessage())
+        self.assertIn("Phase center created 1 dataset(s)", window.status.currentMessage())
         self.assertEqual(window.table.item(3, 0).text(), "Run 1 [PC (1, 0, -2) in]")
         result = window.table.item(3, 0).data(Qt.UserRole)
         np.testing.assert_array_equal(result.rcs_power, self.datasets[0].rcs_power)
@@ -624,7 +624,7 @@ class RangeFrequencyTests(_WindowCase):
         np.testing.assert_allclose(peaks, 0.3, atol=0.03)
         np.testing.assert_allclose(levels, 10 * np.log10(2.0), atol=0.1)
         self.assertEqual(window.plot_ax.get_ylabel(), "Down range (m)")
-        self.assertEqual(window.plot_ax.get_xlabel(), "Sub-band centre frequency (GHz)")
+        self.assertEqual(window.plot_ax.get_xlabel(), "Sub-band center frequency (GHz)")
         self.assertEqual(window.plot_colorbars[0].ax.get_ylabel(), "RCS range profile (dBsm)")
 
         window.analysis_controls.combo_range_unit.setCurrentText("in")

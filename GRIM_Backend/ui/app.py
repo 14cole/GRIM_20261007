@@ -124,7 +124,6 @@ PLOT_OPS_SPECS = {
     ),
     "isar": (
         (
-            ("Hold", "hold"),
             ("Clear", "clear"),
             ("ISAR Image", "isar_image"),
             ("Az. vs D.R.", "az_vs_range"),
@@ -544,8 +543,9 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         )
         operation_tooltips = {
             "btn_coherent_add": (
-                "Add complex fields in the displayed operand order. Axes, units, "
-                "polarization basis, time convention, and phase reference must agree."
+                "Add complex fields as supplied, in the displayed operand order. "
+                "Axes and units must match. Convention differences are advisory; "
+                "use Compatibility to compare them."
             ),
             "btn_coherent_sub": (
                 "Subtract complex fields in the displayed operand order: first minus "
@@ -1553,9 +1553,9 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         ])
         combo_isar_recon.setToolTip(
             "Fast PFA: keystone-corrected matched-filter imaging — quickest, "
-            "but residual range curvature can defocus off-centre scatterers.\n"
+            "but residual range curvature can defocus off-center scatterers.\n"
             "Accurate PFA: regrids both Cartesian wavenumber axes before the FFT; "
-            "better focus for wider apertures and targets away from the phase centre.\n"
+            "better focus for wider apertures and targets away from the phase center.\n"
             "Sparse L1: experimental fixed-lambda complex LASSO/FISTA image "
             "reconstruction. It promotes a sparse pixel image and may reduce "
             "sidelobes or noise, but it can also suppress weak or distributed "
@@ -1663,9 +1663,10 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         row += 1
 
         chk_isar_square = QCheckBox("Square Aspect")
+        chk_isar_square.setChecked(True)
         chk_isar_square.setToolTip(
             "Lock the image to equal cross-range / down-range scale and clip the "
-            "visible window to a square centred on (0, 0). The square is sized to "
+            "visible window to a square centerd on (0, 0). The square is sized to "
             "the smaller of the down-range / cross-range half-extents so the target "
             "fills the box and the geometry is undistorted. Off uses 'fill the axes' "
             "scaling, which packs more data on screen but stretches the geometry."

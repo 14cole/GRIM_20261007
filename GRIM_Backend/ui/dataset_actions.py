@@ -1758,62 +1758,13 @@ class DatasetOpsMixin:
         operation_name: str,
         *,
         independent: bool = False,
-    ) -> bool | None:
-        """Require explicit confirmation when coherent declarations are missing."""
+    ) -> bool:
+        """Proceed with supplied samples; conventions never require a prompt.
 
-        labels = _COHERENT_METADATA_LABELS
-        missing = _missing_coherent_metadata_keys(
-            [dataset for _name, dataset in datasets]
-        )
-
-        if not missing:
-            return False
-
-        missing_text = ", ".join(labels[key] for key in labels if key in missing)
-        affected = []
-        for name, dataset in datasets:
-            absent = []
-            getter = getattr(dataset, "_declared_scalar_metadata", None)
-            for key, label in labels.items():
-                value = getter(key) if callable(getter) else ""
-                if not str(value or "").strip():
-                    absent.append(label)
-            if absent:
-                affected.append(f"• {name}: {', '.join(absent)}")
-        details = "\n".join(affected[:12])
-        if len(affected) > 12:
-            details += f"\n• …and {len(affected) - 12} more"
-        buttons = getattr(QMessageBox, "StandardButton", QMessageBox)
-        physical_statement = (
-            "For each dataset, coherent filtering is physically meaningful only "
-            "when the phase reference/center, phasor time convention, and "
-            "polarization basis apply consistently across its filtered samples. "
-            if independent
-            else "A coherent result is physically meaningful only when phase "
-            "center, phasor time convention, and polarization basis are "
-            "compatible across the inputs. "
-        )
-        answer = QMessageBox.question(
-            self,
-            f"Confirm {operation_name} Assumptions",
-            f"The selected datasets do not fully declare {missing_text}.\n\n"
-            f"{details}\n\n"
-            + physical_statement
-            + "Proceed under that explicit assumption and record it in provenance?",
-            buttons.Yes | buttons.No,
-            buttons.No,
-        )
-        if answer != buttons.Yes:
-            self.status.showMessage(
-                f"{operation_name} cancelled: coherent metadata assumptions "
-                "were not confirmed."
-            )
-            return None
-        self.status.showMessage(
-            f"{operation_name}: missing coherent declarations explicitly "
-            "accepted; the assumption will be recorded."
-        )
-        return True
+        Core operations record missing/conflicting declarations in provenance.
+        False means no explicit attestation was requested or obtained.
+        """
+        return False
 
     def _combine_datasets_add(
         self,
@@ -2157,6 +2108,9 @@ class DatasetOpsMixin:
         reference_name, reference = datasets[0]
 
         def compute():
+            coherent_advisories = reference._assert_coherent_metadata_compatible(
+                *(grid for _name, grid in datasets[1:])
+            )
             blocks = [
                 "Operand 1 (reference): " + reference_name,
                 "Selection order: " + " -> ".join(name for name, _grid in datasets),
@@ -2212,6 +2166,12 @@ class DatasetOpsMixin:
                     missing = _missing_coherent_metadata_keys(
                         (reference, dataset)
                     )
+                    if coherent_advisories:
+                        lines.append(
+                            "  WARN coherent convention differences (operation allowed): "
+                            + "; ".join(coherent_advisories)
+                        )
+                        warning_count += 1
                     if missing:
                         rendered = ", ".join(
                             _COHERENT_METADATA_LABELS[key]
@@ -2222,7 +2182,7 @@ class DatasetOpsMixin:
                             "  WARN coherent declarations missing: " + rendered
                         )
                         warning_count += 1
-                    else:
+                    elif not coherent_advisories:
                         lines.append("  PASS coherent declarations")
                         pass_count += 1
                 available = []
@@ -3508,9 +3468,14 @@ class DatasetOpsMixin:
 
         mode = dlg.get_mode()
         align_plans = []
+        interpolation_extra = 0
         for _name, dataset in others:
             if mode == "interp":
                 output_shape = tuple(int(value) for value in ref_grid.rcs_power.shape)
+                interpolation_extra = max(
+                    interpolation_extra,
+                    dataset._alignment_interpolation_peak_bytes(ref_grid),
+                )
             elif mode == "intersect":
                 output_shape = tuple(
                     min(int(left), int(right))
@@ -3521,7 +3486,9 @@ class DatasetOpsMixin:
             else:
                 output_shape = tuple(int(value) for value in dataset.rcs_power.shape)
             align_plans.append((dataset, output_shape))
-        if not self._preflight_derived_outputs("Align", align_plans):
+        if not self._preflight_derived_outputs(
+            "Align", align_plans, extra_bytes=interpolation_extra
+        ):
             return
         source_references = [
             self._python_reference_for_dataset(dataset)
@@ -4205,25 +4172,16 @@ class DatasetOpsMixin:
             ax[:2] for ax, key in (("Az", "azimuths"), ("El", "elevations"), ("Fq", "frequencies"))
             if params[key]
         )
-        enabled_methods = tuple(
-            method
-            for enabled, method in (
-                (params["azimuths"], "round_azimuths"),
-                (params["elevations"], "round_elevations"),
-                (params["frequencies"], "round_frequencies"),
-            )
-            if enabled
-        )
+        enabled_axes = {
+            key: bool(params[key]) for key in ("azimuths", "elevations", "frequencies")
+        }
         source_references = [
             self._python_reference_for_dataset(dataset)
             for _name, dataset in datasets
         ]
 
         def operation(_index, _name, dataset):
-            rounded = dataset
-            for method in enabled_methods:
-                rounded = getattr(rounded, method)(decimals)
-            return rounded
+            return dataset.round_axes(decimals, **enabled_axes)
 
         def publish(results, skipped) -> None:
             recorder = getattr(self, "python_recorder", None)
@@ -4238,11 +4196,10 @@ class DatasetOpsMixin:
                     recorder.record_expression(
                         self._python_output_reference(output_id, output_name),
                         [source_ref],
-                        lambda variables, methods=enabled_methods, decimals=decimals: (
-                            variables[0]
-                            + "".join(
-                                f".{method}({int(decimals)})" for method in methods
-                            )
+                        lambda variables, axes=enabled_axes, decimals=decimals: (
+                            f"{variables[0]}.round_axes({int(decimals)}, "
+                            + ", ".join(f"{key}={value!r}" for key, value in axes.items())
+                            + ")"
                         ),
                         comment=(
                             f"Round {name} axes {axes_label} to {decimals} decimals"
@@ -4683,7 +4640,7 @@ class DatasetOpsMixin:
     def _phase_center_selected(self) -> None:
         datasets = self._selected_datasets_ordered(
             use_selection_order=True,
-            empty_message="Select one or more datasets to move the phase centre.",
+            empty_message="Select one or more datasets to move the phase center.",
         )
         if datasets is None:
             return
@@ -4704,7 +4661,7 @@ class DatasetOpsMixin:
         def publish(results, skipped) -> None:
             recorder = getattr(self, "python_recorder", None)
             for source_index, name, result in results:
-                history = f"Phase centre moved to {point} in body axes: {name}"
+                history = f"Phase center moved to {point} in body axes: {name}"
                 output_name = f"{name} [PC {point}]"
                 output_id = self._add_dataset_row(result, output_name, history, file_name="")
                 source_ref = source_references[source_index]
@@ -4714,19 +4671,19 @@ class DatasetOpsMixin:
                         "translate_phase_center",
                         [source_ref],
                         kwargs=offset,
-                        comment=f"Move the phase centre of {name} to {point}",
+                        comment=f"Move the phase center of {name} to {point}",
                     )
-            message = f"Phase centre created {len(results)} dataset(s)."
+            message = f"Phase center created {len(results)} dataset(s)."
             if skipped:
                 message += f" Skipped: {_compact_item_summary(skipped)}"
             self.status.showMessage(message)
 
         self._start_dataset_map_job(
-            "Phase centre",
+            "Phase center",
             datasets,
             operation,
             publish,
-            start_message=f"Moving the phase centre of {len(datasets)} dataset(s)...",
+            start_message=f"Moving the phase center of {len(datasets)} dataset(s)...",
         )
 
     def _convert_extrusion_selected(self) -> None:

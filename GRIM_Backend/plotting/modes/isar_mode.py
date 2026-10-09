@@ -11,9 +11,9 @@ import numpy as np
 
 from . import common
 from GRIM_Backend.isar.geometry import angular_bands, angular_sublooks
-from GRIM_Backend.isar.interpolation import cartesian_pair, plan_cache_bytes
+from GRIM_Backend.isar.interpolation import cartesian_pair, plan_cache_bytes, resample_pair
 from GRIM_Backend.isar.quality import (
-    plan_isar, image_contract, psf_metrics, scene_extents,
+    plan_isar, image_contract, psf_metrics, scene_extents, cartesian_support_scale,
     aperture_mode as normalize_aperture_mode,
 )
 from GRIM_Backend.isar.operators import native_image_residual
@@ -419,7 +419,8 @@ def _decimate_display_max(img: np.ndarray, max_side: int = 4096) -> np.ndarray:
     ~97% of the pixels of a 36000-wide image in a ~1000-px viewport — point
     responses visibly blink in and out while panning. Max-pooling to a
     screen-comparable size keeps every peak (max in dB == max in linear).
-    The extent is unchanged, so axes and cursor readout stay correct."""
+    Callers must retain the actual block edges for coordinate-correct display;
+    a partial final block cannot be stretched to a full-width cell."""
     for axis in (0, 1):
         n = img.shape[axis]
         if n > max_side:
@@ -443,7 +444,7 @@ def _split_into_bands(indices: list[int]) -> list[list[int]]:
 
 
 def _unwrap_degrees(values: np.ndarray, center_deg: float) -> np.ndarray:
-    """Return angles on the continuous branch centred on ``center_deg``."""
+    """Return angles on the continuous branch centered on ``center_deg``."""
     values = np.asarray(values, dtype=float)
     return center_deg + np.mod(values - center_deg + 180.0, 360.0) - 180.0
 
@@ -719,6 +720,7 @@ def _cartesian_pfa_axes(
     q = np.linspace(
         ratio_min * np.sin(psi[0]), ratio_min * np.sin(psi[-1]), theta.size
     )
+    q *= cartesian_support_scale(theta, freq_hz)
     u = fc * q
     max_abs_u = float(np.max(np.abs(u)))
     v_max_sq = float(freq_hz[-1] ** 2 - max_abs_u**2)
@@ -747,44 +749,14 @@ def _pfa_regrid_cartesian(
     The grid is inscribed in the measured polar support so no artificial
     zero-filled wedge changes its coherent gain.
     """
-    theta = np.asarray(theta, dtype=float)
-    freq_hz = np.asarray(freq_hz, dtype=float)
-    if _cancel_requested(cancel_check):
-        raise InterruptedError("ISAR computation superseded")
-    psi = theta - float(np.mean(theta))
-    fc = float(np.mean(freq_hz))
-    q, axis_q, v = _cartesian_pfa_axes(theta, freq_hz)
-    az_grid = np.empty_like(S)
-    dpsi = float(np.mean(np.diff(psi)))
-    ratios = freq_hz / fc
-    # Invert q=(f/fc)sin(psi) analytically, then interpolate the complex
-    # field with a four-point stencil. This avoids the amplitude droop of
-    # piecewise-linear gridding when phase advances appreciably per sample.
-    for start in range(0, freq_hz.size, max(int(row_block), 1)):
-        if _cancel_requested(cancel_check):
-            raise InterruptedError("ISAR computation superseded")
-        stop = min(start + max(int(row_block), 1), freq_hz.size)
-        arg = q[:, None] / ratios[None, start:stop]
-        required_psi = np.arcsin(np.clip(arg, -1.0, 1.0))
-        coordinates = (required_psi - psi[0]) / dpsi
-        block = _interp_uniform_axis0(np.asarray(S)[:, start:stop], coordinates)
-        block[np.abs(arg) > 1.0] = 0
-        az_grid[:, start:stop] = block
+    values = np.asarray(S)
+    field, _weights, axis_q, v = cartesian_pair(
+        values, np.ones(values.shape, dtype=np.float32), theta, freq_hz,
+        _cartesian_pfa_axes(theta, freq_hz), block_size=row_block,
+        cancel_check=cancel_check,
+    )
+    return field, axis_q, v
 
-    u = fc * q
-    out = np.empty_like(az_grid)
-    for start in range(0, q.size, max(int(row_block), 1)):
-        if _cancel_requested(cancel_check):
-            raise InterruptedError("ISAR computation superseded")
-        stop = min(start + max(int(row_block), 1), q.size)
-        required_f = np.sqrt(v[None, :] ** 2 + u[start:stop, None] ** 2)
-        coordinates = (required_f - freq_hz[0]) / float(np.mean(np.diff(freq_hz)))
-        out[start:stop] = _interp_uniform_axis0(
-            az_grid[start:stop].T, coordinates.T
-        ).T
-    if _cancel_requested(cancel_check):
-        raise InterruptedError("ISAR computation superseded")
-    return out, axis_q, v
 
 
 def _soft_threshold_complex(x: np.ndarray, t: float) -> np.ndarray:
@@ -1578,8 +1550,8 @@ def _compute_band_sparse_l1(
 ):
     """Experimental fixed-λ complex LASSO image reconstruction.
 
-    The gridded phase history ``S`` is modelled by the same partial Fourier
-    operator used by the fast PFA path and FISTA solves
+    The accurately regridded Cartesian phase history ``S`` is modelled by a
+    partial Fourier operator, and FISTA solves
 
         min_X  ½‖W(A·X − S)‖₂² + λ‖X‖₁,
         λ = strength · ‖AᴴW²S‖_∞.
@@ -1923,7 +1895,7 @@ def _compute_band(
     if _cancel_requested(cancel_check):
         return "ISAR computation superseded."
     target_token = None if az_target_deg is None else _array_token(np.asarray(az_target_deg))
-    preprocess_mode = "accurate" if recon == "accurate" else "fast"
+    preprocess_mode = "accurate" if recon in {"accurate", "sparse"} else "fast"
     source_token = _selected_data_token(
         dataset,
         sorted_band_indices,
@@ -1969,14 +1941,15 @@ def _compute_band(
             target = np.asarray(az_target_deg, dtype=float)
             if _cancel_requested(cancel_check):
                 return "ISAR computation superseded."
-            az_uniform, rcs_slice, az_gap_info = _resample_azimuth_to_target(
-                az_values, rcs_slice, target, axis=0
-            )
-            if _cancel_requested(cancel_check):
+            support, az_gap_info = _interpolation_support(az_values, target)
+            az_uniform = target
+            try:
+                rcs_slice, weights = resample_pair(
+                    az_values, rcs_slice, weights, target, axis=0, support=support,
+                    cancel_check=cancel_check,
+                )
+            except InterruptedError:
                 return "ISAR computation superseded."
-            _, weights, _ = _resample_azimuth_to_target(
-                az_values, weights, target, axis=0
-            )
             if _cancel_requested(cancel_check):
                 return "ISAR computation superseded."
             if az_uniform.size < 2:
@@ -2013,14 +1986,13 @@ def _compute_band(
                 return f"ISAR working-set preflight blocked: {exc}"
             if _cancel_requested(cancel_check):
                 return "ISAR computation superseded."
-            rcs_slice = _apply_resample_plan(
-                az_values, rcs_slice, axis=0, plan=az_plan
-            )
-            if _cancel_requested(cancel_check):
+            try:
+                rcs_slice, weights = resample_pair(
+                    az_values, rcs_slice, weights, az_plan["target"],
+                    axis=0, support=az_plan["support"], cancel_check=cancel_check,
+                )
+            except InterruptedError:
                 return "ISAR computation superseded."
-            weights = _apply_resample_plan(
-                az_values, weights, axis=0, plan=az_plan
-            )
             if _cancel_requested(cancel_check):
                 return "ISAR computation superseded."
             az_gap_info = az_plan["info"]
@@ -2068,14 +2040,13 @@ def _compute_band(
             return f"ISAR working-set preflight blocked: {exc}"
         if _cancel_requested(cancel_check):
             return "ISAR computation superseded."
-        rcs_slice = _apply_resample_plan(
-            freq_hz, rcs_slice, axis=1, plan=freq_plan
-        )
-        if _cancel_requested(cancel_check):
+        try:
+            rcs_slice, weights = resample_pair(
+                freq_hz, rcs_slice, weights, freq_plan["target"],
+                axis=1, support=freq_plan["support"], cancel_check=cancel_check,
+            )
+        except InterruptedError:
             return "ISAR computation superseded."
-        weights = _apply_resample_plan(
-            freq_hz, weights, axis=1, plan=freq_plan
-        )
         if _cancel_requested(cancel_check):
             return "ISAR computation superseded."
         freq_gap_info = freq_plan["info"]
@@ -2279,7 +2250,7 @@ def _compute_band(
             if recon == "sparse"
             else {}
         ),
-        "accurate_pfa": recon == "accurate",
+        "accurate_pfa": preprocess_mode == "accurate",
         "sampling": sampling,
         "image_contract": contract,
         "psf": psf,
@@ -2288,7 +2259,7 @@ def _compute_band(
             "u_min_hz": contract["spatial_frequency_origin_hz"][0],
             "u_max_hz": float(np.mean(freq_uniform) * (theta[-1] - np.mean(theta))),
             "v_min_hz": float(freq_uniform[0]), "v_max_hz": float(freq_uniform[-1]),
-            "coverage_interpolation": "cubic_on_complete_stencils_positive_linear_near_holes" if recon == "accurate" else "positive_linear",
+            "coverage_interpolation": "windowed_sinc_on_complete_stencils_cubic_at_edges_positive_linear_near_holes" if preprocess_mode == "accurate" else "positive_linear",
         },
         **({"complex_image": complex_image} if retain_complex else {}),
     }
@@ -2458,7 +2429,7 @@ def _predict_sublook_scene_axes(
     )
     freq_uniform = np.asarray(freq_plan["target"], dtype=float)
     theta = np.deg2rad(az_uniform)
-    if reconstruction == "accurate":
+    if reconstruction in {"accurate", "sparse"}:
         _q, theta, freq_uniform = _cartesian_pfa_axes(theta, freq_uniform)
     df_eff = float(np.mean(np.diff(freq_uniform)))
     return _scene_axes(
@@ -2874,6 +2845,10 @@ def compute_bands(params: dict):
                 result["magnitude"], max_side=max_side
             )
             result["display_decimated"] = result["magnitude"].shape != original_shape
+            if result["display_decimated"]:
+                from GRIM_Backend.isar.geometry import reduced_axis_edges
+                result["display_x_edges"] = reduced_axis_edges(result["x_range"], max_side)
+                result["display_y_edges"] = reduced_axis_edges(result["y_range"], max_side)
             if _cancel_requested(cancel_check):
                 return "ISAR computation superseded."
         contract_assumptions = tuple(

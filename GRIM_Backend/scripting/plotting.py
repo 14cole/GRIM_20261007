@@ -135,7 +135,7 @@ def plot_datasets(
     isar_options: dict[str, object] | None = None,
     show_colorbar: bool = True,
     shared_colorbar: bool = True,
-    square_aspect: bool = False,
+    square_aspect: bool = True,
     color_limits: tuple[float, float] | None = None,
     color_step: float = 0.0,
     delta_options: dict[str, object] | None = None,
@@ -551,7 +551,8 @@ def plot_datasets(
 
     elif mode_key == "isar_image":
         from GRIM_Backend.plotting.modes.isar_mode import _length_unit, form_isar
-        from GRIM_Backend.isar.geometry import image_extent
+        from GRIM_Backend.isar.geometry import image_extent, draw_image
+        from GRIM_Backend.isar.quality import reconstruction_advisories
 
         dataset = selected[0][1]
         options = dict(isar_options or {})
@@ -613,12 +614,8 @@ def plot_datasets(
 
         meshes = []
         for axis, band, display in zip(axes_values, bands, displays):
-            mesh = axis.imshow(
-                display.T,
-                extent=image_extent(band),
-                origin="lower",
-                aspect="auto",
-                interpolation="nearest",
+            mesh = draw_image(
+                axis, band, display,
                 cmap=colormap,
                 vmin=plot_vmin,
                 vmax=plot_vmax,
@@ -712,6 +709,8 @@ def plot_datasets(
                     if 0 < tick_count <= 1000:
                         colorbar.set_ticks(first + tick_step * np.arange(tick_count))
 
+        for advisory in reconstruction_advisories(bands):
+            warnings.warn(advisory, RuntimeWarning, stacklevel=2)
         sparse_results = [
             band for band in bands if band.get("sparse_iterations") is not None
         ]

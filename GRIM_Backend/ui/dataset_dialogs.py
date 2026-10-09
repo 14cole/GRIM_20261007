@@ -1075,8 +1075,8 @@ class MedianizeDialog(QDialog):
     """Pick the sliding-window parameters for a median smoothing pass along
     the azimuth axis.
 
-    Window = full azimuth width of each window (degrees), centred on each
-    output sample. Slide = step between adjacent window centres (degrees).
+    Window = full azimuth width of each window (degrees), centerd on each
+    output sample. Slide = step between adjacent window centers (degrees).
     Slide < window gives overlap (heavier smoothing, denser output); slide =
     window gives non-overlapping bins; slide > window subsamples the input.
     """
@@ -1510,7 +1510,7 @@ class TimeGateDialog(QDialog):
         self.chk_compensate = QCheckBox("Compensate band-edge droop")
         self.chk_compensate.setChecked(True)
         self.chk_compensate.setToolTip(
-            "Divide out the gate's effect on a point at the gate centre, which "
+            "Divide out the gate's effect on a point at the gate center, which "
             "otherwise lowers the first and last frequencies. Keep mode only."
         )
         self.combo_elevation = QComboBox()
@@ -1627,7 +1627,7 @@ class TimeGateDialog(QDialog):
 
 
 class PhaseCenterDialog(QDialog):
-    """Enter the new phase-centre position in the dataset's body axes."""
+    """Enter the new phase-center position in the dataset's body axes."""
 
     UNITS = (("m", 1.0), ("cm", 0.01), ("mm", 0.001), ("in", 0.0254), ("ft", 0.3048))
 

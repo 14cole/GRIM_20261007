@@ -177,9 +177,12 @@ class GridMetadataMixin:
         """Return explicit source declarations without promoting one-sided data."""
 
         values = []
-        direct = self._declared_scalar_metadata(key)
-        if direct and not self._metadata_placeholder(direct):
-            values.append(direct)
+        # Keep both declarations when units and extra contradict each other;
+        # treating that case as missing would let confirmation hide a conflict.
+        values.extend(
+            value for value in self.inspect_scalar_metadata(key).declarations
+            if not self._metadata_placeholder(value)
+        )
         raw = (self.extra or {}).get("coherent_source_conventions_json")
         if raw is not None:
             try:
@@ -201,16 +204,17 @@ class GridMetadataMixin:
         return values
 
     def _assert_coherent_metadata_compatible(
-        self, other, *, metadata_attested=False
+        self, other=None, *others, metadata_attested=False
     ):
-        """Return advisory convention differences; field operations stay usable."""
+        """Return convention differences for reporting or strict validation."""
 
         if not isinstance(metadata_attested, (bool, np.bool_)):
             raise TypeError("metadata_attested must be True or False")
+        inputs = (self,) + (() if other is None else (other,)) + others
         issues = []
         if self.linear_quantity() == "sigma_2d":
-            versions = [grid._declared_scalar_metadata("amplitude_version") for grid in (self, other)]
-            if any(versions) and versions != ["2", "2"]:
+            versions = [grid._declared_scalar_metadata("amplitude_version") for grid in inputs]
+            if any(versions) and versions != ["2"] * len(inputs):
                 issues.append("2-D amplitude_version annotations differ or are unverified; using supplied complex samples.")
         fields = (
             (
@@ -232,16 +236,12 @@ class GridMetadataMixin:
             ("complex_field_domain", "complex field domains", lambda value: " ".join(value.split()).casefold()),
         )
         for key, label, canonicalize in fields:
-            left_values = self._coherent_source_convention_values(key)
-            right_values = other._coherent_source_convention_values(key)
-            normalized = {
-                canonicalize(value) for value in (*left_values, *right_values)
-            }
+            values = [grid._coherent_source_convention_values(key) for grid in inputs]
+            normalized = {canonicalize(value) for group in values for value in group}
             if len(normalized) > 1:
                 issues.append(
                     f"coherent operation uses supplied samples despite different {label} ({key}): "
-                    f"{left_values or ['<unspecified>']!r} and "
-                    f"{right_values or ['<unspecified>']!r}"
+                    + " and ".join(repr(group or ['<unspecified>']) for group in values)
                 )
         return issues
 
@@ -615,7 +615,7 @@ class GridMetadataMixin:
             "amplitude_convention",
             "complex_field_domain",
         )
-        advisories = [issue for grid in inputs[1:] for issue in self._assert_coherent_metadata_compatible(grid)]
+        advisories = self._assert_coherent_metadata_compatible(*inputs[1:])
         missing = {}
         for key in fields:
             missing_indices = [

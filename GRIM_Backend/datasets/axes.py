@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 
 import numpy as np
 
@@ -14,6 +15,33 @@ from GRIM_Backend.datasets.constants import (
 
 class GridAxesMixin:
     """Axis selection, alignment, interpolation, cropping, and wrapping."""
+
+    def _alignment_interpolation_plan(self, other):
+        """Shrink first so intermediate grids never exceed the input/output."""
+        steps = [
+            (axis, getattr(self, name), getattr(other, name))
+            for axis, name in enumerate(("azimuths", "elevations", "frequencies"))
+            if not np.array_equal(getattr(self, name), getattr(other, name))
+        ]
+        return sorted(steps, key=lambda step: len(step[2]) / len(step[1]))
+
+    def _alignment_interpolation_peak_bytes(self, other):
+        """Conservative temporary allocation estimate, excluding loaded inputs.
+
+        Account for complex reconstruction, both interpolated representations,
+        vectorized gather/ufunc scratch, and construction of the final grid.
+        Python integers avoid overflow on grids too large to allocate.
+        """
+        shape = list(self.rcs_power.shape)
+        largest = math.prod(shape)
+        for axis, _old, new in self._alignment_interpolation_plan(other):
+            shape[axis] = len(new)
+            largest = max(largest, math.prod(shape))
+        axis_cells = sum(len(axis) for axis in (
+            self.azimuths, self.elevations, self.frequencies,
+            other.azimuths, other.elevations, other.frequencies,
+        ))
+        return int(96 * largest + 64 * axis_cells + 4096)
 
     def edit_axis_value(self, name, index, value):
         """Return a grid with one safely edited axis value.
@@ -334,13 +362,13 @@ class GridAxesMixin:
         self._check_axis_sorted(other.frequencies, "frequency")
 
 
-        power_interp = np.asarray(self.rcs_power)
+        steps = self._alignment_interpolation_plan(other)
+        for _axis, old, new in steps:
+            if new.min() < old.min() or new.max() > old.max():
+                raise ValueError("interp would require extrapolation")
+        power_interp = np.array(self.rcs_power, copy=True)
         complex_interp = np.asarray(self.rcs, dtype=np.complex128)
-        for axis, old, new in (
-            (0, self.azimuths, other.azimuths),
-            (1, self.elevations, other.elevations),
-            (2, self.frequencies, other.frequencies),
-        ):
+        for axis, old, new in steps:
             power_interp = self._interp_real_axis(
                 power_interp, old, new, axis
             )
@@ -1259,75 +1287,58 @@ class GridAxesMixin:
             extra=self._exact_transform_extra(preserve_all=True),
         )
 
-    def round_azimuths(self, decimals: int):
-        """Round azimuth axis values to ``decimals`` decimal places (no resampling).
+    def round_axes(
+        self, decimals: int, *, azimuths=True, elevations=True, frequencies=True
+    ):
+        """Round selected coordinates without resampling, copying samples once.
 
-        Use to clean up floating-point noise like 180.0001 -> 180.0.
-        Raises if rounding collapses two distinct azimuths into the same value.
+        All axes are validated before constructing a result. Rounding may not
+        collapse distinct coordinates into duplicate values.
         """
         decimals = int(decimals)
-        rounded = np.round(np.asarray(self.azimuths, dtype=float), decimals)
-        if rounded.size != np.unique(rounded).size:
-            raise ValueError(
-                f"Rounding azimuths to {decimals} decimal(s) would create duplicate "
-                "values. Use a higher decimal count."
-            )
+        axes = []
+        changed = []
+        for name, enabled in (
+            ("azimuths", azimuths), ("elevations", elevations),
+            ("frequencies", frequencies),
+        ):
+            values = np.array(getattr(self, name), dtype=float, copy=True)
+            if enabled:
+                values = np.round(values, decimals)
+                if not np.all(np.isfinite(values)):
+                    raise ValueError(f"Rounding {name} would create non-finite values.")
+                if values.size != np.unique(values).size:
+                    raise ValueError(
+                        f"Rounding {name} to {decimals} decimal(s) would create duplicate "
+                        "values. Use a higher decimal count."
+                    )
+                changed.append({"azimuths": "azimuth", "elevations": "elevation",
+                                "frequencies": "frequency"}[name])
+            axes.append(values)
+        if not changed:
+            return self
         return self._new_grid(
-            rounded,
-            np.array(self.elevations, copy=True),
-            np.array(self.frequencies, copy=True),
+            *axes,
             np.array(self.polarizations, copy=True),
-            rcs_power=np.array(self.rcs_power, copy=True),
-            rcs_phase=np.array(self.rcs_phase, copy=True),
+            rcs_power=self.rcs_power,
+            rcs_phase=self.rcs_phase,
             rcs_domain="power_phase",
             extra=self._exact_transform_extra(
-                coordinate_change="round-azimuth"
+                coordinate_change="round-" + "-".join(changed)
             ),
         )
+
+    def round_azimuths(self, decimals: int):
+        """Round azimuth coordinates without resampling or creating duplicates."""
+        return self.round_axes(decimals, elevations=False, frequencies=False)
 
     def round_elevations(self, decimals: int):
-        """Round elevation axis values to ``decimals`` decimal places (no resampling)."""
-        decimals = int(decimals)
-        rounded = np.round(np.asarray(self.elevations, dtype=float), decimals)
-        if rounded.size != np.unique(rounded).size:
-            raise ValueError(
-                f"Rounding elevations to {decimals} decimal(s) would create duplicate "
-                "values. Use a higher decimal count."
-            )
-        return self._new_grid(
-            np.array(self.azimuths, copy=True),
-            rounded,
-            np.array(self.frequencies, copy=True),
-            np.array(self.polarizations, copy=True),
-            rcs_power=np.array(self.rcs_power, copy=True),
-            rcs_phase=np.array(self.rcs_phase, copy=True),
-            rcs_domain="power_phase",
-            extra=self._exact_transform_extra(
-                coordinate_change="round-elevation"
-            ),
-        )
+        """Round elevation coordinates without resampling or creating duplicates."""
+        return self.round_axes(decimals, azimuths=False, frequencies=False)
 
     def round_frequencies(self, decimals: int):
-        """Round frequency axis values to ``decimals`` decimal places (no resampling)."""
-        decimals = int(decimals)
-        rounded = np.round(np.asarray(self.frequencies, dtype=float), decimals)
-        if rounded.size != np.unique(rounded).size:
-            raise ValueError(
-                f"Rounding frequencies to {decimals} decimal(s) would create duplicate "
-                "values. Use a higher decimal count."
-            )
-        return self._new_grid(
-            np.array(self.azimuths, copy=True),
-            np.array(self.elevations, copy=True),
-            rounded,
-            np.array(self.polarizations, copy=True),
-            rcs_power=np.array(self.rcs_power, copy=True),
-            rcs_phase=np.array(self.rcs_phase, copy=True),
-            rcs_domain="power_phase",
-            extra=self._exact_transform_extra(
-                coordinate_change="round-frequency"
-            ),
-        )
+        """Round frequency coordinates without resampling or creating duplicates."""
+        return self.round_axes(decimals, azimuths=False, elevations=False)
 
     def shift_elevation(self, delta_deg: float):
         """Shift elevation axis by a constant offset and return a new grid."""

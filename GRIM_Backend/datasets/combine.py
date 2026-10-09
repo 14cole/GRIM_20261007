@@ -176,10 +176,9 @@ class GridCombineMixin:
             ref._assert_physical_metadata_compatible(grid)
 
         if policy == "coherent-mean":
-            for grid in grids[1:]:
-                ref._assert_coherent_metadata_compatible(
-                    grid, metadata_attested=bool(metadata_attested)
-                )
+            ref._assert_coherent_metadata_compatible(
+                *grids[1:], metadata_attested=bool(metadata_attested)
+            )
 
         expected_shapes = []
         coherent_missing_phase_count = 0

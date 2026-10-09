@@ -138,12 +138,12 @@ def render(self) -> None:
         ranges_m, starts, power = range_frequency_map(
             sweeps, frequencies_hz, width=width, window=window
         )
-        centres = np.asarray([native[s:s + width].mean() for s in starts])
+        centers = np.asarray([native[s:s + width].mean() for s in starts])
         display = self._display_from_linear(
-            dataset, power, frequency_value=centres[:, None]
+            dataset, power, frequency_value=centers[:, None]
         )
         display = np.where(np.isfinite(display), display, np.nan)
-        x_display = self._plot_axis_values(reference, dataset, "frequency", centres)
+        x_display = self._plot_axis_values(reference, dataset, "frequency", centers)
         x_display, y_display, image = self._bounded_plot_image(
             x_display, ranges_m * scale, display
         )
@@ -199,7 +199,7 @@ def render(self) -> None:
             color=self._current_plot_text(), fontsize=9,
         )
         frequency_label = self._plot_axis_label(reference, "frequency")
-        ax.set_xlabel("Sub-band centre " + frequency_label[:1].lower() + frequency_label[1:])
+        ax.set_xlabel("Sub-band center " + frequency_label[:1].lower() + frequency_label[1:])
         ax.set_ylabel(f"Down range ({unit})")
     if self.chk_colorbar.isChecked():
         colorbar = self.plot_figure.colorbar(meshes[-1], ax=self.plot_axes)

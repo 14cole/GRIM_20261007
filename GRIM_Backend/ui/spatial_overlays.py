@@ -143,6 +143,7 @@ class SpatialOverlayPanel(QWidget):
             markersize=5, zorder=35, label="_spatial_overlay", pickradius=7,
         )
         item.artist._grim_spatial_overlay = True
+        item.artist.set_in_layout(False)
         # add_artist does not change data limits or the image normalization.
         ax.add_artist(item.artist)
 
@@ -382,6 +383,7 @@ class SpatialOverlayPanel(QWidget):
                       marker="o", markersize=9, markerfacecolor="none", markeredgewidth=2,
                       zorder=40, label="_spatial_overlay_measurement")
         line._grim_spatial_overlay = True
+        line.set_in_layout(False)
         ax.add_artist(line)
         self.measure_artists.append(line)
         if len(references) == 1:
@@ -400,6 +402,10 @@ class SpatialOverlayPanel(QWidget):
                            bbox=dict(boxstyle="round,pad=0.3", facecolor=ax.get_facecolor(),
                                      edgecolor=color, alpha=.95))
         text._grim_spatial_overlay = True
+        # A moving label must not resize the axes. Constrained layout would
+        # otherwise reserve space for labels near an edge; ISAR's equal-data
+        # aspect then expands the visible limits on each drag redraw.
+        text.set_in_layout(False)
         self.measure_artists.append(text)
 
     def _start_measurement(self, item, index):

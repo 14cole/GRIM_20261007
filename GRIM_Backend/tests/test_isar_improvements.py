@@ -164,15 +164,16 @@ class NativeOperatorTests(unittest.TestCase):
         self.assertEqual(r['sample_count'], 20)
         self.assertGreater(r['relative_complex_l2_residual'], .001)
 
-    def test_sparse_gridded_convergence_does_not_hide_native_model_mismatch(self):
+    def test_sparse_cartesian_model_removes_off_center_range_curvature_error(self):
         az, freq = np.linspace(-10, 10, 129), np.linspace(9e9, 11e9, 129)
         field = np.exp(-4j*np.pi/C0*freq[None,:]*1.5*np.cos(np.deg2rad(az[:,None])))
         bands, _ = isar.form_isar(grid(az, freq, field), reconstruction='sparse', l1_strength=.05, l1_iterations=1000, retain_complex=True)
         b = bands[0]
         self.assertTrue(b['sparse_converged'])
         self.assertLess(b['sparse_output_relative_residual_norm'], .1)
-        self.assertGreater(b['native_residual']['relative_complex_l2_residual'], 1.)
-        self.assertTrue(b['native_residual']['high_model_mismatch'])
+        self.assertLess(b['native_residual']['relative_complex_l2_residual'], .1)
+        self.assertFalse(b['native_residual']['high_model_mismatch'])
+        self.assertTrue(b['accurate_pfa'])
 
 
 class ReproducibilityTests(unittest.TestCase):

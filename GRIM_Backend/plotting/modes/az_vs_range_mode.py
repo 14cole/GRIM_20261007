@@ -13,15 +13,17 @@ from __future__ import annotations
 
 import numpy as np
 
+from GRIM_Backend.datasets.transforms import _declared_time_sign
 from . import common
 from .isar_mode import (
     _MAX_INTERP_COMPLEX_CELLS,
-    _apply_resample_plan,
-    _decimate_display_max,
     _length_unit,
     _uniform_resample_plan,
     _unit_to_hz_scale,
+    _angle_values_to_degrees,
+    _ifft,
 )
+from GRIM_Backend.isar.interpolation import resample_pair
 
 
 def _prepare_uniform_frequency_history(
@@ -57,14 +59,9 @@ def _prepare_uniform_frequency_history(
         posinf=0.0,
         neginf=0.0,
     ).astype(np.complex64, copy=False)
-    uniform_history = _apply_resample_plan(
-        frequency_hz, clean, axis=1, plan=plan
-    )
-    interpolated_validity = _apply_resample_plan(
-        frequency_hz,
-        finite.astype(np.float32),
-        axis=1,
-        plan=plan,
+    uniform_history, interpolated_validity = resample_pair(
+        frequency_hz, clean, finite.astype(np.float32), plan["target"],
+        axis=1, support=plan["support"],
     )
     weights = (interpolated_validity >= 1.0 - 1.0e-6).astype(np.float32)
     uniform_history = np.asarray(uniform_history, dtype=np.complex64) * weights
@@ -74,6 +71,19 @@ def _prepare_uniform_frequency_history(
         weights,
         dict(plan["info"]),
     )
+
+
+def _form_range_image(history, sample_weights, window):
+    """Single-precision FFT with double-precision coherent-gain accumulation."""
+    taper = np.asarray(window, dtype=np.float32)
+    weighted = np.asarray(history, dtype=np.complex64) * taper[None, :]
+    weighted *= sample_weights
+    image = np.fft.fftshift(_ifft(weighted, n=weighted.shape[1], axis=1), axes=1)
+    gain = np.sum(sample_weights * taper[None, :], axis=1, dtype=np.float64) / weighted.shape[1]
+    usable = gain > 0
+    np.divide(image, gain[:, None], out=image, where=usable[:, None])
+    image[~usable] = np.nan + 1j * np.nan
+    return image, usable
 
 
 def _range_display_values(dataset, magnitude: np.ndarray, *, linear: bool) -> np.ndarray:
@@ -93,6 +103,49 @@ def _range_display_values(dataset, magnitude: np.ndarray, *, linear: bool) -> np
     return 10.0 * np.log10(np.maximum(intensity, 1.0e-12))
 
 
+def _range_display_grid(azimuths, ranges, image, *, azimuth_width, max_side):
+    """Peak-pool with actual bin edges, leaving unmeasured angles blank.
+
+    Each acquired angle occupies one native sampling-width cell centerd on
+    that angle. Pooling never crosses an angular gap. Partial final blocks
+    retain their real extent instead of stretching the image to fit.
+    """
+    azimuths = np.asarray(azimuths, dtype=float)
+    ranges = np.asarray(ranges, dtype=float)
+    width = float(azimuth_width)
+    dy = float(ranges[1] - ranges[0])
+    y_edges = np.r_[ranges - dy / 2.0, ranges[-1] + dy / 2.0]
+    y_starts = np.arange(0, len(ranges), max(1, int(np.ceil(len(ranges) / max_side))))
+    pooled = np.fmax.reduceat(image, y_starts, axis=0)
+    y_edges = y_edges[np.r_[y_starts, len(ranges)]]
+    breaks = np.r_[0, np.flatnonzero(np.diff(azimuths) > width * (1 + 1e-6)) + 1,
+                   len(azimuths)]
+    # Reserve room for one transparent column per gap in the display budget.
+    max_blocks = max_side - (len(breaks) - 2)
+    if len(breaks) - 1 > max_blocks:
+        raise ValueError("too many disconnected azimuth samples; select fewer angles")
+    stride = max(1, int(np.ceil(len(azimuths) / max_blocks)))
+    while True:
+        blocks = [(first, min(first + stride, end))
+                  for start, end in zip(breaks[:-1], breaks[1:])
+                  for first in range(start, end, stride)]
+        if len(blocks) <= max_blocks:
+            break
+        stride *= 2
+    edges = [float(azimuths[0] - width / 2)]
+    columns = []
+    for first, end in blocks:
+        left = float(azimuths[first] - width / 2)
+        if left > edges[-1] + width * 1e-6:
+            columns.append(np.full(pooled.shape[0], np.nan))
+            edges.append(left)
+        columns.append(np.fmax.reduce(pooled[:, first:end], axis=1))
+        edges.append(float(azimuths[end - 1] + width / 2))
+    return np.asarray(edges), y_edges, np.column_stack(columns), (
+        len(y_starts) < len(ranges) or len(blocks) < len(azimuths)
+    )
+
+
 def render(self) -> None:
     self.last_plot_mode = "az_vs_range"
     self._start_plot_render()
@@ -102,12 +155,32 @@ def render(self) -> None:
     reference = self._preflight_plot_datasets([("Dataset", self.active_dataset)])
     if reference is None:
         return
+    try:
+        time_sign = _declared_time_sign(self.active_dataset)
+    except ValueError as exc:
+        self.status.showMessage(f"Az vs Down-Range blocked: {exc}")
+        return
 
     az_indices = sorted(self._selected_indices(self.list_az))
+    aperture = getattr(self, "chk_isar_aperture", None)
+    if aperture is not None and aperture.isChecked() and az_indices:
+        center, width = float(self.spin_isar_ap_center.value()), float(self.spin_isar_ap_width.value())
+        if not np.isfinite(center) or not np.isfinite(width) or width <= 0:
+            self.status.showMessage("Aperture center/width must be finite and width positive.")
+            return
+        degrees = _angle_values_to_degrees(self.active_dataset, 'azimuth', self.active_dataset.azimuths[az_indices])
+        az_indices = [i for i, distance in zip(az_indices, abs((degrees-center+180) % 360-180)) if distance <= width/2+1e-9]
     if not az_indices:
         self.status.showMessage("Select one or more azimuths to plot.")
         return
     freq_indices = sorted(self._selected_indices(self.list_freq))
+    band = getattr(self, "chk_isar_freq_band", None)
+    if band is not None and band.isChecked():
+        lo, hi = float(self.spin_isar_freq_min.value()), float(self.spin_isar_freq_max.value())
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            self.status.showMessage("Frequency band max must exceed min; both must be finite.")
+            return
+        freq_indices = [i for i in freq_indices if lo <= self.active_dataset.frequencies[i] <= hi]
     if not freq_indices:
         self.status.showMessage("Select one or more frequencies to plot.")
         return
@@ -144,6 +217,9 @@ def render(self) -> None:
     rcs_slice = self.active_dataset.rcs_slice(
         np.ix_(sorted_az_indices, [elev_idx], sorted_freq_indices, [pol_idx])
     )[:, 0, :, 0]
+    if time_sign == "-jwt":
+        # Work in the same +jwt convention used by the range-frequency map.
+        rcs_slice = np.conj(rcs_slice)
     if not np.any(np.isfinite(rcs_slice)):
         self.status.showMessage(
             "No compatible phase-aware data for the selected azimuth, "
@@ -167,26 +243,12 @@ def render(self) -> None:
 
     # Window over freq (re-uses ISAR window selector).
     win_freq = self._isar_window(n_freq)
-    rcs_windowed = rcs_slice * win_freq[None, :] * sample_weights
-
-    # Range processing: IFFT and shift so range=0 sits at array center.
-    range_image = np.fft.ifft(rcs_windowed, axis=1)
-    range_image = np.fft.fftshift(range_image, axes=1)
-
-    # Coherent-gain normalisation keeps a unit-amplitude point response near
-    # 0 dB re 1. It is deliberately not labeled dBsm/dBke: the IFFT image is
-    # a processing product, not an RCS sample on the source grid.
-    coherent_gain = np.sum(
-        sample_weights * win_freq[None, :], axis=1
-    ) / float(n_freq)
-    usable_rows = coherent_gain > 0.0
+    range_image, usable_rows = _form_range_image(rcs_slice, sample_weights, win_freq)
     if not np.any(usable_rows):
         self.status.showMessage(
             "No azimuth row has enough finite, supported phase history for range processing."
         )
         return
-    range_image[usable_rows] /= coherent_gain[usable_rows, None]
-    range_image[~usable_rows] = np.nan + 1j * np.nan
 
     units_combo = getattr(self, "combo_isar_units", None)
     unit_name, unit_scale = _length_unit(
@@ -213,8 +275,18 @@ def render(self) -> None:
         linear=self._plot_scale_is_linear(),
     )
     max_side = min(common.MAX_IMAGE_SIDE, int(np.sqrt(common.MAX_IMAGE_CELLS)))
-    display_for_plot = _decimate_display_max(display.T, max_side=max_side)
-    if display_for_plot.shape != display.T.shape:
+    native_steps = np.diff(np.sort(np.unique(self.active_dataset.azimuths)))
+    width = float(np.min(native_steps)) if native_steps.size else (
+        float(np.deg2rad(1.0)) if self._plot_axis_unit(reference, "azimuth") == "rad" else 1.0
+    )
+    try:
+        x_edges, y_edges, display_for_plot, decimated = _range_display_grid(
+            az_values, range_axis, display.T, azimuth_width=width, max_side=max_side
+        )
+    except ValueError as exc:
+        self.status.showMessage(f"Az vs Down-Range blocked: {exc}")
+        return
+    if decimated:
         self._note_plot_render(
             "Large range image was peak-preserving display-decimated for responsive "
             "interaction; narrow the selected axes for full display resolution."
@@ -232,22 +304,21 @@ def render(self) -> None:
     zmax = self.spin_plot_zmax.value()
     use_clamp = zmin < zmax
 
-    # display shape: (n_az, n_freq). imshow wants (n_y, n_x), so transpose.
-    mesh = self.plot_ax.imshow(
-        display_for_plot,
-        extent=[
-            float(az_values[0]),
-            float(az_values[-1]),
-            float(range_axis[0]),
-            float(range_axis[-1]),
-        ],
-        origin="lower",
-        aspect="auto",
-        interpolation="nearest",
-        cmap=cmap,
-        vmin=zmin if use_clamp else None,
-        vmax=zmax if use_clamp else None,
-    )
+    color_options = dict(cmap=cmap, vmin=zmin if use_clamp else None,
+                         vmax=zmax if use_clamp else None)
+    uniform_edges = all(np.allclose(np.diff(edges), np.diff(edges)[0], rtol=1e-6, atol=0)
+                        for edges in (x_edges, y_edges))
+    if uniform_edges:
+        mesh = self.plot_ax.imshow(
+            display_for_plot,
+            extent=[x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]],
+            origin="lower", aspect="auto", interpolation="nearest", **color_options,
+        )
+    else:
+        mesh = self.plot_ax.pcolormesh(
+            x_edges, y_edges, display_for_plot, shading="flat", rasterized=True,
+            **color_options,
+        )
 
     self.plot_ax.set_xlabel(self._plot_axis_label(reference, "azimuth"))
     self.plot_ax.set_ylabel(f"Down-Range ({unit_name})")
@@ -284,10 +355,10 @@ def render(self) -> None:
     self.spin_plot_xmax.blockSignals(True)
     self.spin_plot_ymin.blockSignals(True)
     self.spin_plot_ymax.blockSignals(True)
-    self.spin_plot_xmin.setValue(float(az_values[0]))
-    self.spin_plot_xmax.setValue(float(az_values[-1]))
-    self.spin_plot_ymin.setValue(float(range_axis[0]))
-    self.spin_plot_ymax.setValue(float(range_axis[-1]))
+    self.spin_plot_xmin.setValue(float(x_edges[0]))
+    self.spin_plot_xmax.setValue(float(x_edges[-1]))
+    self.spin_plot_ymin.setValue(float(y_edges[0]))
+    self.spin_plot_ymax.setValue(float(y_edges[-1]))
     self.spin_plot_xmin.blockSignals(False)
     self.spin_plot_xmax.blockSignals(False)
     self.spin_plot_ymin.blockSignals(False)

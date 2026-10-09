@@ -524,27 +524,16 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
         self.assertIn("decimate_axis(", self.window.python_recorder.script)
         self.assertIn("axis='azimuth'", self.window.python_recorder.script)
 
-    def test_coherent_missing_metadata_requires_explicit_confirmation(self) -> None:
+    def test_coherent_missing_metadata_proceeds_without_confirmation(self) -> None:
         dataset = _axis_grid([0.0], 1.0)
-        buttons = getattr(QMessageBox, "StandardButton", QMessageBox)
         with mock.patch(
-            "GRIM_Backend.ui.dataset_actions.QMessageBox.question",
-            return_value=buttons.No,
+            "GRIM_Backend.ui.dataset_actions.QMessageBox.question"
         ) as question:
-            rejected = self.window._confirm_coherent_metadata(
+            attested = self.window._confirm_coherent_metadata(
                 [("Unspecified", dataset)], "Coherent Test"
             )
-        self.assertIsNone(rejected)
-        self.assertIn("phase reference", question.call_args.args[2])
-
-        with mock.patch(
-            "GRIM_Backend.ui.dataset_actions.QMessageBox.question",
-            return_value=buttons.Yes,
-        ):
-            accepted = self.window._confirm_coherent_metadata(
-                [("Unspecified", dataset)], "Coherent Test"
-            )
-        self.assertTrue(accepted)
+        self.assertFalse(attested)
+        question.assert_not_called()
 
         dataset.extra.update(
             phase_reference="origin",
@@ -559,6 +548,29 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
             )
         self.assertFalse(declared)
         question.assert_not_called()
+
+    def test_round_button_records_combined_operation_and_replays_it(self) -> None:
+        source = _mixed_unit_grid(radians=False, frequency_hz=False)
+        source.azimuths += 0.000123
+        source.elevations += 0.000123
+        source.frequencies += 0.000123
+        self._add_saved_fixture(source, "Round source")
+        self._select_rows_in_order(0)
+        with mock.patch("GRIM_Backend.ui.dataset_actions.RoundDialog") as dialog_type:
+            dialog = dialog_type.return_value
+            dialog.exec.return_value = QDialog.Accepted
+            dialog.get_params.return_value = dict(
+                azimuths=True, elevations=True, frequencies=True, decimals=3
+            )
+            self.window.btn_round.click()
+            self._wait_for_background()
+        result = self.window.table.item(1, 0).data(Qt.UserRole)
+        self.assertIn(".round_axes(3,", self.window.python_recorder.script)
+        self.assertNotIn(".round_azimuths(", self.window.python_recorder.script)
+        replayed = self._replay_recorded_datasets()[-1]
+        for name in ("azimuths", "elevations", "frequencies", "rcs_power", "rcs_phase"):
+            np.testing.assert_array_equal(getattr(result, name), getattr(replayed, name))
+        np.testing.assert_array_equal(result.rcs_power, source.rcs_power)
 
     def test_mirror_default_is_displayed_in_physical_degrees_for_radian_axis(self) -> None:
         dataset = _mixed_unit_grid(radians=True, frequency_hz=False)
