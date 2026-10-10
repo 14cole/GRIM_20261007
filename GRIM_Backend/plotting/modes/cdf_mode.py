@@ -71,20 +71,23 @@ def render(self) -> None:
 
     controls = getattr(self, "analysis_controls", None)
     exceedance = bool(controls is not None and controls.cdf_exceedance())
-    rendered = 0
+    curves = []
     low = high = None
     for name, dataset, selection in plans:
-        if rendered >= common.MAX_LINE_SERIES:
+        if len(curves) >= common.MAX_LINE_SERIES:
             break
         values = _pooled_display(self, dataset, selection)
         count = values.size
         if count == 0:
             skipped.append(name)
             continue
-        ranks = np.arange(count, dtype=float)
-        # Step heights at each sorted sample: P(x <= v) jumps to (i+1)/n there;
-        # P(x >= v) is 1 - i/n from v up to the next sample.
-        percent = 100.0 * ((1.0 - ranks / count) if exceedance else (ranks + 1.0) / count)
+        levels, counts = np.unique(values, return_counts=True)
+        # Tied observations jump together. Inclusive P(X >= v) is left-
+        # continuous: between v[i] and v[i+1], its height is P(X >= v[i+1]).
+        # Inclusive P(X <= v) is right-continuous instead.
+        cumulative = (np.cumsum(counts[::-1])[::-1] if exceedance
+                      else np.cumsum(counts))
+        percent = 100.0 * cumulative / count
         pol_value = dataset.polarizations[selection[3][0]]
         median = float(np.median(values))
         unit = self._display_unit([(name, dataset)])
@@ -99,18 +102,25 @@ def render(self) -> None:
             tuple(float(v) for v in dataset.frequencies[selection[2]]),
             str(pol_value),
         )
-        self._plot_bounded_line(
-            self.plot_ax, values, percent, label=label, dataset=dataset,
-            trace_key=trace_key, drawstyle="steps-post",
-        )
-        rendered += 1
+        curves.append((dataset, levels, percent, label, trace_key))
         low = values[0] if low is None else min(low, values[0])
         high = values[-1] if high is None else max(high, values[-1])
 
-    if rendered == 0:
+    if not curves:
         detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
         self._show_plot_status(f"No finite levels in the selected cuts.{detail}")
         return
+    pad = max(1.0e-9, 0.02 * (high - low))
+    for dataset, levels, percent, label, trace_key in curves:
+        # Draw the known tails too, including the single-level population.
+        # Every overlaid curve uses the same finite display bounds.
+        x = np.r_[low - pad, levels, high + pad]
+        y = np.r_[100.0 if exceedance else 0.0,
+                  percent, 0.0 if exceedance else 100.0]
+        self._plot_bounded_line(
+            self.plot_ax, x, y, label=label, dataset=dataset,
+            trace_key=trace_key, drawstyle="steps-pre" if exceedance else "steps-post",
+        )
     if len(plans) > common.MAX_LINE_SERIES:
         self._note_plot_render(
             f"Displayed {common.MAX_LINE_SERIES} datasets; select fewer to show the rest."
@@ -121,7 +131,6 @@ def render(self) -> None:
         "Samples at or above level (%)" if exceedance else "Samples at or below level (%)"
     )
     self._update_legend_visibility()
-    pad = max(1.0e-9, 0.02 * (high - low))
     for spin, value in (
         (self.spin_plot_xmin, low - pad), (self.spin_plot_xmax, high + pad),
         (self.spin_plot_ymin, 0.0), (self.spin_plot_ymax, 100.0),

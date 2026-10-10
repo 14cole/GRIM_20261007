@@ -14,6 +14,7 @@ from .compute import (
     validate_sweep_coverage,
 )
 from .io import write_impedance_batch
+from .sweep_admission import frequency_sweep_count
 
 
 MAX_IBC_BATCH_FILES = 1000
@@ -52,10 +53,7 @@ def ibc_batch_frequency_count(
         raise ValueError("Frequency step must be > 0 GHz.")
     if stop_ghz < start_ghz:
         raise ValueError("Frequency stop must be >= start.")
-    count = int(math.floor((stop_ghz - start_ghz) / step_ghz + 1e-12)) + 1
-    if count <= 0:
-        raise ValueError("Frequency sweep is empty.")
-    return count
+    return frequency_sweep_count(start_ghz, stop_ghz, step_ghz)
 
 
 def validate_ibc_batch_workload(

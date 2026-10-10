@@ -114,15 +114,23 @@ class CdfTests(_WindowCase):
         self.assertIn("CDF plot updated", window.status.currentMessage())
         (line,) = self.lines(self.keys[0])
         expected = np.sort(self.dbsm(np.r_[POWER_SHAPE, POWER_SHAPE * np.linspace(1, 2, 8)[1]]))
-        np.testing.assert_allclose(line.get_xdata(), expected)
-        np.testing.assert_allclose(line.get_ydata(), 100.0 * np.arange(1, 11) / 10)
+        levels = np.unique(expected)
+        np.testing.assert_allclose(line.get_xdata()[1:-1], levels)
+        np.testing.assert_allclose(
+            line.get_ydata()[1:-1], [100.0 * np.mean(expected <= v) for v in levels]
+        )
+        np.testing.assert_allclose(line.get_ydata()[[0, -1]], [0.0, 100.0])
         self.assertEqual(line.get_drawstyle(), "steps-post")
         self.assertIn("10 samples", line.get_label())
         self.assertIn("at or below", window.plot_ax.get_ylabel())
 
         window.analysis_controls.combo_cdf.setCurrentIndex(1)
         (line,) = self.lines(self.keys[0])
-        np.testing.assert_allclose(line.get_ydata(), 100.0 * (1 - np.arange(10) / 10))
+        np.testing.assert_allclose(
+            line.get_ydata()[1:-1], [100.0 * np.mean(expected >= v) for v in levels]
+        )
+        np.testing.assert_allclose(line.get_ydata()[[0, -1]], [100.0, 0.0])
+        self.assertEqual(line.get_drawstyle(), "steps-pre")
         self.assertIn("at or above", window.plot_ax.get_ylabel())
         self.assertEqual(window.plot_ax.get_ylim(), (0.0, 100.0))
 

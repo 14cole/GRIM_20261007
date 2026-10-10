@@ -1225,10 +1225,13 @@ def _isar_preflight_error(
         inverse_polarity = key == "phase_center_motion"
         true_value = semantic in {"1", "true", "yes"}
         false_value = semantic in {"0", "false", "no", "none", "n a", "na"}
-        explicitly_unsafe = bool(
-            (true_value if inverse_polarity else false_value)
-            or unsafe_semantics(declared)
-        )
+        if true_value or false_value:
+            # Interpret a complete boolean declaration before generic text:
+            # "none" denies motion but also denies compensation. Compound
+            # declarations still take the unsafe free-text path below.
+            explicitly_unsafe = true_value if inverse_polarity else false_value
+        else:
+            explicitly_unsafe = unsafe_semantics(declared)
         if explicitly_unsafe:
             return (
                 f"{key} declares {declared!r}; ISAR requires a stable, "

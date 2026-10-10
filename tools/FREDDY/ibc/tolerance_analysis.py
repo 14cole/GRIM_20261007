@@ -17,6 +17,7 @@ import numpy as np
 from .compute import (INCH_TO_M, prepare_layer_properties_many, compute_angle_metrics_many,
                       validate_sweep_coverage, make_frequency_sweep, make_sweep)
 from .io import MATERIAL_SINGULAR_TOL
+from .sweep_admission import validate_grid
 from .tolerance_config import PARAMETERS, layer_parameters, validate_setup, validate_tolerances
 
 
@@ -109,6 +110,10 @@ def sampled_deviations(parameters, samples, seed, batch_size=64):
 class PreparedStudy:
     def __init__(self, layers, frequencies, angles, polarizations, parameters,
                  stop_requested=lambda: False, compute_metrics=compute_angle_metrics_many):
+        validate_grid(len(frequencies), len(angles), label="Sensitivity",
+                      metric_count=2, retained_grids=2 * len(polarizations),
+                      layer_count=len(layers),
+                      extra_bytes=len(frequencies) * len(parameters) * 32)
         self.layers = layers
         self.freqs, self.angles, self.pols = frequencies, angles, polarizations
         self.params, self.stop_requested, self.compute_metrics = parameters, stop_requested, compute_metrics

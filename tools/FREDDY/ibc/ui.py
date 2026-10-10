@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import copy
+from .sweep_admission import (
+    sweep_count, frequency_sweep_count, validate_axis_count,
+    validate_analysis_grid, validate_inverse_grid, validate_mix_grid,
+)
 import json
 from collections.abc import Mapping
 import math
@@ -3243,8 +3247,13 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
             f_start = float(self.f_start_var.get().strip())
             f_stop = float(self.f_stop_var.get().strip())
             f_step = float(self.f_step_var.get().strip())
+            validate_analysis_grid(frequency_sweep_count(f_start, f_stop, f_step),
+                                   len(angles), layer_count=len(loaded_layers),
+                                   label="Off Angle")
             freqs = make_frequency_sweep(f_start, f_stop, f_step)
 
+        validate_analysis_grid(len(freqs), len(angles), layer_count=len(loaded_layers),
+                               label="Off Angle")
         for i, layer in enumerate(loaded_layers, start=1):
             if layer.is_sheet:
                 continue
@@ -3321,6 +3330,8 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
         """Metric grids indexed [frequency][thickness] for one layer swept over
         ``thicknesses_in`` at a fixed incidence angle. Material tables are read
         once by the caller and shared across every thickness."""
+        validate_analysis_grid(len(freqs), len(thicknesses_in), layer_count=len(loaded_layers),
+                               label="Thickness")
         for i, layer in enumerate(loaded_layers, start=1):
             if layer.is_sheet:
                 continue
@@ -3407,6 +3418,8 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
         wave_pol: str,
         capture: dict | None = None,
     ) -> tuple[int, str]:
+        validate_analysis_grid(len(sweep), layer_count=len(loaded_layers),
+                               uncertainty=uncertainty.enabled, label="Impedance")
         for i, layer in enumerate(loaded_layers, start=1):
             if layer.is_sheet:
                 continue
@@ -3505,6 +3518,8 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
         dict[str, list[list[float]]] | None,
         str,
     ]:
+        validate_analysis_grid(len(freqs), len(angles), layer_count=len(loaded_layers),
+                               uncertainty=uncertainty.enabled, label="Off Angle")
         out = self._compute_heatmap_data(loaded_layers, wave_pol, angles, freqs=freqs)
 
         scales = build_uncertainty_scales(uncertainty)
@@ -3650,6 +3665,8 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
         dict[str, list[list[float]]] | None,
         str,
     ]:
+        validate_analysis_grid(len(freqs), len(thicknesses_in), layer_count=len(loaded_layers),
+                               uncertainty=uncertainty.enabled, label="Thickness")
         out = self._compute_thickness_data(
             loaded_layers, layer_idx, thicknesses_in, wave_pol, angle_deg, freqs
         )
@@ -3751,6 +3768,7 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
         )
         if not tokens:
             raise ValueError("Enter one or more discrete frequencies in GHz (for example: 8.2, 9.5, 10.0).")
+        validate_axis_count(len(tokens), "Discrete frequency list")
         values: list[float] = []
         for token in tokens:
             value = float(token)
@@ -3843,12 +3861,13 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
             freq_mode = self.inv_freq_mode_var.get().strip().lower()
             if freq_mode.startswith("discrete"):
                 target_freqs = self._parse_inverse_discrete_freqs(self.inv_freq_list_var.get())
+                nf = len(target_freqs)
                 target_freq_desc = "Discrete GHz: " + ", ".join(f"{v:g}" for v in target_freqs)
             else:
                 f_start = float(self.inv_target_start_var.get().strip())
                 f_stop = float(self.inv_target_stop_var.get().strip())
                 f_step = float(self.inv_target_step_var.get().strip())
-                target_freqs = make_frequency_sweep(f_start, f_stop, f_step)
+                nf = frequency_sweep_count(f_start, f_stop, f_step)
                 target_freq_desc = f"Band GHz: {f_start:g}-{f_stop:g} (step {f_step:g})"
             a_start = float(self.inv_angle_start_var.get().strip())
             a_stop = float(self.inv_angle_stop_var.get().strip())
@@ -3857,10 +3876,10 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
             if a_stop < a_start:
                 raise ValueError("Inverse-design angle stop must be >= start.")
             if a_stop == a_start:
-                target_angles = [a_start]
+                na = 1
             else:
                 a_step = float(self.inv_angle_step_var.get().strip())
-                target_angles = make_sweep(a_start, a_stop, a_step)
+                na = sweep_count(a_start, a_stop, a_step)
 
             top_n = int(self.inv_top_n_var.get().strip())
             if top_n <= 0:
@@ -3870,8 +3889,15 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
                 raise ValueError('Choose a supported inverse-design objective.')
             requirement_db = inverse_requirement_target(score_mode, self.inv_requirement_db_var.get())
             uncertainty_cfg = self._read_inverse_uncertainty_config()
-            check_layers(layer_snapshot, target_freqs, materials=False)
             grid = DesignGrid(layer_snapshot)
+            validate_inverse_grid(nf, na,
+                                  layer_count=len(layer_snapshot),
+                                  case_count=len(build_uncertainty_scales(uncertainty_cfg)),
+                                  design_count=grid.total, top_n=top_n)
+            if not freq_mode.startswith("discrete"):
+                target_freqs = make_frequency_sweep(f_start, f_stop, f_step)
+            target_angles = [a_start] if na == 1 else make_sweep(a_start, a_stop, a_step)
+            check_layers(layer_snapshot, target_freqs, materials=False)
             recovery_text = self.inverse_recovery_path.text().strip()
             recovery_path = Path(recovery_text).expanduser().resolve() if recovery_text else None
             if recovery_path is not None:
@@ -4244,8 +4270,11 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
             f_start = float(self.mix_target_start_var.get().strip())
             f_stop = float(self.mix_target_stop_var.get().strip())
             f_step = float(self.mix_target_step_var.get().strip())
+            validate_mix_grid(frequency_sweep_count(f_start, f_stop, f_step),
+                              component_count=len(self.mix_components))
             target_freqs = make_frequency_sweep(f_start, f_stop, f_step)
             desc = f"Band GHz: {f_start:g}-{f_stop:g} (step {f_step:g})"
+        validate_mix_grid(len(target_freqs), component_count=len(self.mix_components))
         return target_freqs, desc
 
     def _parse_mix_property_target(
@@ -4539,6 +4568,9 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
             if max_evals < 1 or top_n < 1:
                 raise ValueError("Recipe samples and number kept must be >= 1.")
             top_n = min(top_n, max_evals)
+            validate_mix_grid(len(target_freqs),
+                              len(performance_config["angles"]) if performance_config else 1,
+                              component_count=len(comp_snapshot), retained_results=top_n)
             if top_n > MAX_MIX_RETAINED:
                 raise ValueError(f'Keep at most {MAX_MIX_RETAINED} recipes for comparison.')
             score_mode = self.mix_score_mode_var.get().strip()
@@ -5242,6 +5274,9 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
             f_start = float(self.f_start_var.get().strip())
             f_stop = float(self.f_stop_var.get().strip())
             f_step = float(self.f_step_var.get().strip())
+            nf = frequency_sweep_count(f_start, f_stop, f_step)
+            validate_analysis_grid(nf, layer_count=len(layer_snapshot),
+                                   uncertainty=uncertainty.enabled, label="Impedance")
             freqs = make_frequency_sweep(f_start, f_stop, f_step)
             backing = normalize_backing(self.backing_var.get())
         except Exception as exc:
@@ -5333,7 +5368,7 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
             f_start = float(self.angle_f_start_var.get().strip())
             f_stop = float(self.angle_f_stop_var.get().strip())
             f_step = float(self.angle_f_step_var.get().strip())
-            freqs = make_frequency_sweep(f_start, f_stop, f_step)
+            nf = frequency_sweep_count(f_start, f_stop, f_step)
             wave_pol = normalize_wave_polarization(self.wave_pol_var.get())
 
             a_start = float(self.angle_start_var.get().strip())
@@ -5343,10 +5378,16 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
             if a_stop < a_start:
                 raise ValueError("Angle stop must be >= start.")
             if abs(a_stop - a_start) <= 1e-12:
-                angles = [a_start]
+                na = 1
             else:
                 a_step = float(self.angle_step_var.get().strip())
-                angles = make_sweep(a_start, a_stop, a_step)
+                na = sweep_count(a_start, a_stop, a_step)
+            compare_both = self.angle_compare_both.isChecked()
+            validate_analysis_grid(nf, na, layer_count=len(layer_snapshot),
+                                   uncertainty=uncertainty.enabled,
+                                   polarizations=2 if compare_both else 1, label="Off Angle")
+            freqs = make_frequency_sweep(f_start, f_stop, f_step)
+            angles = [a_start] if na == 1 else make_sweep(a_start, a_stop, a_step)
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
             return
@@ -5356,7 +5397,6 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
         ):
             return
 
-        compare_both = self.angle_compare_both.isChecked()
         def worker() -> dict[str, object]:
             loaded_layers = self._load_layers(layer_snapshot)
             other_pol = 'tm' if wave_pol == 'te' else 'te'
@@ -5420,7 +5460,7 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
             f_start = float(self.thk_f_start_var.get().strip())
             f_stop = float(self.thk_f_stop_var.get().strip())
             f_step = float(self.thk_f_step_var.get().strip())
-            freqs = make_frequency_sweep(f_start, f_stop, f_step)
+            nf = frequency_sweep_count(f_start, f_stop, f_step)
             wave_pol = normalize_wave_polarization(self.thk_wave_pol_var.get())
 
             angle_deg = float(self.thk_angle_var.get().strip())
@@ -5428,15 +5468,21 @@ class ImpedanceGui(ProjectStateMixin, AnalysisWorkflowMixin, InverseResultsMixin
 
             t_start = float(self.thk_start_var.get().strip())
             t_stop = float(self.thk_stop_var.get().strip())
+            if not all(math.isfinite(t) for t in (t_start, t_stop)):
+                raise ValueError("Thickness limits must be finite.")
             if t_start <= 0:
                 raise ValueError("Thickness start must be > 0 in.")
             if t_stop < t_start:
                 raise ValueError("Thickness stop must be >= start.")
             if abs(t_stop - t_start) <= 1e-12:
-                thicknesses = [t_start]
+                nt = 1
             else:
                 t_step = float(self.thk_step_var.get().strip())
-                thicknesses = make_sweep(t_start, t_stop, t_step)
+                nt = sweep_count(t_start, t_stop, t_step)
+            validate_analysis_grid(nf, nt, layer_count=len(layer_snapshot),
+                                   uncertainty=uncertainty.enabled, label="Thickness")
+            freqs = make_frequency_sweep(f_start, f_stop, f_step)
+            thicknesses = [t_start] if nt == 1 else make_sweep(t_start, t_stop, t_step)
             # The swept layer's own thickness is overwritten per column, so a
             # zero-thickness placeholder in the stack is not an error here.
             layer_snapshot[layer_idx].thickness_in = t_start

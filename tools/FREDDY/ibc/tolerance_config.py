@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from .sweep_admission import sweep_count, validate_grid
 
 PARAMETERS = {'thickness': 'Thickness', 'eps_real': 'ε′', 'eps_imag': 'ε″',
               'mu_real': 'μ′', 'mu_imag': 'μ″', 'sheet_resistance': 'Sheet resistance'}
@@ -69,8 +70,10 @@ def validate_setup(raw):
     if not 0 <= integers['seed'] < 2**32:
         raise ValueError('Seed must be an integer from 0 to 4294967295.')
     # Reject accidental huge grids before make_sweep allocates Python lists.
-    nf = (nums['f_stop'] - nums['f_start']) / nums['f_step'] + 1
-    na = (nums['a_stop'] - nums['a_start']) / nums['a_step'] + 1
+    nf = sweep_count(nums['f_start'], nums['f_stop'], nums['f_step'])
+    na = sweep_count(nums['a_start'], nums['a_stop'], nums['a_step'])
     if nf > 20001 or na > 1001 or nf * na * (2 if state['polarization'] == 'Both' else 1) > 2_000_000:
         raise ValueError('Sensitivity grid is too large; use at most 20,001 frequencies, 1,001 angles and 2 million response points per trial.')
+    validate_grid(nf, na, label="Sensitivity", metric_count=2,
+                  retained_grids=4 if state['polarization'] == 'Both' else 2)
     return state

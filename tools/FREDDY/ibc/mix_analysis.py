@@ -1,6 +1,7 @@
 """Qt-free material recipe display data and stack-performance evaluation."""
 from __future__ import annotations
 import math
+from .sweep_admission import validate_mix_grid
 from .compute import (
     NUMPY_AVAILABLE, INCH_TO_M, LoadedLayer, MaterialTable, MixComponent,
     MIX_RULES, MIX_RULE_LABELS, prepare_layer_properties_many,
@@ -35,6 +36,7 @@ def evaluate_mix_performance(
     check_stop=lambda: None,
 ) -> dict:
     check_stop()
+    validate_mix_grid(len(table.freq_ghz), len(config["angles"]))
     layer = LoadedLayer(
         thickness_m=thickness_in * INCH_TO_M,
         anisotropic=False,
@@ -84,6 +86,8 @@ def build_mix_display(
     check_stop=lambda: None,
 ) -> dict:
     check_stop()
+    validate_mix_grid(len(grid_ghz), len(performance["angles"]) if performance else 1,
+                      component_count=len(components))
     # Synthesize on the frequency grid selected in the Material Mix tab.
     # When a property target is given, also carry target curves and
     # per-frequency mismatch.

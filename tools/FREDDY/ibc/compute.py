@@ -5,6 +5,7 @@ import cmath
 import math
 from dataclasses import dataclass, field
 from itertools import product
+from .sweep_admission import sweep_count, validate_axis_count, validate_grid
 
 try:
     import numpy as np
@@ -745,15 +746,7 @@ def snap_to_increment(
 
 
 def make_sweep(f_start: float, f_stop: float, f_step: float) -> list[float]:
-    if not all(math.isfinite(value) for value in (f_start, f_stop, f_step)):
-        raise ValueError("Sweep start, stop, and step must be finite.")
-    if f_step <= 0:
-        raise ValueError("Sweep step must be > 0.")
-    if f_stop < f_start:
-        raise ValueError("Sweep stop must be >= start.")
-    count = int(math.floor((f_stop - f_start) / f_step + 1e-12)) + 1
-    if count <= 0:
-        raise ValueError("Sweep is empty.")
+    count = validate_axis_count(sweep_count(f_start, f_stop, f_step))
     return [f_start + i * f_step for i in range(count)]
 
 
@@ -979,11 +972,31 @@ def prepare_layer_properties_many(
     inverse and thickness searches can vary those quantities without stale
     physics.
     """
+    if len(f_ghz):
+        validate_grid(len(f_ghz), layer_count=len(layers), label="Solver frequency sweep")
     _validate_frequency_vector(f_ghz)
     prepared: list[tuple[list[complex], list[complex]] | None] = []
     for layer in layers:
         prepared.append(None if layer.is_sheet else layer_properties_many(layer, f_ghz))
     return prepared
+
+
+class _PreparedLayerWaveTerms(tuple):
+    """Keep the legacy ``(Zc, kz)`` pair plus finite Maxwell couplings.
+
+    At cutoff Zc is infinite (TE) or zero (TM), although the layer matrix is
+    finite. Retaining its off-diagonal generator entries avoids inf*0 and
+    0/0 without changing two-value unpacking for existing callers.
+    """
+
+    def __new__(cls, zc, kz, upper, lower):
+        result = super().__new__(cls, (zc, kz))
+        result.upper = upper
+        result.lower = lower
+        return result
+
+    def __getnewargs__(self):
+        return (*self, self.upper, self.lower)
 
 
 def prepare_layer_wave_terms_many(
@@ -995,9 +1008,15 @@ def prepare_layer_wave_terms_many(
     mu_scale: float = 1.0,
     prepared_properties: list[tuple[list[complex], list[complex]] | None] | None = None,
 ) -> list[tuple["np.ndarray", "np.ndarray"] | None]:
-    """Precompute frequency-dependent ``(Zc, kz)`` arrays for a fixed corner."""
+    """Precompute wave arrays, including finite cutoff terms, for a corner.
+
+    Bulk entries still unpack as ``(Zc, kz)``. Pass the returned entries
+    intact to ``compute_angle_metrics_many`` to retain their finite terms.
+    """
     if not NUMPY_AVAILABLE:
         raise RuntimeError("Prepared wave arrays require NumPy.")
+    if len(f_ghz):
+        validate_grid(len(f_ghz), layer_count=len(layers), label="Solver frequency sweep")
     _validate_frequency_vector(f_ghz)
     theta_deg = validate_incidence_angle(theta_deg)
     if wave_pol not in {"te", "tm"}:
@@ -1032,10 +1051,15 @@ def prepare_layer_wave_terms_many(
             omega,
         )
         if wave_pol == "te":
-            zc = omega * MU0 * mu_arr / kz
+            upper = omega * MU0 * mu_arr
+            lower = kz * kz / upper
+            zc = np.full_like(kz, complex(math.inf, 0.0))
+            np.divide(upper, kz, out=zc, where=kz != 0.0)
         else:
-            zc = kz / (omega * EPS0 * eps_arr)
-        out.append((zc, kz))
+            lower = omega * EPS0 * eps_arr
+            upper = kz * kz / lower
+            zc = kz / lower
+        out.append(_PreparedLayerWaveTerms(zc, kz, upper, lower))
     return out
 
 
@@ -1095,6 +1119,8 @@ def compute_stack_impedance_many(
 
     if not f_ghz:
         return []
+    if len(f_ghz):
+        validate_grid(len(f_ghz), layer_count=len(layers), label="Solver frequency sweep")
     _validate_frequency_vector(f_ghz)
 
     if NUMPY_AVAILABLE:
@@ -1164,7 +1190,9 @@ def _causal_kz(
         return -kz
     if abs(kz.imag) <= tol:
         if wave_pol == "te":
-            z_try = omega * MU0 * mu_r / kz
+            # Re(mu/kz) has the same sign as Re(mu*conj(kz)); this
+            # remains defined at kz=0 where the branch sign is immaterial.
+            z_try = omega * MU0 * mu_r * kz.conjugate()
         elif wave_pol == "tm":
             z_try = kz / (omega * EPS0 * eps_r)
         else:
@@ -1174,13 +1202,14 @@ def _causal_kz(
     return kz
 
 
-def layer_wave_params(
+def _layer_wave_couplings(
     f_hz: float,
     theta_deg: float,
     eps_r: complex,
     mu_r: complex,
     wave_pol: str,
-) -> tuple[complex, complex]:
+) -> tuple[complex, complex, complex]:
+    """Return finite Maxwell generator entries ``(upper, lower, kz)``."""
     f_hz = float(f_hz)
     if not math.isfinite(f_hz) or f_hz <= 0:
         raise ValueError("Frequency must be finite and > 0 Hz.")
@@ -1198,11 +1227,31 @@ def layer_wave_params(
         omega,
     )
     if wave_pol == "te":
-        zc = omega * MU0 * mu_r / kz
+        upper = omega * MU0 * mu_r
+        lower = kz * kz / upper
     elif wave_pol == "tm":
-        zc = kz / (omega * EPS0 * eps_r)
+        lower = omega * EPS0 * eps_r
+        upper = kz * kz / lower
     else:
         raise ValueError(f"Unsupported wave polarization: {wave_pol}")
+    return upper, lower, kz
+
+
+def layer_wave_params(
+    f_hz: float,
+    theta_deg: float,
+    eps_r: complex,
+    mu_r: complex,
+    wave_pol: str,
+) -> tuple[complex, complex]:
+    """Return ``(Zc, kz)``; TE's physical Zc is infinite at exact cutoff."""
+    upper, lower, kz = _layer_wave_couplings(
+        f_hz, theta_deg, eps_r, mu_r, wave_pol
+    )
+    if wave_pol == "te":
+        zc = upper / kz if kz != 0.0 else complex(math.inf, 0.0)
+    else:
+        zc = kz / lower
     return zc, kz
 
 
@@ -1264,9 +1313,13 @@ def cascade_input_impedance(
         eps_r, mu_r = layer_properties(layer, f_ghz)
         eps_r *= eps_scale
         mu_r *= mu_scale
-        zc, kz = layer_wave_params(f_hz, theta_deg, eps_r, mu_r, wave_pol)
-        t = _stable_complex_tan(kz * layer.thickness_m * thickness_scale)
-        z_next = zc * (z_next + 1j * zc * t) / (zc + 1j * z_next * t)
+        upper, lower, kz = _layer_wave_couplings(
+            f_hz, theta_deg, eps_r, mu_r, wave_pol
+        )
+        ai, bi, ci, _scale = _scaled_layer_matrix(
+            upper, lower, kz, layer.thickness_m * thickness_scale
+        )
+        z_next = (ai * z_next + bi) / (ci * z_next + ai)
     return z_next
 
 
@@ -1293,11 +1346,16 @@ def cascade_abcd(
         eps_r, mu_r = layer_properties(layer, f_ghz)
         eps_r *= eps_scale
         mu_r *= mu_scale
-        zc, kz = layer_wave_params(f_hz, theta_deg, eps_r, mu_r, wave_pol)
-        p = kz * layer.thickness_m * thickness_scale
-        ai = cmath.cos(p)
-        bi = 1j * zc * cmath.sin(p)
-        ci = 1j * cmath.sin(p) / zc
+        upper, lower, kz = _layer_wave_couplings(
+            f_hz, theta_deg, eps_r, mu_r, wave_pol
+        )
+        ai, bi, ci, scale = _scaled_layer_matrix(
+            upper, lower, kz, layer.thickness_m * thickness_scale
+        )
+        # This public API returns the unscaled ABCD matrix. The metrics
+        # paths keep the scale logarithmic for electrically thick layers.
+        scale = math.exp(scale)
+        ai, bi, ci = ai * scale, bi * scale, ci * scale
         di = ai
         a, b, c, d = (
             a * ai + b * ci,
@@ -1323,6 +1381,49 @@ def _scaled_layer_trig(p: complex) -> tuple[complex, complex, float]:
     cos_scaled = 0.5 * (forward_phase + small * reverse_phase)
     jsin_scaled = 0.5 * (forward_phase - small * reverse_phase)
     return cos_scaled, jsin_scaled, attenuation
+
+
+def _scaled_layer_matrix(upper, lower, kz, thickness):
+    """Finite slab matrix with exp(max(0, -Im(kz*d))) factored out.
+
+    B = j*upper*d*sinc(kz*d), C = j*lower*d*sinc(kz*d), with the
+    unnormalized sinc(0)=1. For TE upper=omega*mu, lower=kz^2/upper;
+    for TM lower=omega*epsilon, upper=kz^2/lower. No division by kz
+    or by the singular characteristic impedance is needed.
+    """
+    p = kz * thickness
+    if abs(p) <= 1.0:
+        attenuation = max(0.0, -p.imag)
+        scale = math.exp(-attenuation)
+        ai = cmath.cos(p) * scale
+        jsinc = 1j * (cmath.sin(p) / p if p != 0.0 else 1.0) * scale
+    else:
+        ai, jsin, attenuation = _scaled_layer_trig(p)
+        jsinc = jsin / p
+    return ai, upper * thickness * jsinc, lower * thickness * jsinc, attenuation
+
+
+def _scaled_layer_matrix_many(upper, lower, kz, thickness):
+    """Vector counterpart using the same dimensionless sinc limit."""
+    p = kz * thickness
+    attenuation = np.maximum(0.0, -p.imag)
+    ai = np.empty_like(p, dtype=complex)
+    jsinc = np.empty_like(p, dtype=complex)
+    small = np.abs(p) <= 1.0
+    if np.any(small):
+        ps = p[small]
+        sinc = np.ones_like(ps)
+        np.divide(np.sin(ps), ps, out=sinc, where=ps != 0.0)
+        scale = np.exp(-attenuation[small])
+        ai[small] = np.cos(ps) * scale
+        jsinc[small] = 1j * sinc * scale
+    if np.any(~small):
+        pl = p[~small]
+        forward = np.exp(1j * pl.real)
+        reverse = np.exp(np.maximum(-800.0, -2.0 * attenuation[~small])) * np.conjugate(forward)
+        ai[~small] = 0.5 * (forward + reverse)
+        jsinc[~small] = 0.5 * (forward - reverse) / pl
+    return ai, upper * thickness * jsinc, lower * thickness * jsinc, attenuation
 
 
 def _transmission_from_scaled_chain(
@@ -1353,12 +1454,15 @@ def _transmission_from_scaled_chain(
             eps_r, mu_r = layer_properties(layer, f_ghz)
             eps_r *= eps_scale
             mu_r *= mu_scale
-            zc, kz = layer_wave_params(f_hz, theta_deg, eps_r, mu_r, wave_pol)
-            p = kz * layer.thickness_m * thickness_scale
-            ai, jsin, layer_log_scale = _scaled_layer_trig(p)
+            upper, lower, kz = _layer_wave_couplings(
+                f_hz, theta_deg, eps_r, mu_r, wave_pol
+            )
+            ai, bi, ci, layer_log_scale = _scaled_layer_matrix(
+                upper, lower, kz, layer.thickness_m * thickness_scale
+            )
             di = ai
-            bi = (zc / z0) * jsin
-            ci = (z0 / zc) * jsin
+            bi /= z0
+            ci *= z0
 
         a, b, c, d = (
             a * ai + b * ci,
@@ -1386,7 +1490,7 @@ def _transmission_from_scaled_chain(
 
 def _transmission_from_scaled_chain_many(
     z0: complex,
-    layer_terms: list[tuple["np.ndarray", "np.ndarray", "np.ndarray"] | None],
+    layer_terms: list[tuple["np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray"] | None],
     layer_sheet_rs: list[float],
     sample: "np.ndarray",
 ) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
@@ -1404,17 +1508,10 @@ def _transmission_from_scaled_chain_many(
             ci = np.full_like(sample, z0 / layer_sheet_rs[idx], dtype=complex)
             layer_log_scale = np.zeros_like(sample.real, dtype=float)
         else:
-            zc, _tan_p, p = term
-            attenuation = np.maximum(0.0, -p.imag)
-            forward_phase = np.exp(1j * p.real)
-            small = np.exp(np.maximum(-800.0, -2.0 * attenuation))
-            reverse_phase = np.conjugate(forward_phase)
-            ai = 0.5 * (forward_phase + small * reverse_phase)
-            jsin = 0.5 * (forward_phase - small * reverse_phase)
+            ai, raw_bi, raw_ci, layer_log_scale = term
             di = ai
-            bi = (zc / z0) * jsin
-            ci = (z0 / zc) * jsin
-            layer_log_scale = attenuation
+            bi = raw_bi / z0
+            ci = raw_ci * z0
 
         a, b, c, d = (
             a * ai + b * ci,
@@ -1496,7 +1593,7 @@ def _causal_kz_many(
     flip = out.imag > tol
     lossless = np.abs(out.imag) <= tol
     if wave_pol == "te":
-        z_try = omega * MU0 * mu_r / out
+        z_try = omega * MU0 * mu_r * np.conjugate(out)
     elif wave_pol == "tm":
         z_try = out / (omega * EPS0 * eps_r)
     else:
@@ -1541,6 +1638,8 @@ def compute_angle_metrics_many(
             "metal_absorption_db": [],
             "air_absorption_db": [],
         }
+    if len(f_ghz):
+        validate_grid(len(f_ghz), layer_count=len(layers), label="Solver frequency sweep")
     _validate_frequency_vector(f_ghz)
     theta_deg = validate_incidence_angle(theta_deg)
     validate_anisotropic_oblique_model(layers, theta_deg, wave_pol)
@@ -1592,7 +1691,7 @@ def compute_angle_metrics_many(
 
     # Cache layer wave terms once; they are reused by both reflection cascades
     # and the scaled transmission chain. For sheet layers, the entry is None.
-    layer_terms: list[tuple[np.ndarray, np.ndarray, np.ndarray] | None] = []
+    layer_terms: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None] = []
     layer_sheet_rs: list[float] = []
     for layer, wave_term in zip(layers, wave_terms):
         if layer.is_sheet:
@@ -1605,8 +1704,27 @@ def compute_angle_metrics_many(
             raise ValueError("Prepared wave terms are missing a bulk layer.")
         layer_sheet_rs.append(0.0)
         zc, kz = wave_term
-        p = kz * layer.thickness_m * thickness_scale
-        layer_terms.append((zc, _stable_complex_tan_many(p), p))
+        if isinstance(wave_term, _PreparedLayerWaveTerms):
+            upper, lower = wave_term.upper, wave_term.lower
+        else:
+            # Accept legacy plain (Zc, kz) cache entries. At exact cutoff
+            # their singular Zc cannot encode the finite generator entry,
+            # so recover that entry from the material only for this case.
+            cutoff = kz == 0.0
+            upper = np.zeros_like(kz, dtype=complex)
+            lower = np.zeros_like(kz, dtype=complex)
+            np.multiply(zc, kz, out=upper, where=~cutoff)
+            np.divide(kz, zc, out=lower, where=~cutoff)
+            if np.any(cutoff):
+                eps_r, mu_r = layer_properties_many(layer, f_ghz)
+                omega = 2.0 * math.pi * f_hz
+                if wave_pol == "te":
+                    upper[cutoff] = (omega * MU0 * np.asarray(mu_r) * mu_scale)[cutoff]
+                else:
+                    lower[cutoff] = (omega * EPS0 * np.asarray(eps_r) * eps_scale)[cutoff]
+        layer_terms.append(_scaled_layer_matrix_many(
+            upper, lower, kz, layer.thickness_m * thickness_scale
+        ))
 
     def _cascade(z_load: complex) -> np.ndarray:
         z_next = np.full_like(f_hz, z_load, dtype=complex)
@@ -1615,8 +1733,8 @@ def compute_angle_metrics_many(
                 rs = complex(layer_sheet_rs[idx], 0.0)
                 z_next = (z_next * rs) / (z_next + rs)
             else:
-                zc, t, _p = layer_terms[idx]
-                z_next = zc * (z_next + 1j * zc * t) / (zc + 1j * z_next * t)
+                ai, bi, ci, _scale = layer_terms[idx]
+                z_next = (ai * z_next + bi) / (ci * z_next + ai)
         return z_next
 
     zin_metal = _cascade(0.0 + 0.0j)

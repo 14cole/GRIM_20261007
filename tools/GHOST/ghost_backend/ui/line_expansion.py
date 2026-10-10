@@ -8,16 +8,16 @@ try:
     from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
     from PySide6.QtWidgets import (
         QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-        QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QProgressBar,
-        QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
+        QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QProgressBar,
+        QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
         QWidget,
     )
 except ImportError:
     from PySide2.QtCore import QObject, QThread, Qt, Signal, Slot  # type: ignore
     from PySide2.QtWidgets import (  # type: ignore
         QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-        QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QProgressBar,
-        QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
+        QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QProgressBar,
+        QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
         QWidget,
     )
 
@@ -125,7 +125,23 @@ class LineExpansionTab(QWidget):
         self._build_ui()
 
     def _build_ui(self) -> 'None':
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        # The inactive page also contributes to its host tab stack's minimum
+        # size. Keep the long editor scrollable instead of sizing the host to it.
+        self.controls_scroll = QScrollArea(self)
+        self.controls_scroll.setObjectName("ghostLineExpansionControlsScroll")
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setFrameShape(QFrame.NoFrame)
+        self.controls_scroll.setMinimumHeight(160)
+        controls = QWidget(self.controls_scroll)
+        layout = QVBoxLayout(controls)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.controls_scroll.setWidget(controls)
+        # Preserve the host's panel background instead of QScrollArea's
+        # automatic widget fill, which can obscure light checkbox text.
+        controls.setAutoFillBackground(False)
+        self.controls_scroll.viewport().setAutoFillBackground(False)
+        outer.addWidget(self.controls_scroll, 1)
         help_label = QLabel(
             "Fast 3-D approximation from 2-D solves. Each row is one straight "
             "section: its .geo is solved as a stand-alone 2-D object and "
@@ -160,6 +176,7 @@ class LineExpansionTab(QWidget):
         self.section_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.Stretch
         )
+        self.section_table.setMinimumHeight(160)
         layout.addWidget(self.section_table, 1)
         row_actions = QHBoxLayout()
         self.add_button = QPushButton("Add section(s)\u2026", self)
@@ -180,6 +197,7 @@ class LineExpansionTab(QWidget):
         layout.addLayout(row_actions)
 
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         self.coordinate_units = QComboBox(self)
         for label, value in _COORDINATE_UNITS:
             self.coordinate_units.addItem(label, value)
@@ -310,11 +328,22 @@ class LineExpansionTab(QWidget):
         action_row.addWidget(self.run_button)
         action_row.addWidget(self.cancel_button)
         action_row.addWidget(self.progress, 1)
-        layout.addLayout(action_row)
+        outer.addLayout(action_row)
+        # Results can include a station or warning per section. Bound their
+        # height as well, while keeping every line selectable and reachable.
+        self.status_scroll = QScrollArea(self)
+        self.status_scroll.setObjectName("ghostLineExpansionStatusScroll")
+        self.status_scroll.setWidgetResizable(True)
+        self.status_scroll.setFrameShape(QFrame.NoFrame)
+        self.status_scroll.setMaximumHeight(96)
+        self.status_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         self.status_label = QLabel(self)
         self.status_label.setWordWrap(True)
+        self.status_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.status_label)
+        self.status_scroll.setWidget(self.status_label)
+        self.status_scroll.hide()
+        outer.addWidget(self.status_scroll)
 
         self.add_button.clicked.connect(self._add_sections)
         self.import_path_button.clicked.connect(self._import_path)
@@ -340,6 +369,12 @@ class LineExpansionTab(QWidget):
         """Include worker shutdown so a host cannot destroy the QThread."""
 
         return self._thread is not None
+
+    @Slot(str)
+    def _set_status(self, message: 'str') -> 'None':
+        self.status_label.setText(message)
+        self.status_scroll.setVisible(bool(message))
+        self.status_scroll.verticalScrollBar().setValue(0)
 
     def _add_sections(self) -> 'None':
         paths, _ = QFileDialog.getOpenFileNames(
@@ -372,7 +407,7 @@ class LineExpansionTab(QWidget):
         try:
             sections = sections_from_path(geometry, *read_path_points(path))
         except (OSError, ValueError) as exc:
-            self.status_label.setText(str(exc))
+            self._set_status(str(exc))
             return
         for section in sections:
             self._append_row(
@@ -383,7 +418,7 @@ class LineExpansionTab(QWidget):
                     for value in section[key]
                 ]
             )
-        self.status_label.setText(
+        self._set_status(
             f"Added {len(sections)} chained section(s) from {path}."
         )
 
@@ -521,7 +556,7 @@ class LineExpansionTab(QWidget):
                 },
             )
         except ValueError as exc:
-            self.status_label.setText(str(exc))
+            self._set_status(str(exc))
             return
         self._abort_event = threading.Event()
         thread = QThread(self)
@@ -530,8 +565,8 @@ class LineExpansionTab(QWidget):
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_progress)
         worker.finished.connect(self._on_finished)
-        worker.canceled.connect(self.status_label.setText)
-        worker.error.connect(self.status_label.setText)
+        worker.canceled.connect(self._set_status)
+        worker.error.connect(self._set_status)
         for signal in (worker.finished, worker.canceled, worker.error):
             signal.connect(thread.quit)
             signal.connect(worker.deleteLater)
@@ -539,7 +574,7 @@ class LineExpansionTab(QWidget):
         thread.finished.connect(self._on_thread_finished)
         self._thread, self._worker = thread, worker
         self._set_busy(True)
-        self.status_label.setText("Solving 2-D sections and expanding\u2026")
+        self._set_status("Solving 2-D sections and expanding\u2026")
         thread.start()
 
     @Slot()
@@ -547,7 +582,7 @@ class LineExpansionTab(QWidget):
         if self._abort_event is not None:
             self._abort_event.set()
             self.cancel_button.setEnabled(False)
-            self.status_label.setText(
+            self._set_status(
                 "Cancelling after the current section; no partial output "
                 "will be saved."
             )
@@ -563,7 +598,7 @@ class LineExpansionTab(QWidget):
         lines = [f"Saved {output}"]
         lines += [str(value) for value in result.get("stations", ())]
         lines += ["\u26a0 " + str(value) for value in result.get("warnings", ())]
-        self.status_label.setText("\n".join(lines))
+        self._set_status("\n".join(lines))
         self.files_exported.emit([output], "line expansion")
 
     @Slot()

@@ -46,6 +46,7 @@ from .io import read_material_table, constant_material_from_layer
 from .ui_options import inverse_requirement_target
 from .inverse_workflow import StopInverseSearch, search_identity
 from .inverse_grid import DesignGrid
+from .sweep_admission import validate_inverse_grid, validate_mix_grid, validate_grid
 
 
 def score_inverse_candidate(target_freqs, target_angles, candidate_layers, wave_pol,
@@ -53,6 +54,8 @@ def score_inverse_candidate(target_freqs, target_angles, candidate_layers, wave_
                             stop_requested, statistics,
                             compute_metrics=compute_angle_metrics_many, requirement_db=-10.):
     """Score a complete candidate, observing cancellation between responses."""
+    validate_grid(len(target_freqs), len(target_angles),
+                  layer_count=len(candidate_layers), label="Inverse candidate")
     corner_means: list[float] = []
     nominal_mean: float | None = None
     requirement_db = inverse_requirement_target(score_mode, requirement_db)
@@ -140,6 +143,10 @@ def run_inverse_search(request: InverseSearchRequest, *, stop_requested, progres
     a_stop = request.a_stop
     numpy_available = request.numpy_available
 
+    validate_inverse_grid(len(target_freqs), len(target_angles),
+                          layer_count=len(layer_snapshot),
+                          case_count=len(build_uncertainty_scales(uncertainty_cfg)),
+                          design_count=grid.total, top_n=top_n)
     from array import array
     import heapq
     identity = search_identity(layer_snapshot, target_freqs, target_angles, wave_pol,
@@ -417,6 +424,10 @@ def run_mix_search(request: MixSearchRequest, *, evaluate_performance=evaluate_m
 
     if max_evals < 1 or not 1 <= top_n <= MAX_MIX_RETAINED:
         raise ValueError(f'Recipe samples must be positive; keep between 1 and {MAX_MIX_RETAINED} recipes.')
+
+    validate_mix_grid(len(target_freqs),
+                      len(performance_config["angles"]) if performance_config else 1,
+                      component_count=len(comp_snapshot), retained_results=top_n)
 
     def check_stop():
         if stop_requested():

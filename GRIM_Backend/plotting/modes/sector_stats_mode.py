@@ -2,8 +2,9 @@
 
 Each dataset/frequency/elevation cut becomes one line of flat segments, one
 per sector, on the same azimuth axis as Azimuth (Rect). Statistics use linear
-power (a mean of dB values is not a mean level); order statistics are the
-same either way. Every statistic is kept for Copy Sector Table.
+power (a mean of dB values is not a mean level), including valid zero-power
+samples. Every statistic is kept for Copy Sector Table; logarithmic zero
+is represented by negative infinity, separately from missing data (NaN).
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ STATISTICS = (
 
 def _sector_linear_statistics(linear, members, percentile: float) -> dict[str, float]:
     values = linear[members]
-    values = values[np.isfinite(values)]
+    values = values[np.isfinite(values) & (values >= 0.0)]
     if values.size == 0:
         return {"count": 0, "mean": np.nan, "median": np.nan, "max": np.nan,
                 "min": np.nan, "percentile": np.nan}
@@ -97,6 +98,11 @@ def render(self) -> None:
     self._configure_line_budget(sum(len(sel[1]) * len(sel[2]) for _, _, sel in plans))
     if not self._prepare_line_plot_axes("sector_stats", "rectilinear", reference, datasets):
         return
+    previous_zero_note = getattr(self.plot_ax, "_grim_sector_zero_note", None)
+    if previous_zero_note is not None:
+        if previous_zero_note in self.plot_ax.texts:
+            previous_zero_note.remove()
+        self.plot_ax._grim_sector_zero_note = None
 
     tag = statistic_tag(statistic, percentile)
     freq_unit = self._plot_axis_unit(reference, "frequency")
@@ -108,6 +114,7 @@ def render(self) -> None:
     row_units = []
     rendered = 0
     omitted = 0
+    zero_levels = 0
     for name, dataset, selection in plans:
         native_unit = self._display_unit([(name, dataset)])
         az_indices, elev_indices, freq_indices, pol_indices = selection
@@ -124,21 +131,32 @@ def render(self) -> None:
                     continue
                 elevation = float(self._plot_axis_values(
                     reference, dataset, "elevation", [float(dataset.elevations[elev_idx])])[0])
-                linear = dataset.rcs_to_linear(
-                    dataset.rcs_power[az_indices, elev_idx, freq_idx, pol_indices[0]]
+                # Stored rcs_power is already linear. rcs_to_linear clamps
+                # negative real inputs to zero, which would make invalid
+                # samples indistinguishable from valid physical zeros here.
+                linear = np.asarray(
+                    dataset.rcs_power[az_indices, elev_idx, freq_idx, pol_indices[0]],
+                    dtype=float,
                 )
-                linear = np.where(np.asarray(linear, dtype=float) > 0.0, linear, np.nan)
                 x_points, y_points = [], []
                 for sector, members in zip(sectors, memberships):
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore", category=RuntimeWarning)
                         stats = _sector_linear_statistics(linear, members, percentile)
-                    shown = {
-                        key: float(self._display_from_linear(
-                            dataset, np.asarray([stats[key]]), frequency_value=native_frequency
-                        )[0])
-                        for key in ("mean", "median", "max", "min", "percentile")
-                    }
+                    keys = ("mean", "median", "max", "min", "percentile")
+                    values = np.asarray([stats[key] for key in keys])
+                    if not self._plot_scale_is_linear():
+                        # The shared line-display helper omits zero. Tables
+                        # must instead distinguish log(0)=-inf from missing
+                        # statistics, and retain the complete population.
+                        values = dataset.linear_to_default_db(
+                            values, frequency_value=native_frequency, eps=0.0
+                        )
+                        if any(stats[key] == 0.0 for key in keys):
+                            self._note_plot_render(
+                                "Zero-power statistics are retained as -inf in the sector table."
+                            )
+                    shown = {key: float(value) for key, value in zip(keys, values)}
                     table.append((
                         name, str(pol_value), frequency, elevation, sector.label(),
                         stats["count"], shown["mean"], shown["median"], shown["min"],
@@ -146,6 +164,8 @@ def render(self) -> None:
                     ))
                     row_units.append(native_unit)
                     level = shown[statistic]
+                    if np.isneginf(level):
+                        zero_levels += 1
                     if not np.isfinite(level):
                         continue
                     for first, last in sector.display_pieces(low, high):
@@ -175,7 +195,21 @@ def render(self) -> None:
         "rows": table,
         "row_units": row_units,
     }
-    if rendered == 0:
+    if zero_levels:
+        zero_message = (
+            f"{zero_levels} zero-power sector level(s) (-inf on the dB scale). "
+            "Use Linear to display these levels."
+        )
+        self._note_plot_render(zero_message)
+        # Include the explanation in exported figures as well as the status
+        # bar: there is no finite ordinate at which to draw these levels.
+        self.plot_ax._grim_sector_zero_note = self.plot_ax.text(
+            0.02, 0.02,
+            f"{zero_levels} zero-power sector level(s): -inf on the dB scale\n"
+            "Retained in the sector table; use Linear to display.",
+            transform=self.plot_ax.transAxes, ha="left", va="bottom", fontsize="small",
+        )
+    if rendered == 0 and zero_levels == 0:
         detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
         self._show_plot_status(f"No finite levels inside the sectors.{detail}")
         return

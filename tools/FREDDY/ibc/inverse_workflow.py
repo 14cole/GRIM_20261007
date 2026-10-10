@@ -10,6 +10,7 @@ from pathlib import Path
 import threading
 
 from .compute import build_uncertainty_scales, make_frequency_sweep, make_sweep, validate_incidence_angle
+from .sweep_admission import sweep_count, frequency_sweep_count, validate_inverse_grid
 from .io import read_material_table, save_project_file, constant_material_from_layer, CONSTANT_VALUE_FIELDS
 from .compute import layer_material_label
 from .ui_options import inverse_requirement_target
@@ -284,15 +285,29 @@ class InverseWorkflowMixin:
         dialog.exec()
 
     def _inverse_setup_values(self):
-        if self.inv_freq_mode_var.get().lower().startswith('discrete'):
+        discrete = self.inv_freq_mode_var.get().lower().startswith('discrete')
+        if discrete:
             freqs = self._parse_inverse_discrete_freqs(self.inv_freq_list_var.get())
+            nf = len(freqs)
         else:
-            freqs = make_frequency_sweep(float(self.inv_target_start_var.get()), float(self.inv_target_stop_var.get()), float(self.inv_target_step_var.get()))
+            frequency_args = (float(self.inv_target_start_var.get()),
+                              float(self.inv_target_stop_var.get()),
+                              float(self.inv_target_step_var.get()))
+            nf = frequency_sweep_count(*frequency_args)
         start, stop = map(validate_incidence_angle, (float(self.inv_angle_start_var.get()), float(self.inv_angle_stop_var.get())))
         if stop < start:
             raise ValueError('Angle stop must be at least start.')
+        na = 1 if start == stop else sweep_count(start, stop, float(self.inv_angle_step_var.get()))
+        layers = self._snapshot_layers()
+        cfg = self._read_inverse_uncertainty_config()
+        validate_inverse_grid(nf, na, layer_count=len(layers),
+                              case_count=len(build_uncertainty_scales(cfg)),
+                              design_count=DesignGrid(layers).total,
+                              top_n=int(self.inv_top_n_var.get()))
+        if not discrete:
+            freqs = make_frequency_sweep(*frequency_args)
         angles = [start] if start == stop else make_sweep(start, stop, float(self.inv_angle_step_var.get()))
-        return self._snapshot_layers(), freqs, angles, self._read_inverse_uncertainty_config()
+        return layers, freqs, angles, cfg
 
     def _check_inverse_setup(self):
         from PySide6.QtWidgets import QMessageBox
@@ -333,10 +348,7 @@ class InverseWorkflowMixin:
         try:
             # Editing a tiny step must not allocate a huge frequency/angle
             # vector just to display the work count. Match make_sweep's count.
-            def count(start, stop, step):
-                if not all(math.isfinite(v) for v in (start, stop, step)) or step <= 0 or stop < start:
-                    raise ValueError('Sweep limits must be finite, stop ≥ start, and step > 0.')
-                return math.floor((stop - start) / step + 1e-12) + 1
+            count = sweep_count
             if self.inv_freq_mode_var.get().lower().startswith('discrete'):
                 frequency_count = len(self._parse_inverse_discrete_freqs(self.inv_freq_list_var.get()))
             else:

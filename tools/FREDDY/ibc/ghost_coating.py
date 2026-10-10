@@ -6,11 +6,18 @@ The reference plane is the outer air/coating surface in every comparison.
 from __future__ import annotations
 import cmath
 import math
+from itertools import islice
 from .compute import (C0, compute_stack_impedance_many, compute_angle_metrics_many,
                       ambient_wave_impedance, validate_incidence_angle)
 
 
 def assess_scalar_coating(frequencies, layers, angles=(0., 15., 30., 45., 60., 75., 85.), *, include_details=False):
+    # A generator is allowed, but must not be exhausted without a bound before
+    # the existing sample-product check. At least two polarizations are used.
+    frequencies = list(islice(frequencies, 100001))
+    angles = list(islice(angles, 100001))
+    if len(frequencies) * len(angles) * 2 > 200000:
+        raise ValueError("Coating check is limited to 200,000 frequency/angle/polarization samples.")
     frequencies = [float(f) for f in frequencies]
     angles = [validate_incidence_angle(float(a)) for a in angles]
     if not frequencies or not angles or not layers:
