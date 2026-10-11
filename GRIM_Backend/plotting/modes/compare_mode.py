@@ -652,6 +652,7 @@ def render(self) -> None:
         )
         return
 
+    self._release_native_plot_samples()
     top_ax, residual_ax = self._ensure_compare_axes()
     top_ax.clear()
     residual_ax.clear()

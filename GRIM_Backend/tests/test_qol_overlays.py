@@ -116,6 +116,14 @@ class NativeOverlayTests(unittest.TestCase):
                 self.assertEqual(vv.get_linestyle(), "-")
                 first = hh.get_xdata() if mode is cdf_mode else hh.get_ydata()
                 second = vv.get_xdata() if mode is cdf_mode else vv.get_ydata()
+                if mode is cdf_mode:
+                    # Both empirical CDFs extend to shared 0/100% tail
+                    # bounds. Their actual sample levels retain the 20 dB
+                    # channel separation, not these illustrative endpoints.
+                    np.testing.assert_array_equal(first[[0, -1]], second[[0, -1]])
+                    np.testing.assert_array_equal(hh.get_ydata()[[0, -1]], [0, 100])
+                    np.testing.assert_array_equal(vv.get_ydata()[[0, -1]], [0, 100])
+                    first, second = first[1:-1], second[1:-1]
                 valid = np.isfinite(first) & np.isfinite(second)
                 np.testing.assert_allclose(np.asarray(second)[valid] - np.asarray(first)[valid], 20)
 

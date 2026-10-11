@@ -147,12 +147,24 @@ def render(self) -> None:
         )
         display = np.where(np.isfinite(display), display, np.nan)
         x_display = self._plot_axis_values(reference, dataset, "frequency", centers)
+        native_x, native_y, native_image = x_display, ranges_m * scale, display
         x_display, y_display, image = self._bounded_plot_image(
             x_display, ranges_m * scale, display
         )
+        native_snapshot = self._native_image_snapshot(
+            native_x, native_y, native_image, reduced=image.shape != native_image.shape,
+        )
+        if native_snapshot is not None and native_snapshot is not False and native_x.size == 1:
+            # The single full-band column covers the selected band, not an
+            # arbitrary +/-0.5 native frequency unit around its center.
+            native_snapshot = (
+                self._plot_axis_values(reference, dataset, "frequency", native[[0, -1]]),
+                native_snapshot[1], native_snapshot[2],
+            )
         step_hz = float(np.mean(np.diff(frequencies_hz)))
         panels.append({
             "name": name,
+            "native_snapshot": native_snapshot,
             "pol": str(dataset.polarizations[pol_indices[0]]),
             "sweeps": int(sweeps.shape[0]),
             "x": x_display,
@@ -170,6 +182,7 @@ def render(self) -> None:
         return
 
     self._remove_colorbar()
+    self._release_native_plot_samples()
     self.plot_figure.clear()
     axes = self.plot_figure.subplots(nrows=len(panels), ncols=1, squeeze=False)[:, 0]
     self.plot_axes = list(axes)
@@ -203,6 +216,7 @@ def render(self) -> None:
             coordinates[0, :, 0], coordinates[:, 0, 1],
             mesh.get_array().reshape(panel["image"].T.shape),
         )
+        self._attach_native_image_snapshot(mesh, panel["native_snapshot"])
         meshes.append(mesh)
         band_label = ("full selected band" if panel['width'] == panel['count']
                       else f"sub-band {panel['width']}/{panel['count']} samples")

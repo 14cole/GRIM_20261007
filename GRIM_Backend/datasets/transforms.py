@@ -8,6 +8,7 @@ import math
 import numpy as np
 
 from GRIM_Backend.datasets.grid import RcsGrid
+from GRIM_Backend.datasets.constants import C0
 
 
 _MAX_EXPLICIT_AXIS_POINTS = 1_000_000
@@ -190,12 +191,16 @@ def regrid_axis(
     stop: float | None = None,
     step: float | None = None,
     values=None,
+    max_gap: float | None = None,
+    support: str = "interpolate",
 ) -> RcsGrid:
     """Interpolate one numeric axis onto the requested coordinates.
 
     Supply either ``values`` or all of ``start``, ``stop``, and ``step`` in the
     dataset axis unit. ``RcsGrid.interpolate_axis`` applies complex/linear
-    interpolation and rejects extrapolation.
+    interpolation and rejects extrapolation. Optional ``max_gap`` uses the
+    same native axis unit. ``support='measured-only'`` masks new coordinates;
+    the default keeps the existing permissive interpolation behavior.
     """
 
     aliases = {
@@ -249,7 +254,7 @@ def regrid_axis(
         raise ValueError("target grid values must be finite")
     if target.size > 1 and np.any(np.diff(target) <= 0.0):
         raise ValueError("target grid values must be strictly increasing")
-    return dataset.interpolate_axis(axis_name, target)
+    return dataset.interpolate_axis(axis_name, target, max_gap=max_gap, support=support)
 
 
 def join_datasets(*datasets: RcsGrid, tol: float = 1.0e-6) -> RcsGrid:
@@ -309,6 +314,26 @@ def shift_dataset(
     if elevation_degrees is not None:
         result = result.shift_elevation(float(elevation_degrees))
     if phase_degrees is not None:
+        delta = float(phase_degrees)
+        if np.isfinite(delta) and delta % 360.0 == 0.0:
+            return result
+        raw_pair = result._complete_authoritative_raw_arrays()
+        if raw_pair is not None and result.linear_quantity() in {"sigma_2d", "sigma_3d"}:
+            # Retain authoritative precision without materializing a complex
+            # whole-grid response from the rounded display power.
+            real, imag = raw_pair
+            power = np.square(np.asarray(real, dtype=np.float64))
+            power += np.square(np.asarray(imag, dtype=np.float64))
+            if result.linear_quantity() == "sigma_2d":
+                k = 2.0 * np.pi * result._frequency_value_to_hz(result.frequencies) / C0
+                power /= (4.0 * k)[None, None, :, None]
+            else:
+                power *= 4.0 * np.pi
+            return _copy_grid(
+                result, rcs_power=power,
+                rcs_phase=_phase_shifted_response(result, delta),
+                rcs_domain="complex_amplitude",
+            )
         result = _copy_grid(
             result,
             rcs_power=result.rcs_power,
@@ -531,6 +556,49 @@ def convert_extrusion(dataset: RcsGrid, *, to: str, length_m: float) -> RcsGrid:
     )
 
 
+def decimation_axis_plan(source_axis, factor: int, partial: str = "keep"):
+    """Resolve block centers and sampling facts for processing and UI preview."""
+    if isinstance(factor, (bool, np.bool_)) or not isinstance(factor, (int, np.integer)):
+        raise TypeError("factor must be an integer of at least 2")
+    factor = int(factor)
+    if factor < 2:
+        raise ValueError("factor must be an integer of at least 2")
+    if partial not in {"keep", "drop"}:
+        raise ValueError("partial must be 'keep' or 'drop'")
+    source_axis = np.asarray(source_axis, dtype=float)
+    if source_axis.size < 2 or np.any(~np.isfinite(source_axis)):
+        raise ValueError("decimation requires at least two finite axis coordinates")
+    steps = np.diff(source_axis)
+    if np.any(steps <= 0.0):
+        raise ValueError("decimation requires a strictly increasing source axis")
+    nominal_step = float(np.median(steps))
+    atol = max(abs(nominal_step) * 1e-9,
+               np.finfo(np.float64).eps * max(1.0, float(np.max(np.abs(source_axis)))) * 32)
+    if not np.allclose(steps, nominal_step, rtol=1e-6, atol=atol):
+        raise ValueError("decimation requires uniformly spaced source coordinates; regrid to a uniform fine grid first")
+    full_bins, remainder = divmod(int(source_axis.size), factor)
+    centers = source_axis[:full_bins * factor].reshape(full_bins, factor).mean(axis=1)
+    if remainder and partial == "keep":
+        centers = np.append(centers, np.mean(source_axis[full_bins * factor:]))
+    if not centers.size:
+        raise ValueError("dropping the partial bin leaves no output; keep it or choose a smaller factor")
+    output_steps = np.diff(centers)
+    uniform = output_steps.size < 2 or bool(np.allclose(
+        output_steps, output_steps[0], rtol=1e-6, atol=atol))
+    return centers, {
+        "partial_bin_policy": partial,
+        "source_coordinate_count": int(source_axis.size),
+        "output_coordinate_count": int(centers.size),
+        "full_bin_count": full_bins,
+        "partial_bin_sample_count": remainder,
+        "partial_final_bin_retained": bool(remainder and partial == "keep"),
+        "discarded_source_coordinate_count": remainder if partial == "drop" else 0,
+        "output_uniform": uniform,
+        "output_step_min": float(np.min(output_steps)) if output_steps.size else None,
+        "output_step_max": float(np.max(output_steps)) if output_steps.size else None,
+    }
+
+
 def decimate_axis(
     dataset: RcsGrid,
     *,
@@ -538,12 +606,15 @@ def decimate_axis(
     factor: int,
     mode: str = "power",
     metadata_attested: bool = False,
+    partial: str = "keep",
 ) -> RcsGrid:
     """Boxcar-prefilter and decimate one numeric axis by an integer factor.
 
     ``mode='power'`` averages finite linear power and marks phase unknown.
     ``mode='coherent'`` averages the finite complex field and retains the
-    resulting phase. The final partial bin is retained with its actual count.
+    resulting phase. ``partial='keep'`` retains the final partial bin at its
+    actual center (which may break uniform output spacing). ``partial='drop'``
+    explicitly discards those trailing samples and preserves uniform spacing.
     """
 
     axis_key = str(axis).strip().lower()
@@ -565,49 +636,9 @@ def decimate_axis(
 
     axis_index = axis_map[axis_key]
     source_axis = np.asarray(dataset.get_axis(axis_key), dtype=float)
-    if source_axis.size < 2 or np.any(~np.isfinite(source_axis)):
-        raise ValueError("decimation requires at least two finite axis coordinates")
-    source_steps = np.diff(source_axis)
-    if np.any(source_steps <= 0.0):
-        raise ValueError("decimation requires a strictly increasing source axis")
-    nominal_step = float(np.median(source_steps))
-    spacing_atol = max(
-        abs(nominal_step) * 1.0e-9,
-        np.finfo(np.float64).eps
-        * max(1.0, float(np.max(np.abs(source_axis))))
-        * 32.0,
-    )
-    if not np.allclose(
-        source_steps,
-        nominal_step,
-        rtol=1.0e-6,
-        atol=spacing_atol,
-    ):
-        raise ValueError(
-            "decimation requires uniformly spaced source coordinates; regrid "
-            "to a uniform fine grid before applying a boxcar prefilter"
-        )
-
+    output_axis, sampling_report = decimation_axis_plan(source_axis, factor, partial)
     source_count = int(source_axis.size)
     full_bin_count, remainder = divmod(source_count, factor)
-    output_axis_parts = []
-    if full_bin_count:
-        output_axis_parts.append(
-            np.mean(
-                source_axis[: full_bin_count * factor].reshape(
-                    full_bin_count, factor
-                ),
-                axis=1,
-            )
-        )
-    if remainder:
-        output_axis_parts.append(
-            np.asarray(
-                [float(np.mean(source_axis[full_bin_count * factor :]))],
-                dtype=float,
-            )
-        )
-    output_axis = np.concatenate(output_axis_parts)
     output_shape = list(dataset.rcs_power.shape)
     output_shape[axis_index] = int(output_axis.size)
     output_shape = tuple(output_shape)
@@ -687,7 +718,7 @@ def decimate_axis(
         )
         output_power_by_bin[output_start:output_stop] = power
         output_phase_by_bin[output_start:output_stop] = phase
-    if remainder:
+    if remainder and partial == "keep":
         power, phase = aggregate_bins(
             full_bin_count * factor,
             1,
@@ -728,7 +759,7 @@ def decimate_axis(
             "factor": factor,
             "filter": "finite boxcar mean",
             "mode": mode_key,
-            "partial_final_bin_retained": bool(source_axis.size % factor),
+            **sampling_report,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -736,8 +767,13 @@ def decimate_axis(
     history_entry = (
         f"Decimate {axis_key} by {factor} with finite boxcar {mode_key} mean"
     )
-    if source_axis.size % factor:
-        history_entry += "; retained final partial bin"
+    if remainder:
+        history_entry += (
+            f"; retained final partial bin ({remainder} source coordinates)"
+            if partial == "keep" else f"; explicitly discarded {remainder} trailing source coordinates"
+        )
+    if not sampling_report["output_uniform"]:
+        history_entry += "; output spacing is nonuniform"
     prior_history = (
         attestation_history
         if attestation_history is not None

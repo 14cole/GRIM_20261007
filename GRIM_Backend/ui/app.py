@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -52,6 +53,7 @@ from GRIM_Backend.integrations.freddy import FreddyIntegrationWidget
 from GRIM_Backend.integrations.ghost import GhostIntegrationWidget, load_ghost_module
 from GRIM_Backend.datasets.grid import RcsGrid
 from GRIM_Backend.ui.analysis_controls import PlotAnalysisControls, PlotSliderBar
+from GRIM_Backend.ui.image_analysis import ImageAnalysisControls
 from GRIM_Backend.ui.sector_statistics_dialog import SectorStatisticsDialog
 from GRIM_Backend.ui.dataset_sidebar import DatasetSidebar, DatasetTable
 from GRIM_Backend.ui.widgets import (
@@ -121,6 +123,12 @@ PLOT_OPS_SPECS = {
             ("Slider", "slider"),
             ("Overlays", "overlays"),
         ),
+        (
+            ("Measure…", "measure"),
+            ("Phase Diagnostics…", "phase_diagnostics"),
+            ("Polarization…", "polarization_diagnostics"),
+            ("Images A/B…", "image_compare"),
+        ),
     ),
     "isar": (
         (
@@ -137,6 +145,12 @@ PLOT_OPS_SPECS = {
             ("Pan", "pan"),
             ("Auto Plot", "auto_plot"),
             ("Auto Scale", "auto_scale"),
+        ),
+        (
+            ("Measure…", "measure"),
+            ("Phase Diagnostics…", "phase_diagnostics"),
+            ("Polarization…", "polarization_diagnostics"),
+            ("Images A/B…", "image_compare"),
         ),
     ),
 }
@@ -429,6 +443,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         def _ops_pad(title: str, specs: tuple[tuple[str, str], ...], cols: int = 2) -> None:
             cap = QLabel(title)
             cap.setObjectName("opsCategory")
+            cap.setWordWrap(True)
             ops_content_layout.addWidget(cap)
             grid = QGridLayout()
             grid.setHorizontalSpacing(4)
@@ -468,15 +483,20 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             ("Duplicate", "btn_duplicate"),
             ("Time Gate…", "btn_time_gate"),
         ))
-        _ops_pad("Calibration", (
+        _ops_pad("Calibration, Geometry & Quality", (
             ("Range Cal", "btn_range_cal"),
             ("Support Ref -", "btn_support_reference"),
-        ), cols=1)
-        _ops_pad("Quality", (
             ("Audit…", "btn_audit"),
             ("Compatibility…", "btn_compatibility"),
             ("Provenance…", "btn_provenance"),
-        ), cols=1)
+            ("Axis Units…", "btn_axis_units"),
+            ("El→Az360", "btn_el_to_az360"),
+            ("Swap El/Az", "btn_swap_el_az"),
+            ("SENTRi El→GRIM", "btn_sentri_elevation"),
+            ("Extrusion…", "btn_extrusion"),
+            ("Wedge → Conic", "btn_wedge_to_conic"),
+            ("Phase Center…", "btn_phase_center"),
+        ))
         self.btn_audit.setToolTip(
             "Run the bounded, read-only dataset health audit and show axis, "
             "sample, phase, metadata, seam, and readiness findings."
@@ -506,15 +526,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             "support-referenced difference. It does not reconstruct a free-space "
             "target or remove target/support interaction terms."
         )
-        _ops_pad("Geometry & Units", (
-            ("Axis Units…", "btn_axis_units"),
-            ("El→Az360", "btn_el_to_az360"),
-            ("Swap El/Az", "btn_swap_el_az"),
-            ("SENTRi El→GRIM", "btn_sentri_elevation"),
-            ("Extrusion…", "btn_extrusion"),
-            ("Wedge → Conic", "btn_wedge_to_conic"),
-            ("Phase Center…", "btn_phase_center"),
-        ))
         self.btn_axis_units.setToolTip(
             "Convert stored angle and frequency coordinates between equivalent "
             "units without interpolating or changing any response sample."
@@ -736,7 +747,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
 
         python_hint = QLabel(
             "Successful dataset operations and supported rectangular/polar azimuth, "
-            "frequency, and elevation-sweep plots appear here. PBP and other plot "
+            "frequency, elevation-sweep, CDF, and waterfall plots appear here. PBP and other plot "
             "modes are noted but not emitted as runnable code. Tab changes, zoom, "
             "pan, and selection gestures are not recorded."
         )
@@ -886,6 +897,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         plotting_canvas.mpl_connect("key_press_event", self._on_plot_key_press)
         plotting_context = self._plot_contexts["plotting"]
         plotting_context.analysis_controls.changed.connect(self._on_analysis_setting_changed)
+        plotting_context.image_analysis_controls.changed.connect(self._on_analysis_setting_changed)
         plotting_context.plot_slider.moved.connect(self._on_plot_slider_moved)
         plotting_context.plot_slider.axis_changed.connect(self._refresh_plot_slider)
         plotting_context.plot_slider.shown.connect(self._schedule_plot_slider_refresh)
@@ -907,6 +919,15 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.lbl_az.doubleClicked.connect(lambda: self.list_az.selectAll())
 
         for tab_key, controls in self._plot_controls_by_tab.items():
+            for role, diagnostic_tab in (("measure", "measure"),
+                                         ("phase_diagnostics", "phase"),
+                                         ("polarization_diagnostics", "polarization")):
+                if role in controls:
+                    controls[role].clicked.connect(
+                        lambda _checked=False, tab=diagnostic_tab: self._show_engineering_tool(tab)
+                    )
+            if "image_compare" in controls:
+                controls["image_compare"].clicked.connect(self._show_image_comparison)
             if "azimuth_rect" in controls:
                 controls["azimuth_rect"].clicked.connect(self._plot_azimuth_rect)
             if "frequency" in controls:
@@ -1305,6 +1326,22 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         finally:
             dialog.deleteLater()
 
+    def _show_engineering_tool(self, tab="measure") -> None:
+        from GRIM_Backend.ui.engineering_analysis import show_engineering_analysis
+        show_engineering_analysis(self, tab=tab)
+
+    def _show_image_comparison(self, _checked=False) -> None:
+        from GRIM_Backend.ui.image_comparison import open_image_comparison
+        self._image_comparison_dialog = open_image_comparison(self)
+
+    def _save_analysis_preferences(self) -> None:
+        context = self._plot_contexts.get("plotting")
+        if context is None:
+            return
+        payload = {"analysis": context.analysis_controls.analysis_options(),
+                   "image": context.image_analysis_controls.options()}
+        self._settings.setValue("plotting/analysis-options-v1", json.dumps(payload))
+
     def _build_plot_left_context(self, panel: QWidget, tab_key: str) -> PlotContext:
         left_layout = QVBoxLayout(panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -1456,9 +1493,21 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         # section is only inserted into the ISAR popup; the PlotContext still
         # owns compatible widgets so its public API remains unchanged.
         analysis_controls = None
+        image_analysis_controls = None
         if tab_key == "plotting":
             analysis_controls = PlotAnalysisControls(settings_frame)
             row = analysis_controls.add_rows(settings_layout, row)
+            image_analysis_controls = ImageAnalysisControls(settings_frame)
+            row = image_analysis_controls.add_rows(settings_layout, row)
+            try:
+                settings = getattr(self, "_settings", None)
+                saved_options = settings.value("plotting/analysis-options-v1", "{}") if settings is not None else "{}"
+                preferences = json.loads(str(saved_options))
+                if isinstance(preferences, dict):
+                    analysis_controls.restore_analysis_options(preferences.get("analysis", {}))
+                    image_analysis_controls.restore_options(preferences.get("image", {}))
+            except (TypeError, ValueError, KeyError):
+                pass  # Invalid saved preferences leave the usable defaults.
 
         common_settings_layout = settings_layout
         common_row = row
@@ -1859,10 +1908,16 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 btn.setToolTip("Signed A - B level differences for two datasets over two selected axes; choose the fixed third coordinate in the plot controls.")
             tooltips = {
                 "cdf": (
-                    "Share of samples at or below (or above) each level, one curve per "
-                    "dataset pooled over the selected azimuths, elevations, and "
-                    "frequencies. Choose cumulative or exceedance in Plot Settings."
+                    "CDF or exceedance with explicit population, weighting, run/band/sector "
+                    "grouping, and threshold lookup. Configure in Plot Settings."
                 ),
+                "frequency": "Frequency response by elevation/polarization. Choose individual angular cuts, linear-power mean, median, percentile, or maximum in Plot Settings.",
+                "elevation_sweep": "Elevation response by frequency/polarization. Choose individual angular cuts or an explicit aggregation in Plot Settings; coverage is reported.",
+                "waterfall": "Waterfall view over any pair of azimuth, elevation, and frequency, with linked horizontal and vertical cuts. Choose axes in Plot Settings.",
+                "measure": "Search native samples for peaks, minima, crossings and bandwidth; inspect cursor-region statistics and copy results.",
+                "phase_diagnostics": "Inspect paired magnitude/phase, unwrap, I/Q, reference residuals, and a controlled phase-slope fit on an explicit cut.",
+                "polarization_diagnostics": "Compare polarization channels, co/cross ratios, reciprocity, and channel phase differences on explicit cuts.",
+                "image_compare": "Compare captured images with locked coordinates and scales, linked cursors, blink/swipe, signed differences, and region statistics.",
                 "sector_stats": (
                     "Mean, median, max, min, or a percentile of linear power inside "
                     "each azimuth sector, drawn over the sector. Right-click this "
@@ -1991,6 +2046,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             last_plot_mode=None,
             delta_map_controls=delta_map_controls,
             analysis_controls=analysis_controls,
+            image_analysis_controls=image_analysis_controls,
             plot_slider=plot_slider,
             spatial_overlays=spatial_overlays,
         )
@@ -2067,6 +2123,10 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_slider = controls.get("slider")
         self.btn_cdf = controls.get("cdf")
         self.btn_sector_stats = controls.get("sector_stats")
+        self.btn_measure = controls.get("measure")
+        self.btn_phase_diagnostics = controls.get("phase_diagnostics")
+        self.btn_polarization_diagnostics = controls.get("polarization_diagnostics")
+        self.btn_image_compare = controls.get("image_compare")
 
         context = self._plot_contexts[tab_key]
         if tab_key == "isar":
@@ -2526,6 +2586,12 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         if callable(dispose_ppt):
             dispose_ppt()
         super().closeEvent(event)
+        if event.isAccepted():
+            self._dispose_native_plot_snapshots()
+            for name in ("_engineering_analysis_dialog", "_image_comparison_dialog"):
+                dialog = getattr(self, name, None)
+                if dialog is not None:
+                    dialog.close()
 
 
 def main() -> int:

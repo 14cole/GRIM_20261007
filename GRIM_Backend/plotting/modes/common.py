@@ -28,6 +28,80 @@ MAX_SYNC_TOTAL_CELLS = 16_000_000
 MAX_EXPLICIT_TICKS = 200
 
 
+class NativeSamples:
+    """Frozen native values backed by a temporary file, not another RAM grid.
+
+    Reduced artists own this snapshot for their lifetime. Copying and cursor
+    searches use bounded blocks; Hold can therefore retain exact probes
+    without retaining every full-resolution array in Python memory.
+    """
+
+    def __init__(self, shape):
+        self._file = tempfile.TemporaryFile(prefix="grim-plot-probe-")
+        self.values = None
+        try:
+            self.values = np.memmap(self._file, dtype=np.float64, mode="w+", shape=shape)
+        except Exception:
+            self._file.close()
+            raise
+
+    @classmethod
+    def image(cls, values):
+        values = np.asarray(values)
+        result = cls(values.shape)
+        try:
+            rows = max(1, REDUCTION_BLOCK_CELLS // max(1, values.shape[1]))
+            for start in range(0, values.shape[0], rows):
+                result.values[start:start + rows] = values[start:start + rows]
+            result.values.flush()
+        except Exception:
+            result.close()
+            raise
+        return result
+
+    @classmethod
+    def curve(cls, x, y):
+        x, y = np.asarray(x), np.asarray(y)
+        result = cls((2, x.size))
+        try:
+            result.x_monotonic = True
+            for start in range(0, x.size, REDUCTION_BLOCK_CELLS // 2):
+                stop = start + REDUCTION_BLOCK_CELLS // 2
+                result.values[0, start:stop] = x[start:stop]
+                result.values[1, start:stop] = y[start:stop]
+                check = x[max(0, start - 1):stop]
+                result.x_monotonic = result.x_monotonic and bool(
+                    np.all(np.isfinite(check)) and np.all(np.diff(check) >= 0))
+            result.values.flush()
+        except Exception:
+            result.close()
+            raise
+        return result
+
+    def close(self):
+        values = getattr(self, "values", None)
+        self.values = None
+        if values is not None:
+            values._mmap.close()
+        handle = getattr(self, "_file", None)
+        if handle is not None:
+            handle.close()
+            self._file = None
+
+    def __del__(self):
+        self.close()
+
+
+def coordinate_edges(values):
+    """Physical cell edges, including a useful extent for a singleton."""
+    values = np.asarray(values, dtype=float)
+    if values.size == 1:
+        return np.array([values[0] - 0.5, values[0] + 0.5])
+    middle = values[:-1] + np.diff(values) / 2.0
+    return np.r_[values[0] - (middle[0] - values[0]), middle,
+                 values[-1] + (values[-1] - middle[-1])]
+
+
 _FREQUENCY_UNITS = {
     "hz": ("Hz", 1.0),
     "khz": ("kHz", 1.0e3),

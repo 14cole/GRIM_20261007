@@ -82,14 +82,17 @@ class ExceedanceStepTests(_WindowCase):
         self.assert_empirical_path(line, [1, 2, 3, 4, 5], exceedance=False)
         self.assertEqual(horizontal_height(line, 1.5), 20.0)
 
-    def test_existing_missing_and_log_zero_policy_stays_explicit(self):
+    def test_missing_excluded_but_valid_zero_retained_on_both_scales(self):
         line = self.distribution([0, 1, 2, np.nan, np.inf], linear=True)
         self.assert_empirical_path(line, [0, 1, 2], exceedance=True)
         self.assertIn("3 samples", line.get_label())
         line = self.distribution([0, 1, 2, np.nan, np.inf], linear=False)
-        self.assert_empirical_path(line, self.dbsm([1, 2]), exceedance=True)
-        self.assertIn("2 samples", line.get_label())
-        self.assertIn("Zero/nonpositive samples are omitted", self.window.status.currentMessage())
+        levels = self.dbsm([1, 2])
+        self.assertAlmostEqual(horizontal_height(line, float(np.mean(levels))), 100.0 / 3)
+        self.assertAlmostEqual(line.get_ydata()[0], 200.0 / 3)
+        self.assertIn("3 samples", line.get_label())
+        self.assertIn("1 zero;", line.get_label())
+        self.assertIn("Zero power retained", self.window.status.currentMessage())
 
     def test_frequency_dependent_dbke_is_ranked_after_conversion(self):
         dataset = self.datasets[0]
@@ -119,13 +122,16 @@ class ExceedanceStepTests(_WindowCase):
 
     def test_svg_export_contains_the_same_corrected_path_geometry(self):
         line = self.distribution([1, 1, 2, 2, 5])
-        self.assertEqual(horizontal_height(line, 1.5), 60.0)
+        self.assertAlmostEqual(horizontal_height(line, 1.5), 60.0)
         line.set_gid("verified-exceedance")
         figure = self.window.plot_figure
         original_dpi = figure.dpi
         try:
             figure.set_dpi(72)
             figure.canvas.draw()
+            # Freeze the solved layout: SVG and Qt fonts have slightly
+            # different metrics, but this check compares the data path.
+            figure.set_layout_engine("none")
             expected = line.get_transform().transform(line.get_path().vertices)
             expected[:, 1] = figure.bbox.height - expected[:, 1]
             stream = BytesIO()

@@ -139,6 +139,12 @@ def plot_datasets(
     color_limits: tuple[float, float] | None = None,
     color_step: float = 0.0,
     delta_options: dict[str, object] | None = None,
+    sweep_options: dict[str, object] | None = None,
+    cdf_options: dict[str, object] | None = None,
+    heatmap_axes: tuple[str, str] = ("azimuth", "frequency"),
+    heatmap_aggregation: str = "panels",
+    heatmap_cuts: bool = False,
+    heatmap_options: dict[str, object] | None = None,
 ):
     """Create a Matplotlib Figure from resolved physical selector values.
 
@@ -150,6 +156,10 @@ def plot_datasets(
     mixed quantities use a "Mixed dB" ordinate and identify units in the legend.
     Ordinary overlays accept one polarization or a sequence and preserve each
     dataset's native sweep samples within the selected reference intervals.
+    ``sweep_options`` selects individual/mean/median/percentile/max azimuth
+    reduction. ``cdf_options`` selects groups, weighting and an inclusive
+    threshold; the returned figure exposes ``_grim_cdf_lookup_table``.
+    ``heatmap_options`` selects axes, panels/mean_power and linked cuts.
     """
 
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -158,7 +168,10 @@ def plot_datasets(
     selected = [(str(name), grid) for name, grid in datasets]
     if not selected:
         raise ValueError("plot_datasets needs at least one dataset")
+    scale = str(scale).strip().lower()
     mode_key = str(mode).strip().lower()
+    if mode_key == "heatmap":
+        mode_key = "waterfall"
     supported_modes = {
         "azimuth_rect",
         "azimuth_polar",
@@ -166,12 +179,14 @@ def plot_datasets(
         "elevation_sweep",
         "isar_image",
         "delta_map",
+        "cdf",
+        "waterfall",
     }
     if mode_key not in supported_modes:
         raise ValueError(
             f"Unsupported headless plot mode {mode!r}; supported modes are "
             "azimuth_rect, azimuth_polar, frequency, elevation_sweep, "
-            "isar_image, and delta_map"
+            "isar_image, delta_map, cdf, and waterfall"
         )
     if mode_key == "isar_image" and len(selected) != 1:
         raise ValueError("ISAR headless plotting requires exactly one dataset")
@@ -223,7 +238,7 @@ def plot_datasets(
         phase=bool(phase),
         linear=str(scale).strip().lower() == "linear",
         allow_mixed_db=mode_key in {
-            "azimuth_rect", "azimuth_polar", "frequency", "elevation_sweep"
+            "azimuth_rect", "azimuth_polar", "frequency", "elevation_sweep", "cdf", "waterfall"
         },
     )
     az_values = [float(value) for value in azimuths]
@@ -231,6 +246,143 @@ def plot_datasets(
     freq_values = [float(value) for value in frequencies]
     if not az_values or not el_values or not freq_values:
         raise ValueError("azimuths, elevations, and frequencies cannot be empty")
+    if mode_key == "waterfall":
+        from GRIM_Backend.plotting.image_analysis import AXES, AXIS_ATTRIBUTES, heatmap_display_plane
+        from matplotlib.colors import Normalize
+        if heatmap_options:
+            heatmap_axes = heatmap_options.get("axes", heatmap_axes)
+            heatmap_aggregation = heatmap_options.get("aggregation", heatmap_aggregation)
+            heatmap_cuts = bool(heatmap_options.get("linked_cuts", heatmap_cuts))
+        x_axis, y_axis = tuple(heatmap_axes)
+        if x_axis not in AXES or y_axis not in AXES or x_axis == y_axis:
+            raise ValueError("Waterfall needs two different physical axes")
+        if heatmap_aggregation not in {"panels", "mean_power"}:
+            raise ValueError("Waterfall aggregation must be panels or mean_power")
+        remaining = next(a for a in AXES if a not in (x_axis, y_axis))
+        panels = []
+        for name, dataset in selected:
+            for pol in polarizations:
+                indices = _plot_selection_indices(reference, dataset, az_values, el_values, freq_values, pol)
+                if indices is None:
+                    continue
+                indices = [*indices[:3], [indices[3]]]
+                cuts = [None] if heatmap_aggregation == "mean_power" else indices[AXES.index(remaining)]
+                x = plot_common.values_for_display(reference, dataset, x_axis, np.asarray(getattr(dataset, AXIS_ATTRIBUTES[x_axis]))[indices[AXES.index(x_axis)]])
+                y = plot_common.values_for_display(reference, dataset, y_axis, np.asarray(getattr(dataset, AXIS_ATTRIBUTES[y_axis]))[indices[AXES.index(y_axis)]])
+                xo, yo = np.argsort(x), np.argsort(y)
+                for cut in cuts:
+                    plane = heatmap_display_plane(dataset, indices, x_axis, y_axis, remaining_index=cut, phase=phase, linear=str(scale).lower() == "linear")
+                    plane = plane[np.ix_(xo, yo)]
+                    suffix = (f"{'Circular phase mean' if phase else 'Mean linear display quantity'} over {len(indices[AXES.index(remaining)])} {remaining} samples" if cut is None else
+                              f"{remaining.capitalize()} {plot_common.values_for_display(reference, dataset, remaining, [getattr(dataset, AXIS_ATTRIBUTES[remaining])[cut]])[0]:g} {plot_common.axis_unit(reference, remaining)}")
+                    response = _plot_response_label(dataset, phase=phase, scale=scale)
+                    panels.append((f"{name} | Pol {pol} | {suffix} | {response}", x[xo], y[yo], plane, response))
+        if not panels:
+            raise ValueError("No compatible Waterfall coordinates")
+        figure = Figure(figsize=(10., max(4., 4.*len(panels))), dpi=100, facecolor="white")
+        FigureCanvasAgg(figure)
+        spec = figure.add_gridspec(len(panels), 3 if heatmap_cuts else 1, width_ratios=(2,1,1) if heatmap_cuts else None)
+        norms = {}
+        for _title, _x, _y, data, response in panels:
+            finite = data[np.isfinite(data)]
+            if finite.size:
+                old = norms.get(response, (np.inf, -np.inf))
+                norms[response] = (min(old[0], float(np.min(finite))), max(old[1], float(np.max(finite))))
+        callbacks, image_axes, meshes = [], [], []
+        global_limits = (min(v[0] for v in norms.values()), max(v[1] for v in norms.values())) if norms else None
+        for i, (title, x, y, data, response) in enumerate(panels):
+            ax = figure.add_subplot(spec[i, 0])
+            limits = color_limits if color_limits is not None else global_limits if shared_colorbar else None
+            norm = Normalize(*limits) if limits is not None else None
+            mesh = ax.pcolormesh(plot_common.coordinate_edges(x), plot_common.coordinate_edges(y), data.T,
+                                 shading="flat", cmap=colormap, norm=norm)
+            ax.set(title=title, xlabel=plot_common.axis_label(reference, x_axis), ylabel=plot_common.axis_label(reference, y_axis))
+            ax.grid(bool(show_grid))
+            image_axes.append(ax); meshes.append(mesh)
+            if show_colorbar and not shared_colorbar:
+                figure.colorbar(mesh, ax=ax, label=response)
+            if heatmap_cuts:
+                horizontal = figure.add_subplot(spec[i, 1])
+                vertical = figure.add_subplot(spec[i, 2])
+                ix, iy = len(x)//2, len(y)//2
+                row, = horizontal.plot(x, data[:, iy])
+                column, = vertical.plot(y, data[ix, :])
+                hline = ax.axhline(y[iy], color="white", linewidth=.8)
+                vline = ax.axvline(x[ix], color="white", linewidth=.8)
+                horizontal.set(xlabel=plot_common.axis_label(reference, x_axis), ylabel=response, title=f"{y_axis} = {y[iy]:g}")
+                vertical.set(xlabel=plot_common.axis_label(reference, y_axis), ylabel=response, title=f"{x_axis} = {x[ix]:g}")
+                def update(event, ax=ax, x=x, y=y, data=data, row=row, column=column, hline=hline, vline=vline, horizontal=horizontal, vertical=vertical):
+                    if event.inaxes is not ax or event.xdata is None or event.ydata is None:
+                        return
+                    ix, iy = int(np.argmin(abs(x-event.xdata))), int(np.argmin(abs(y-event.ydata)))
+                    row.set_ydata(data[:, iy]); column.set_ydata(data[ix, :])
+                    hline.set_ydata([y[iy], y[iy]]); vline.set_xdata([x[ix], x[ix]])
+                    horizontal.set_title(f"{y_axis} = {y[iy]:g}"); vertical.set_title(f"{x_axis} = {x[ix]:g}")
+                    for cut_ax in (horizontal, vertical):
+                        cut_ax.relim(); cut_ax.autoscale_view()
+                    figure.canvas.draw_idle()
+                callbacks.append(figure.canvas.mpl_connect("button_press_event", update))
+        if show_colorbar and shared_colorbar:
+            response = panels[0][4] if len({p[4] for p in panels}) == 1 else "Mixed dB"
+            figure.colorbar(meshes[-1], ax=image_axes, label=response)
+        figure._grim_heatmap_cut_callbacks = callbacks
+        figure.set_layout_engine("constrained")
+        return figure
+
+    if mode_key == "cdf":
+        from GRIM_Backend.plotting import distribution_analysis as distribution
+        if phase:
+            raise ValueError("CDF plots rank magnitude levels, not phase")
+        config = distribution.options(cdf_options)
+        curves = []
+        for name, dataset in selected:
+            for pol in polarizations:
+                indices = _plot_selection_indices(reference, dataset, az_values, el_values, freq_values, pol)
+                if indices is None:
+                    continue
+                for selection, label in distribution.groups(dataset, reference, indices, config, azimuths=az_values, frequencies=freq_values):
+                    curve = distribution.prepare_curve(name, dataset, selection, label, config, scale=scale)
+                    if curve is not None:
+                        curves.append(curve)
+        if not curves:
+            raise ValueError("No valid magnitude population for the selected CDF")
+        figure = Figure(figsize=(10., 6.), dpi=100, facecolor="white")
+        FigureCanvasAgg(figure)
+        axes = figure.add_subplot(111)
+        limits = distribution.bounds(curves, config["threshold"] if config["threshold_enabled"] else None)
+        mixed = len({(c["dataset"].linear_quantity(), c["unit"]) for c in curves}) > 1
+        for curve in curves:
+            x, y = distribution.draw_values(curve, limits, exceedance=config["exceedance"])
+            label = curve["label"]
+            if mixed:
+                head, separator, tail = label.partition(" | ")
+                label = f"{head} [{curve['unit']}]{separator}{tail}"
+            line, = axes.plot(x, y, label=label, drawstyle="steps-pre" if config["exceedance"] else "steps-post")
+            line._grim_cdf_population = curve["population"]["counts"]
+            line._grim_cdf_threshold_lookup = curve["lookup"]
+            line._grim_trace_key = curve["key"]
+        if config["threshold_enabled"]:
+            axes.axvline(config["threshold"], color="0.4", linestyle=":", label="_CDF threshold")
+            axes.text(.01, .98, "Threshold lookup (inclusive):\n" + "\n".join(
+                f"{c['name']} | {c['pol']} | {c['group']}: <= {c['lookup'][0]:.4g}%, >= {c['lookup'][1]:.4g}% at {config['threshold']:g} {c['unit']}"
+                for c in curves), transform=axes.transAxes, va="top", fontsize=8)
+        notes = []
+        if any(np.any(np.isneginf(c["levels"])) for c in curves):
+            notes.append("Zero power retained at -infinity dB.")
+        if config["weighting"] != "samples":
+            notes.append("Trapezoidal measure over selected group coordinate hull, including gaps; not dwell time or solid angle.")
+        if notes:
+            figure.text(.01, .01, " ".join(notes), fontsize=8)
+        axes.set_xlabel(_plot_response_label(curves[0]["dataset"], phase=False, scale=scale, mixed_db=mixed))
+        axes.set_ylabel(distribution.y_label(config))
+        axes.set_ylim(0., 100.)
+        axes.grid(bool(show_grid))
+        if show_legend:
+            axes.legend()
+        figure._grim_cdf_lookup_table = distribution.table_text(curves, config)
+        figure.tight_layout(rect=(0, .05 if notes else 0, 1, 1))
+        return figure
+
     compatible_count = 0
     style_axes = None
     plotted_series = []
@@ -317,135 +469,31 @@ def plot_datasets(
             _plot_response_label(reference, phase=phase, scale=scale)
         )
 
-    elif mode_key == "frequency":
+    elif mode_key in {"frequency", "elevation_sweep"}:
+        from GRIM_Backend.plotting import sweep_analysis
+        config = sweep_analysis.options(sweep_options)
+        sweep_axis = "frequency" if mode_key == "frequency" else "elevation"
         for name, dataset, polarization in overlay_series:
             indices = _plot_selection_indices(
-                reference,
-                dataset,
-                az_values,
-                el_values,
-                freq_values,
-                polarization,
-                native_axes=("azimuth", "frequency"),
+                reference, dataset, az_values, el_values, freq_values, polarization,
+                native_axes=("azimuth", sweep_axis),
             )
             if indices is None:
                 continue
-            az_idx, el_idx, fr_idx, pol_idx = indices
             compatible_count += 1
-            native_x = np.asarray(dataset.frequencies)[fr_idx]
-            x = plot_common.values_for_display(
-                reference, dataset, "frequency", native_x
-            )
-            order = np.argsort(x)
-            for ei in el_idx:
-                if phase:
-                    block = dataset.rcs_slice(
-                        np.ix_(az_idx, [ei], fr_idx, [pol_idx])
-                    )[:, 0, :, 0]
-                    phase_degrees = np.rad2deg(np.angle(block))
-                    phase_degrees = np.where(np.isfinite(block), phase_degrees, np.nan)
-                    y = plot_common.circular_median_degrees(
-                        phase_degrees, axis=0
-                    )
-                else:
-                    block = dataset.rcs_power[np.ix_(az_idx, [ei], fr_idx, [pol_idx])][:, 0, :, 0]
-                    power = np.nanmedian(block, axis=0)
-                    y = _display_values(
-                        dataset,
-                        power,
-                        frequency=native_x,
-                        phase=False,
-                        scale=scale,
-                    )
-                elevation = float(
-                    plot_common.values_for_display(
-                        reference,
-                        dataset,
-                        "elevation",
-                        [dataset.elevations[ei]],
-                    )[0]
-                )
-                lines = axes.plot(
-                    np.asarray(x)[order],
-                    np.asarray(y)[order],
-                    linestyle="-",
-                    label=(
-                        f"{name} | {polarization}, "
-                        f"{plot_common.angular_axis_name(reference, 'elevation')} "
-                        f"{elevation:g} {plot_common.axis_unit(reference, 'elevation')}"
-                    ),
-                )
+            for x, y, label, key in sweep_analysis.iter_series(
+                name, dataset, reference, indices, sweep_axis=sweep_axis,
+                config=config, phase=phase, scale=scale,
+            ):
+                order = np.argsort(x)
+                lines = axes.plot(np.asarray(x)[order], np.asarray(y)[order], linestyle="-", label=label)
+                for line in lines:
+                    line._grim_trace_key = key
                 plotted_series.extend((line, dataset) for line in lines)
-        axes.set_xlabel(plot_common.axis_label(reference, "frequency"))
-        axes.set_ylabel(
-            _plot_response_label(reference, phase=phase, scale=scale, p50=True)
-        )
-
-    elif mode_key == "elevation_sweep":
-        for name, dataset, polarization in overlay_series:
-            indices = _plot_selection_indices(
-                reference,
-                dataset,
-                az_values,
-                el_values,
-                freq_values,
-                polarization,
-                native_axes=("azimuth", "elevation"),
-            )
-            if indices is None:
-                continue
-            az_idx, el_idx, fr_idx, pol_idx = indices
-            compatible_count += 1
-            native_x = np.asarray(dataset.elevations)[el_idx]
-            x = plot_common.values_for_display(
-                reference, dataset, "elevation", native_x
-            )
-            order = np.argsort(x)
-            for fi in fr_idx:
-                if phase:
-                    block = dataset.rcs_slice(
-                        np.ix_(az_idx, el_idx, [fi], [pol_idx])
-                    )[:, :, 0, 0]
-                    phase_degrees = np.rad2deg(np.angle(block))
-                    phase_degrees = np.where(np.isfinite(block), phase_degrees, np.nan)
-                    y = (
-                        plot_common.circular_median_degrees(
-                            phase_degrees, axis=0
-                        )
-                        if len(az_idx) > 1
-                        else phase_degrees[0]
-                    )
-                else:
-                    block = dataset.rcs_power[np.ix_(az_idx, el_idx, [fi], [pol_idx])][:, :, 0, 0]
-                    power = np.nanmedian(block, axis=0) if len(az_idx) > 1 else block[0]
-                    y = _display_values(dataset, power, frequency=dataset.frequencies[fi], phase=False, scale=scale)
-                frequency = float(
-                    plot_common.values_for_display(
-                        reference,
-                        dataset,
-                        "frequency",
-                        [dataset.frequencies[fi]],
-                    )[0]
-                )
-                lines = axes.plot(
-                    np.asarray(x)[order],
-                    np.asarray(y)[order],
-                    linestyle="-",
-                    label=(
-                        f"{name} | {polarization}, {frequency:g} "
-                        f"{plot_common.axis_unit(reference, 'frequency')}"
-                    ),
-                )
-                plotted_series.extend((line, dataset) for line in lines)
-        axes.set_xlabel(plot_common.axis_label(reference, "elevation"))
-        axes.set_ylabel(
-            _plot_response_label(
-                reference,
-                phase=phase,
-                scale=scale,
-                p50=len(az_values) > 1,
-            )
-        )
+        axes.set_xlabel(plot_common.axis_label(reference, sweep_axis))
+        response = _plot_response_label(reference, phase=phase, scale=scale)
+        tag = sweep_analysis.axis_tag(config, phase=phase) if mode_key == "frequency" or len(az_values) > 1 or config["mode"] != "median" else ""
+        axes.set_ylabel(response.replace(" (", tag + " (", 1))
 
     elif mode_key == "compare":
         if len(selected) != 2:
@@ -749,13 +797,13 @@ def plot_datasets(
             )
             for _, dataset in plotted_series
         }) > 1
-        axes.set_ylabel(_plot_response_label(
-            plotted_series[0][1], phase=False, scale=scale,
-            p50=mode_key == "frequency" or (
-                mode_key == "elevation_sweep" and len(az_values) > 1
-            ),
-            mixed_db=mixed_db,
-        ))
+        response = _plot_response_label(plotted_series[0][1], phase=False, scale=scale, mixed_db=mixed_db)
+        if mode_key in {"frequency", "elevation_sweep"}:
+            from GRIM_Backend.plotting import sweep_analysis
+            config = sweep_analysis.options(sweep_options)
+            tag = sweep_analysis.axis_tag(config) if mode_key == "frequency" or len(az_values) > 1 or config["mode"] != "median" else ""
+            response = response if mixed_db else response.replace(" (", tag + " (", 1)
+        axes.set_ylabel(response)
         if mixed_db:
             for line, dataset in plotted_series:
                 head, separator, tail = line.get_label().partition(" | ")

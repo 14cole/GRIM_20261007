@@ -55,10 +55,17 @@ class PlotMarkersMixin:
         ]
 
     @staticmethod
-    def _line_screen_points(line) -> np.ndarray:
+    def _marker_arrays(line):
+        native = getattr(line, "_grim_native_samples", None)
+        if native is not None and native.values is not None:
+            return native.values[0], native.values[1]
+        return np.asarray(line.get_xdata(), dtype=float), np.asarray(line.get_ydata(), dtype=float)
+
+    @staticmethod
+    def _line_screen_points(line, start=0, stop=None) -> np.ndarray:
+        xs, ys = PlotMarkersMixin._marker_arrays(line)
         xy = np.column_stack((
-            np.asarray(line.get_xdata(), dtype=float),
-            np.asarray(line.get_ydata(), dtype=float),
+            xs[start:stop], ys[start:stop],
         ))
         screen = np.full(xy.shape, np.nan)
         finite = np.all(np.isfinite(xy), axis=1)
@@ -69,13 +76,27 @@ class PlotMarkersMixin:
     def _nearest_line_point(self, lines, x_px, y_px):
         best = None
         for line in lines:
-            screen = self._line_screen_points(line)
-            distance = np.hypot(screen[:, 0] - x_px, screen[:, 1] - y_px)
-            if not np.any(np.isfinite(distance)):
-                continue
-            index = int(np.nanargmin(distance))
-            if best is None or distance[index] < best[0]:
-                best = (float(distance[index]), line, index)
+            xs, _ys = self._marker_arrays(line)
+            start, stop = 0, len(xs)
+            native = getattr(line, "_grim_native_samples", None)
+            if (native is not None and native.x_monotonic
+                    and getattr(line.axes, "name", "") != "polar"):
+                # Monotonic sweeps only need samples within the pixel snap
+                # radius; avoid scanning a whole large trace on each drag.
+                limits = line.get_transform().inverted().transform([
+                    [x_px - MARKER_SNAP_PIXELS, y_px],
+                    [x_px + MARKER_SNAP_PIXELS, y_px],
+                ])[:, 0]
+                start = max(0, int(np.searchsorted(xs, min(limits), side="left")) - 1)
+                stop = min(len(xs), int(np.searchsorted(xs, max(limits), side="right")) + 1)
+            for offset in range(start, stop, 16_384):
+                screen = self._line_screen_points(line, offset, min(stop, offset + 16_384))
+                distance = np.hypot(screen[:, 0] - x_px, screen[:, 1] - y_px)
+                if not np.any(np.isfinite(distance)):
+                    continue
+                index = int(np.nanargmin(distance))
+                if best is None or distance[index] < best[0]:
+                    best = (float(distance[index]), line, offset + index)
         return best
 
     def _marker_at_pixel(self, x_px, y_px):
@@ -95,7 +116,8 @@ class PlotMarkersMixin:
     def _marker_point(self, marker) -> tuple[float, float]:
         line = marker["line"]
         index = marker["index"]
-        return float(line.get_xdata()[index]), float(line.get_ydata()[index])
+        xs, ys = self._marker_arrays(line)
+        return float(xs[index]), float(ys[index])
 
     def _marker_display_x(self, ax, x: float) -> float:
         if getattr(ax, "name", "") != "polar":
@@ -122,6 +144,8 @@ class PlotMarkersMixin:
             f"x {x:.6g} {x_unit}".rstrip(),
             f"y {y:.6g} {y_unit}".rstrip(),
         ]
+        if getattr(marker["line"], "_grim_native_probe_unavailable", False):
+            lines.append("Displayed sample only; native snapshot unavailable")
         if first is not None and first is not marker and first["line"].axes is ax:
             first_x, first_y = self._marker_point(first)
             first_x = self._marker_display_x(ax, first_x)
@@ -186,6 +210,7 @@ class PlotMarkersMixin:
             "number": max((m["number"] for m in markers), default=0) + 1,
             "key": line._grim_dataset_key,
             "ordinal": same_key.index(line) if line in same_key else 0,
+            "trace_key": getattr(line, "_grim_trace_key", None),
             "line": line,
             "index": int(index),
         }
@@ -226,17 +251,35 @@ class PlotMarkersMixin:
             lines = self._marker_lines(marker["key"])
             if not lines:
                 continue
-            line = lines[min(marker["ordinal"], len(lines) - 1)]
-            xs = np.asarray(line.get_xdata(), dtype=float)
-            ys = np.asarray(line.get_ydata(), dtype=float)
-            distance = np.abs(xs - float(marker.get("x", np.nan)))
-            if getattr(line.axes, "name", "") == "polar":
-                distance = np.abs(np.angle(np.exp(1j * (xs - float(marker.get("x", 0.0))))))
-            distance = np.where(np.isfinite(xs) & np.isfinite(ys), distance, np.inf)
-            if not np.any(np.isfinite(distance)):
+            key = marker.get("trace_key")
+            matched = [line for line in lines if key is not None and getattr(line, "_grim_trace_key", None) == key]
+            if matched:
+                line = matched[0]
+            elif key is not None and len(lines) > 1:
+                # A removed trace must not silently attach to another
+                # frequency/polarization merely because its ordinal moved.
+                continue
+            else:
+                # Preserve single-curve scrubbing, and legacy band markers
+                # that have no semantic trace identity.
+                line = lines[min(marker["ordinal"], len(lines) - 1)]
+            xs, ys = self._marker_arrays(line)
+            best = None
+            for start in range(0, len(xs), 16_384):
+                chunk_x, chunk_y = xs[start:start + 16_384], ys[start:start + 16_384]
+                distance = np.abs(chunk_x - float(marker.get("x", np.nan)))
+                if getattr(line.axes, "name", "") == "polar":
+                    distance = np.abs(np.angle(np.exp(1j * (chunk_x - float(marker.get("x", 0.0))))))
+                distance = np.where(np.isfinite(chunk_x) & np.isfinite(chunk_y), distance, np.inf)
+                if distance.size:
+                    index = int(np.argmin(distance))
+                    if np.isfinite(distance[index]) and (best is None or distance[index] < best[0]):
+                        best = (float(distance[index]), start + index)
+            if best is None:
                 continue
             marker["line"] = line
-            marker["index"] = int(np.argmin(distance))
+            marker["trace_key"] = getattr(line, "_grim_trace_key", None)
+            marker["index"] = best[1]
             self._draw_marker(marker)
             kept.append(marker)
         self._plot_markers = kept
@@ -305,15 +348,22 @@ class PlotMarkersMixin:
         marker = getattr(self, "_active_marker", None)
         if marker is None or marker not in self._plot_marker_list():
             return False
-        ys = np.asarray(marker["line"].get_ydata(), dtype=float)
-        xs = np.asarray(marker["line"].get_xdata(), dtype=float)
-        valid = np.flatnonzero(np.isfinite(xs) & np.isfinite(ys))
-        if valid.size == 0:
-            return True
-        position = int(np.searchsorted(valid, marker["index"]))
-        step = (10 if key.startswith("shift+") else 1) * (1 if key.endswith("right") else -1)
-        position = int(np.clip(position + step, 0, valid.size - 1))
-        self._move_marker(marker, valid[position])
+        xs, ys = self._marker_arrays(marker["line"])
+        direction = 1 if key.endswith("right") else -1
+        remaining = 10 if key.startswith("shift+") else 1
+        position = marker["index"]
+        scan = position + direction
+        while remaining and 0 <= scan < len(xs):
+            begin, end = (scan, min(len(xs), scan + 4096)) if direction > 0 else (max(0, scan - 4095), scan + 1)
+            valid = np.flatnonzero(np.isfinite(xs[begin:end]) & np.isfinite(ys[begin:end])) + begin
+            if direction < 0:
+                valid = valid[::-1]
+            if valid.size:
+                taken = min(remaining, valid.size)
+                position = int(valid[taken - 1])
+                remaining -= taken
+            scan = end if direction > 0 else begin - 1
+        self._move_marker(marker, position)
         return True
 
     def _marker_context_menu(self, pos) -> bool:

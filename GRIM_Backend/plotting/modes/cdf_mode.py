@@ -1,9 +1,10 @@
 """Cumulative distribution (or exceedance) of levels over the selection.
 
-Each dataset/polarization contributes one curve pooled over every selected azimuth,
-elevation, and frequency. Samples are converted to the display scale one by
-one (so frequency-dependent dBke is exact) before ranking; a ranking is the
-same in dB or linear power, so no statistic is taken across unlike scales.
+Each dataset/polarization is kept separate. Optional band/sector groups and
+explicit coordinate-hull quadrature define each empirical population. Samples are converted to the display scale one by
+one before ranking, including frequency-dependent dBke conversion. Valid zero
+power stays in the population as -infinity on a logarithmic scale. For a
+frequency-dependent conversion the ranking can change; the population cannot.
 """
 
 from __future__ import annotations
@@ -12,22 +13,24 @@ import numpy as np
 
 from . import common
 from .azimuth_rect_mode import _plan_series
+from .. import distribution_analysis as distribution
+
+
+def _pooled_population(self, dataset, selection):
+    pop = distribution.population(dataset, selection, scale="linear" if self._plot_scale_is_linear() else "dbsm")
+    return pop["values"], pop["counts"]
 
 
 def _pooled_display(self, dataset, selection) -> np.ndarray:
-    az_indices, elev_indices, freq_indices, pol_indices = selection
-    power = dataset.rcs_power[np.ix_(az_indices, elev_indices, freq_indices, [pol_indices[0]])]
-    frequencies = np.asarray(dataset.frequencies[freq_indices], dtype=float)
-    display = self._display_from_values(
-        dataset, power[..., 0], frequency_value=frequencies[None, None, :]
-    )
-    display = np.asarray(display, dtype=float).ravel()
-    return np.sort(display[np.isfinite(display)])
+    return _pooled_population(self, dataset, selection)[0]
 
 
 def render(self) -> None:
     self.last_plot_mode = "cdf"
     self._start_plot_render()
+    controls = getattr(self, "analysis_controls", None)
+    if callable(getattr(controls, "set_cdf_results", None)):
+        controls.set_cdf_results("")
     datasets = self._selected_datasets()
     if not datasets:
         self.status.showMessage("Select a dataset before plotting.")
@@ -65,74 +68,74 @@ def render(self) -> None:
     except ValueError as exc:
         self.status.showMessage(f"Plot blocked: {exc}.")
         return
-    self._configure_line_budget(len(plans))
+    self._configure_line_budget(common.MAX_LINE_SERIES)
     if not self._prepare_line_plot_axes("cdf", "rectilinear", reference, datasets):
         return
 
     controls = getattr(self, "analysis_controls", None)
-    exceedance = bool(controls is not None and controls.cdf_exceedance())
+    config = distribution.owner_options(self)
+    exceedance = config["exceedance"]
     curves = []
-    low = high = None
+    omitted = 0
+    scale = "linear" if self._plot_scale_is_linear() else "dbsm"
     for name, dataset, selection in plans:
-        if len(curves) >= common.MAX_LINE_SERIES:
-            break
-        values = _pooled_display(self, dataset, selection)
-        count = values.size
-        if count == 0:
-            skipped.append(name)
-            continue
-        levels, counts = np.unique(values, return_counts=True)
-        # Tied observations jump together. Inclusive P(X >= v) is left-
-        # continuous: between v[i] and v[i+1], its height is P(X >= v[i+1]).
-        # Inclusive P(X <= v) is right-continuous instead.
-        cumulative = (np.cumsum(counts[::-1])[::-1] if exceedance
-                      else np.cumsum(counts))
-        percent = 100.0 * cumulative / count
-        pol_value = dataset.polarizations[selection[3][0]]
-        median = float(np.median(values))
-        unit = self._display_unit([(name, dataset)])
-        label = (
-            f"{name} | Pol {pol_value}, {len(selection[0])} az × {len(selection[1])} el × "
-            f"{len(selection[2])} freq, {count:,} samples, median {median:.4g} {unit}"
-        )
-        trace_key = (
-            "cdf", exceedance,
-            tuple(float(v) for v in dataset.azimuths[selection[0]]),
-            tuple(float(v) for v in dataset.elevations[selection[1]]),
-            tuple(float(v) for v in dataset.frequencies[selection[2]]),
-            str(pol_value),
-        )
-        curves.append((dataset, levels, percent, label, trace_key))
-        low = values[0] if low is None else min(low, values[0])
-        high = values[-1] if high is None else max(high, values[-1])
-
+        for group_selection, group_label in distribution.groups(
+            dataset, reference, selection, config, azimuths=az_values, frequencies=freq_values
+        ):
+            if len(curves) >= common.MAX_LINE_SERIES:
+                omitted += 1
+                continue
+            curve = distribution.prepare_curve(name, dataset, group_selection, group_label, config, scale=scale)
+            if curve is None:
+                skipped.append(f"{name} | {group_label}")
+            else:
+                curves.append(curve)
     if not curves:
         detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
         self._show_plot_status(f"No finite levels in the selected cuts.{detail}")
         return
-    pad = max(1.0e-9, 0.02 * (high - low))
-    for dataset, levels, percent, label, trace_key in curves:
-        # Draw the known tails too, including the single-level population.
-        # Every overlaid curve uses the same finite display bounds.
-        x = np.r_[low - pad, levels, high + pad]
-        y = np.r_[100.0 if exceedance else 0.0,
-                  percent, 0.0 if exceedance else 100.0]
-        self._plot_bounded_line(
-            self.plot_ax, x, y, label=label, dataset=dataset,
-            trace_key=trace_key, drawstyle="steps-pre" if exceedance else "steps-post",
+    self.plot_figure.set_layout_engine("constrained")
+    self.plot_figure._grim_analysis_constrained_layout = True
+    low, high = distribution.bounds(curves, config["threshold"] if config["threshold_enabled"] else None)
+    zero_notes = []
+    for curve in curves:
+        x, y = distribution.draw_values(curve, (low, high), exceedance=exceedance)
+        lines = self._plot_bounded_line(
+            self.plot_ax, x, y, label=curve["label"], dataset=curve["dataset"],
+            trace_key=curve["key"], drawstyle="steps-pre" if exceedance else "steps-post",
         )
-    if len(plans) > common.MAX_LINE_SERIES:
-        self._note_plot_render(
-            f"Displayed {common.MAX_LINE_SERIES} datasets; select fewer to show the rest."
-        )
-
+        for line in lines:
+            line._grim_cdf_population = curve["population"]["counts"]
+            line._grim_cdf_weight_coverage = curve["population"]["coverage"]
+            line._grim_cdf_threshold_lookup = curve["lookup"]
+        if np.any(np.isneginf(curve["levels"])):
+            population = curve["population"]
+            zero_percent = 100. * population["zero_weight"] / population["coverage"]
+            zero_notes.append(f"{population['counts']['zero']:,} zero samples ({zero_percent:g}% mass) at -∞ dB")
+    if zero_notes:
+        self._note_plot_render("Zero power retained in the probability denominator at -infinity dB.")
+        self.plot_ax.text(0.01, 0.02, "Zero power retained: " + "; ".join(zero_notes),
+                          transform=self.plot_ax.transAxes, fontsize=8,
+                          color=self._current_plot_text(), va="bottom",
+                          bbox={"facecolor": self._current_plot_bg(), "alpha": 0.85, "edgecolor": "none"})
+    if omitted:
+        self._note_plot_render(f"Displayed {len(curves)} groups; {omitted} further groups were not evaluated. Narrow the selection to show the rest.")
+    if config["weighting"] != "samples":
+        self._note_plot_render("CDF uses normalized trapezoidal weights over each selected group coordinate hull, including gaps; not dwell-time or solid angle.")
+    if config["threshold_enabled"]:
+        self.plot_ax.axvline(config["threshold"], color=self._current_plot_text(), linestyle=":", label="_CDF threshold")
+        low, high = min(low, config["threshold"]), max(high, config["threshold"])
+        self._note_plot_render("Inclusive threshold lookup and coverage are available in CDF Population / threshold.")
+    if callable(getattr(controls, "set_cdf_results", None)):
+        text = distribution.table_text(curves, config)
+        if omitted:
+            text += f"\n{omitted} groups omitted by the visible-series limit."
+        controls.set_cdf_results(text)
     self.plot_ax.set_xlabel(self._display_axis_label(datasets))
-    self.plot_ax.set_ylabel(
-        "Samples at or above level (%)" if exceedance else "Samples at or below level (%)"
-    )
+    self.plot_ax.set_ylabel(distribution.y_label(config))
     self._update_legend_visibility()
     for spin, value in (
-        (self.spin_plot_xmin, low - pad), (self.spin_plot_xmax, high + pad),
+        (self.spin_plot_xmin, low), (self.spin_plot_xmax, high),
         (self.spin_plot_ymin, 0.0), (self.spin_plot_ymax, 100.0),
     ):
         spin.blockSignals(True)

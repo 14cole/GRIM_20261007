@@ -129,8 +129,16 @@ class MixedDbPlotTests(unittest.TestCase):
         for line, unit, offset in zip(owner.plot_ax.lines, ("dBsm", "dBke"), (
             0.0, 10.0 * np.log10(2.0 * np.pi * 9.0e9 / 299_792_458.0)
         )):
-            np.testing.assert_allclose(line.get_xdata(), 10.0 * np.log10(np.arange(1.0, 6.0)) + offset)
+            expected = 10.0 * np.log10(np.arange(1.0, 6.0)) + offset
+            # The outer knots draw shared finite tails; only interior knots
+            # represent the samples in this dataset's native dB units.
+            np.testing.assert_allclose(line.get_xdata()[1:-1], expected)
+            self.assertLess(line.get_xdata()[0], expected[0])
+            self.assertGreater(line.get_xdata()[-1], expected[-1])
+            np.testing.assert_allclose(line.get_ydata(), [0, 20, 40, 60, 80, 100, 100])
             self.assertIn(f"median {10.0 * np.log10(3.0) + offset:.4g} {unit}", line.get_label())
+        np.testing.assert_array_equal(owner.plot_ax.lines[0].get_xdata()[[0, -1]],
+                                      owner.plot_ax.lines[1].get_xdata()[[0, -1]])
 
     def test_sector_table_keeps_each_rows_native_unit(self):
         owner = self.harness()

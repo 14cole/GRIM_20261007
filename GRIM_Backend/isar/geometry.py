@@ -99,6 +99,69 @@ def reduced_axis_edges(axis, max_side):
     return np.r_[axis[np.arange(0, len(axis), stride)] - step/2, axis[-1] + step/2]
 
 
+def pool_image_peaks(image, row_stride, column_blocks):
+    """Pool (row, column) pixels and retain each maximum's native indices.
+
+    Scratch contains one column block, never a second full source image.
+    A None column block is an unmeasured gap. Unknown-only blocks stay NaN.
+    """
+    image = np.asanyarray(image)
+    rows = (image.shape[0] + row_stride - 1) // row_stride
+    shape = (rows, len(column_blocks))
+    values = np.full(shape, np.nan, dtype=image.dtype)
+    row_indices = np.full(shape, -1, dtype=np.int32)
+    column_indices = np.full(shape, -1, dtype=np.int32)
+    for column, bounds in enumerate(column_blocks):
+        if bounds is None:
+            continue
+        start, stop = bounds
+        width = stop - start
+        block = image[:, start:stop]
+        scratch = np.full((rows * row_stride, width), -np.inf, dtype=image.dtype)
+        valid = np.isfinite(np.ma.getdata(block)) & ~np.ma.getmaskarray(block)
+        np.copyto(scratch[:image.shape[0]], np.ma.getdata(block), where=valid)
+        flat = scratch.reshape(rows, row_stride * width)
+        peak = np.argmax(flat, axis=1)
+        maximum = flat[np.arange(rows), peak]
+        known = np.isfinite(maximum)
+        values[known, column] = maximum[known]
+        row_indices[known, column] = (np.arange(rows) * row_stride + peak // width)[known]
+        column_indices[known, column] = (start + peak % width)[known]
+    return values, row_indices, column_indices
+
+
+def attach_block_peak_probe(artist, x_edges, y_edges, x_axis, y_axis, x_indices, y_indices):
+    """Attach bounded overview probes without retaining full numerical pixels."""
+    x_edges, y_edges = np.asarray(x_edges), np.asarray(y_edges)
+    x_axis, y_axis = np.asarray(x_axis), np.asarray(y_axis)
+    x_indices, y_indices = np.asarray(x_indices), np.asarray(y_indices)
+
+    def cell(edges, value):
+        if value is None:
+            return None
+        sign = 1 if edges[-1] > edges[0] else -1
+        ordered, coordinate = edges * sign, value * sign
+        if not np.isfinite(coordinate) or coordinate < ordered[0] or coordinate > ordered[-1]:
+            return None
+        return min(len(edges) - 2, int(np.searchsorted(ordered, coordinate, side="right")) - 1)
+
+    def probe(x, y):
+        column, row = cell(x_edges, x), cell(y_edges, y)
+        if column is None or row is None:
+            return None
+        ix, iy = int(x_indices[row, column]), int(y_indices[row, column])
+        if ix < 0 or iy < 0:
+            return None
+        values = np.ma.asarray(artist.get_array()).reshape(x_indices.shape)
+        value = values[row, column]
+        if np.ma.is_masked(value) or not np.isfinite(value):
+            return None
+        return float(x_axis[ix]), float(y_axis[iy]), float(value)
+
+    artist._grim_native_probe = probe
+    artist._grim_display_reduced = True
+
+
 def draw_image(ax, band, display, **options):
     """Use a mesh only when display pooling leaves unequal cell widths."""
     x, y = band.get('display_x_edges'), band.get('display_y_edges')

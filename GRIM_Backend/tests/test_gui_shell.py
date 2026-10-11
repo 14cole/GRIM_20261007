@@ -392,7 +392,7 @@ class UnifiedGuiShellTest(unittest.TestCase):
         quality_categories = [
             label
             for label in self.window.findChildren(QLabel)
-            if label.objectName() == "opsCategory" and label.text() == "Quality"
+            if label.objectName() == "opsCategory" and label.text() == "Calibration, Geometry & Quality"
         ]
         self.assertEqual(len(quality_buttons), 3)
         self.assertEqual(len(quality_categories), 1)

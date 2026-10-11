@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import math
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -13,6 +14,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QSlider,
     QToolButton,
+    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout,
+    QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from GRIM_Backend.plotting.modes import common
@@ -34,7 +37,7 @@ class PlotAnalysisControls(QObject):
     """PBP band, CDF, sector-statistics, and range-frequency settings.
 
     ``changed`` carries which feature changed ("pbp", "cdf", "sector",
-    "range") so only the matching plot type re-renders.
+    "range", "sweep") so only the matching plot type re-renders.
     """
 
     changed = Signal(str)
@@ -55,6 +58,27 @@ class PlotAnalysisControls(QObject):
         self.combo_cdf = QComboBox()
         self.combo_cdf.addItem("Cumulative: samples at or below level", "cdf")
         self.combo_cdf.addItem("Exceedance: samples at or above level", "exceedance")
+
+        self.combo_sweep_aggregation = QComboBox()
+        for text, key in (("Individual azimuth cuts", "individual"),
+                          ("Mean linear power", "mean"), ("Median (P50)", "median"),
+                          ("Percentile of linear power", "percentile"), ("Worst case (maximum)", "max")):
+            self.combo_sweep_aggregation.addItem(text, key)
+        self.combo_sweep_aggregation.setCurrentIndex(self.combo_sweep_aggregation.findData("median"))
+        self.combo_sweep_aggregation.setToolTip(
+            "Frequency and Elevation Sweep reduce the selected azimuths at each point. "
+            "Mean/median/percentile/max use valid linear power, including zero, before dB conversion. "
+            "Individual cuts keep every azimuth separate. Legend n is valid/selected azimuth samples per point (a range when coverage varies). These are sample statistics, not coherent-field averages. "
+            "In Phase, mean/median are circular; percentile/max show the phase of the nearest-rank/strongest power observation."
+        )
+        self.spin_sweep_percentile = _percent_spin(90., "Percentile across the selected azimuth samples, in linear power.")
+        self.combo_sweep_aggregation.currentIndexChanged.connect(self._sweep_changed)
+        self.spin_sweep_percentile.valueChanged.connect(lambda: self.changed.emit("sweep"))
+        self._sweep_changed(emit=False)
+
+        self.btn_cdf_settings = QPushButton("Population / threshold…")
+        self._build_cdf_dialog(parent)
+        self.btn_cdf_settings.clicked.connect(self._show_cdf_dialog)
 
         self._sector_text = "30"
         self._sector_statistic = "mean"
@@ -89,15 +113,16 @@ class PlotAnalysisControls(QObject):
         self.combo_range_unit.currentIndexChanged.connect(lambda: self.changed.emit("range"))
         self.spin_pbp_low.valueChanged.connect(self._pbp_low_changed)
         self.spin_pbp_high.valueChanged.connect(self._pbp_high_changed)
-        self.combo_cdf.currentIndexChanged.connect(lambda: self.changed.emit("cdf"))
+        self.combo_cdf.currentIndexChanged.connect(self._cdf_options_changed)
         self._pbp_band_changed(emit=False)
 
     def add_rows(self, grid, row: int) -> int:
         """Add labelled rows to the Plot Settings grid; returns the next row."""
         rows = (
+            (("Sweep statistic", self.combo_sweep_aggregation), ("Sweep percentile", self.spin_sweep_percentile)),
             (("PbP Band", self.combo_pbp_band), ("Lower", self.spin_pbp_low),
              ("Upper", self.spin_pbp_high)),
-            (("CDF", self.combo_cdf),),
+            (("CDF", self.combo_cdf), ("Details", self.btn_cdf_settings)),
             (("Range–Freq Sub-band", self.spin_range_subband),
              ("Window", self.combo_range_window), ("Range Unit", self.combo_range_unit)),
         )
@@ -123,6 +148,138 @@ class PlotAnalysisControls(QObject):
 
     def cdf_exceedance(self) -> bool:
         return self.combo_cdf.currentData() == "exceedance"
+
+    def _sweep_changed(self, *_args, emit=True):
+        self.spin_sweep_percentile.setEnabled(self.combo_sweep_aggregation.currentData() == "percentile")
+        if emit:
+            self.changed.emit("sweep")
+
+    def sweep_aggregation(self):
+        return {"mode": self.combo_sweep_aggregation.currentData(),
+                "percentile": float(self.spin_sweep_percentile.value())}
+
+    def _build_cdf_dialog(self, parent):
+        self.cdf_dialog = QDialog(parent if isinstance(parent, QWidget) else None)
+        self.cdf_dialog.setWindowTitle("CDF population and threshold lookup")
+        self.cdf_dialog.resize(840, 580)
+        layout = QVBoxLayout(self.cdf_dialog)
+        definition = QLabel(
+            "Each dataset/run and polarization remains a separate population. Bands and sectors subdivide "
+            "the selected coordinates; no runs or unlike units are pooled. Valid zero power remains included; "
+            "missing, nonfinite and negative power is excluded.\n\n"
+            "Equal samples gives every observation one vote. Quadrature weights approximate uniform measure "
+            "over each group's selected coordinate hull (trapezoidal endpoint weights). This can bridge "
+            "unsampled gaps; it is not a dwell-time, solid-angle or independent-trial probability. "
+            "Singleton axes have unit weight. Coverage reports valid weight / selected weight."
+        )
+        definition.setWordWrap(True)
+        layout.addWidget(definition)
+        form = QFormLayout()
+        self.combo_cdf_grouping = QComboBox()
+        for text, key in (("Per run: all selected coordinates", "run"),
+                          ("Per run and frequency band", "band"),
+                          ("Per run and azimuth sector", "sector"),
+                          ("Per run, frequency band and sector", "band_sector")):
+            self.combo_cdf_grouping.addItem(text, key)
+        form.addRow("Groups", self.combo_cdf_grouping)
+        self.spin_cdf_bands = QSpinBox()
+        self.spin_cdf_bands.setRange(1, 1000)
+        self.spin_cdf_bands.setValue(4)
+        self.spin_cdf_bands.setToolTip("Equal-width frequency bands across the selected reference-frequency extent; final band includes its upper edge.")
+        form.addRow("Frequency bands", self.spin_cdf_bands)
+        self.spin_cdf_sector_width = QDoubleSpinBox()
+        self.spin_cdf_sector_width.setRange(.1, 360.)
+        self.spin_cdf_sector_width.setDecimals(3)
+        self.spin_cdf_sector_width.setValue(30.)
+        self.spin_cdf_sector_width.setSuffix(" deg")
+        self.spin_cdf_sector_width.setToolTip("Sector width measured from the lowest selected reference azimuth. Angular units are converted explicitly.")
+        form.addRow("Azimuth sector width", self.spin_cdf_sector_width)
+        self.combo_cdf_weighting = QComboBox()
+        for text, key in (("Equal samples", "samples"), ("Uniform azimuth measure", "azimuth"),
+                          ("Uniform frequency measure", "frequency"),
+                          ("Uniform azimuth × frequency measure", "azimuth_frequency"),
+                          ("Uniform azimuth × elevation × frequency measure", "all_axes")):
+            self.combo_cdf_weighting.addItem(text, key)
+        form.addRow("Weighting", self.combo_cdf_weighting)
+        self.chk_cdf_threshold = QCheckBox("Show threshold and lookup results")
+        form.addRow(self.chk_cdf_threshold)
+        self.spin_cdf_threshold = QDoubleSpinBox()
+        self.spin_cdf_threshold.setRange(-1.e12, 1.e12)
+        self.spin_cdf_threshold.setDecimals(9)
+        self.spin_cdf_threshold.setKeyboardTracking(False)
+        self.spin_cdf_threshold.setToolTip("Numeric threshold in each curve's displayed unit. The table identifies that unit; mixed dB conventions are not physically interchangeable.")
+        form.addRow("Threshold (current display unit)", self.spin_cdf_threshold)
+        layout.addLayout(form)
+        self.cdf_results = QPlainTextEdit()
+        self.cdf_results.setReadOnly(True)
+        self.cdf_results.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.cdf_results.setPlaceholderText("Plot a CDF to inspect population coverage and inclusive threshold probabilities.")
+        layout.addWidget(self.cdf_results, 1)
+        copy = QPushButton("Copy lookup table")
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(self.cdf_results.toPlainText()))
+        layout.addWidget(copy)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.cdf_dialog.hide)
+        layout.addWidget(buttons)
+        for widget in (self.combo_cdf_grouping, self.combo_cdf_weighting):
+            widget.currentIndexChanged.connect(self._cdf_options_changed)
+        for widget in (self.spin_cdf_bands, self.spin_cdf_sector_width, self.spin_cdf_threshold):
+            widget.valueChanged.connect(self._cdf_options_changed)
+        self.chk_cdf_threshold.toggled.connect(self._cdf_options_changed)
+        self._cdf_options_changed(emit=False)
+
+    def _show_cdf_dialog(self):
+        self.cdf_dialog.show()
+        self.cdf_dialog.raise_()
+
+    def _cdf_options_changed(self, *_args, emit=True):
+        self.cdf_results.clear()
+        grouping = self.combo_cdf_grouping.currentData()
+        self.spin_cdf_bands.setEnabled(grouping in ("band", "band_sector"))
+        self.spin_cdf_sector_width.setEnabled(grouping in ("sector", "band_sector"))
+        self.spin_cdf_threshold.setEnabled(self.chk_cdf_threshold.isChecked())
+        if emit:
+            self.changed.emit("cdf")
+
+    def cdf_options(self):
+        return {"exceedance": self.cdf_exceedance(), "grouping": self.combo_cdf_grouping.currentData(),
+                "band_count": self.spin_cdf_bands.value(), "sector_width_deg": self.spin_cdf_sector_width.value(),
+                "weighting": self.combo_cdf_weighting.currentData(),
+                "threshold_enabled": self.chk_cdf_threshold.isChecked(), "threshold": self.spin_cdf_threshold.value()}
+
+    def set_cdf_results(self, text):
+        self.cdf_results.setPlainText(str(text))
+
+    def analysis_options(self):
+        return {"sweep": self.sweep_aggregation(), "cdf": self.cdf_options()}
+
+    def restore_analysis_options(self, options):
+        options = options if isinstance(options, dict) else {}
+        sweep, cdf = options.get("sweep", {}), options.get("cdf", {})
+        sweep = sweep if isinstance(sweep, dict) else {}
+        cdf = cdf if isinstance(cdf, dict) else {}
+        def number(mapping, key, default):
+            try:
+                value = float(mapping.get(key, default))
+                return value if math.isfinite(value) else default
+            except (ValueError, TypeError, OverflowError):
+                return default
+        blocked = self.blockSignals(True)
+        try:
+            for widget, value in ((self.combo_sweep_aggregation, sweep.get("mode", "median")),
+                                  (self.combo_cdf, "exceedance" if cdf.get("exceedance", False) else "cdf"),
+                                  (self.combo_cdf_grouping, cdf.get("grouping", "run")),
+                                  (self.combo_cdf_weighting, cdf.get("weighting", "samples"))):
+                index = widget.findData(value)
+                if index >= 0:
+                    widget.setCurrentIndex(index)
+            self.spin_sweep_percentile.setValue(number(sweep, "percentile", 90.))
+            self.spin_cdf_bands.setValue(int(number(cdf, "band_count", 4)))
+            self.spin_cdf_sector_width.setValue(number(cdf, "sector_width_deg", 30.))
+            self.chk_cdf_threshold.setChecked(bool(cdf.get("threshold_enabled", False)))
+            self.spin_cdf_threshold.setValue(number(cdf, "threshold", 0.))
+        finally:
+            self.blockSignals(blocked)
 
     def sector_text(self, unit: str | None = None) -> str:
         """Return the definition in the requested azimuth units."""

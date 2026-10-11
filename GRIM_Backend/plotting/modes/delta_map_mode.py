@@ -236,6 +236,7 @@ def render(self):
         blocked(str(exc))
         return
     self._remove_colorbar()
+    self._release_native_plot_samples()
     self.plot_figure.clear()
     self.plot_ax = self.plot_figure.add_subplot(111)
     self.plot_axes = None

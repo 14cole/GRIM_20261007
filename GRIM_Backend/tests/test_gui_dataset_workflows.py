@@ -524,6 +524,48 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
         self.assertIn("decimate_axis(", self.window.python_recorder.script)
         self.assertIn("axis='azimuth'", self.window.python_recorder.script)
 
+    def test_decimate_drop_tail_button_records_explicit_choice(self) -> None:
+        source = RcsGrid([0.], [0.], 8. + .1 * np.arange(26), ["HH"],
+                         rcs=np.ones((1, 1, 26, 1), dtype=complex),
+                         units={"frequency": "GHz"})
+        self.window._add_dataset_row(source, "Sweep", "Loaded", os.path.abspath("sweep.grim"))
+        self._select_rows_in_order(0)
+        with mock.patch("GRIM_Backend.ui.dataset_actions.DecimateDialog") as dialog_type:
+            dialog_type.return_value.exec.return_value = QDialog.Accepted
+            dialog_type.return_value.get_params.return_value = {
+                "axis": "frequency", "factor": 3, "mode": "coherent", "partial": "drop"}
+            self.window._decimate_selected()
+            self._wait_for_background()
+        result = self.window.table.item(1, 0).data(Qt.UserRole)
+        self.assertEqual(len(result.frequencies), 8)
+        np.testing.assert_allclose(np.diff(result.frequencies), .3)
+        self.assertIn("partial='drop'", self.window.python_recorder.script)
+        self.assertIn("Explicitly discarded 2", self.window.status.currentMessage())
+
+    def test_regrid_gap_policy_converts_each_native_unit_and_records_recipe(self) -> None:
+        for unit, scale in (("Hz", 1e9), ("GHz", 1.)):
+            source = RcsGrid([0.], [0.], np.asarray([8., 9., 12., 13.]) * scale, ["HH"],
+                             rcs=np.ones((1, 1, 4, 1), dtype=complex), units={"frequency": unit})
+            self.window._add_dataset_row(source, unit, "Loaded", os.path.abspath(f"gap-{unit}.grim"))
+        self._select_rows_in_order(0, 1)
+        with mock.patch("GRIM_Backend.ui.dataset_actions.RegridDialog") as dialog_type:
+            dialog_type.return_value.exec.return_value = QDialog.Accepted
+            dialog_type.return_value.get_params.return_value = {
+                "axis": "frequency", "start": 8., "stop": 13., "step": .5,
+                "unit": "GHz", "max_gap": 1.1, "support": "interpolate"}
+            self.window._interpolate_selected()
+            self._wait_for_background()
+        for row, expected_gap in ((2, 1.1e9), (3, 1.1)):
+            result = self.window.table.item(row, 0).data(Qt.UserRole)
+            report = json.loads(result.extra["regrid_support_json"])
+            self.assertEqual(report["excluded_coordinate_count"], 5)
+            self.assertAlmostEqual(report["maximum_gap"], expected_gap)
+            self.assertEqual(np.count_nonzero(np.isfinite(result.rcs_power)), 6)
+        script = self.window.python_recorder.script
+        self.assertIn("max_gap=1100000000.0", script)
+        self.assertIn("max_gap=1.1", script)
+        self.assertIn("support='interpolate'", script)
+
     def test_coherent_missing_metadata_proceeds_without_confirmation(self) -> None:
         dataset = _axis_grid([0.0], 1.0)
         with mock.patch(

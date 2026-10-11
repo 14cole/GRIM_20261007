@@ -1,3 +1,4 @@
+"""Heatmaps of any pair of measured RF axes; retains the waterfall recipe key."""
 from __future__ import annotations
 
 import numpy as np
@@ -6,6 +7,7 @@ from . import common
 
 
 def render(self) -> None:
+    from GRIM_Backend.plotting.image_analysis import AXES, AXIS_ATTRIBUTES, ImageRecord, heatmap_display_plane, compact_metadata
     self.last_plot_mode = "waterfall"
     self._start_plot_render()
     datasets = self._selected_datasets()
@@ -15,264 +17,170 @@ def render(self) -> None:
     reference = self._preflight_plot_datasets(datasets)
     if reference is None:
         return
-
-    az_values = np.asarray(sorted(self._selected_values(self.list_az)), dtype=float)
-    if az_values.size == 0:
-        self.status.showMessage("Select one or more azimuths to plot.")
+    controls = getattr(self, "image_analysis_controls", None)
+    x_axis, y_axis = controls.axes() if controls is not None else ("azimuth", "frequency")
+    if x_axis not in AXES or y_axis not in AXES or x_axis == y_axis:
+        self.status.showMessage("Choose two different waterfall axes.")
         return
-    freq_values = np.asarray(sorted(self._selected_values(self.list_freq)), dtype=float)
-    if freq_values.size == 0:
-        self.status.showMessage("Select one or more frequencies to plot.")
+    remaining = next(axis for axis in AXES if axis not in (x_axis, y_axis))
+    aggregate = controls is not None and controls.aggregation() == "mean_power"
+    show_cuts = controls is not None and controls.linked_cuts()
+    selected = {}
+    for axis, widget in (("azimuth", self.list_az), ("elevation", self.list_elev), ("frequency", self.list_freq)):
+        selected[axis] = np.asarray(sorted(self._selected_values(widget)), float)
+        if not selected[axis].size:
+            self.status.showMessage(f"Select one or more {axis} values to plot.")
+            return
+    pol_values = self._selected_values(self.list_pol)
+    if not len(pol_values):
+        self.status.showMessage("Select one or more polarizations to plot.")
         return
-    elev_values = np.asarray(sorted(self._selected_values(self.list_elev)), dtype=float)
-    if elev_values.size == 0:
-        self.status.showMessage("Select one or more elevations to plot.")
-        return
-    polarization = self._single_selection_value(self.list_pol, "polarization")
-    if polarization is None:
-        return
-
-    phase_mode = self._button_checked(self.btn_phase)
-    skipped: list[str] = []
-    plans = []
-    panel_count = 0
-    peak_slice_cells = 0
-    total_source_cells = 0
-    total_display_cells = 0
-    for dataset_name, dataset in datasets:
-        az_indices = self._axis_selection_for_dataset(
-            reference, dataset, "azimuth", az_values
-        )
-        freq_indices = self._axis_selection_for_dataset(
-            reference, dataset, "frequency", freq_values
-        )
-        elev_indices = self._axis_selection_for_dataset(
-            reference, dataset, "elevation", elev_values
-        )
-        pol_indices = self._indices_for_values(dataset.polarizations, [polarization], tol=0.0)
-        if any(value is None for value in (az_indices, freq_indices, elev_indices, pol_indices)):
-            skipped.append(dataset_name)
+    phase = self._button_checked(self.btn_phase)
+    plans, skipped = [], []
+    total_source = total_display = panel_count = peak_cells = 0
+    for name, dataset in datasets:
+        indices = {axis: self._axis_selection_for_dataset(reference, dataset, axis, selected[axis]) for axis in AXES}
+        if any(ids is None for ids in indices.values()):
+            skipped.append(name)
             continue
-        panel_count += len(elev_indices)
-        if panel_count > common.MAX_WATERFALL_PANELS:
-            self.status.showMessage(
-                f"Waterfall blocked: selection would create more than "
-                f"{common.MAX_WATERFALL_PANELS} panels. Select fewer datasets or "
-                "elevations."
-            )
+        cells = len(indices[x_axis]) * len(indices[y_axis])
+        peak_cells = max(peak_cells, cells * (len(indices[remaining]) if aggregate else 1))
+        for pol in pol_values:
+            pol_ids = self._indices_for_values(dataset.polarizations, [pol], tol=0.)
+            if pol_ids is None:
+                skipped.append(f"{name}/{pol}")
+                continue
+            count = 1 if aggregate else len(indices[remaining])
+            panel_count += count
+            total_source += cells * len(indices[remaining])
+            total_display += common.bounded_image_cell_count(len(indices[x_axis]), len(indices[y_axis])) * count
+            plans.append((name, dataset, indices, pol_ids))
+        if phase and common.image_requires_decimation(len(indices[x_axis]), len(indices[y_axis])):
+            self.status.showMessage("Phase waterfall blocked: scalar peak reduction would distort phase. Narrow the selected waterfall axes.")
             return
-        slice_cells = len(az_indices) * len(freq_indices)
-        peak_slice_cells = max(peak_slice_cells, slice_cells)
-        total_source_cells += slice_cells * len(elev_indices)
-        panel_display_cells = common.bounded_image_cell_count(
-            len(az_indices), len(freq_indices)
-        )
-        total_display_cells += panel_display_cells * len(elev_indices)
-        if phase_mode and common.image_requires_decimation(
-            len(az_indices), len(freq_indices)
-        ):
-            self.status.showMessage(
-                "Phase waterfall blocked: the selected image exceeds the interactive "
-                "display limit, and scalar peak decimation would distort wrapped phase. "
-                "Narrow the selected azimuth or frequency axes and plot again."
-            )
-            return
-        plans.append(
-            (dataset_name, dataset, az_indices, freq_indices, elev_indices, pol_indices)
-        )
-
     if not plans:
-        detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
-        self._show_plot_status(
-            "No compatible data for the selected waterfall axes and polarization."
-            f"{detail}"
-        )
+        self._show_plot_status("No compatible selected data for this waterfall. " + ", ".join(skipped))
         return
     try:
-        common.validate_synchronous_plot_workload(
-            operation="Waterfall plot",
-            peak_slice_cells=peak_slice_cells,
-            total_cells=total_source_cells,
-        )
-        common.validate_aggregate_image_cells(
-            total_display_cells,
-            panel_count=panel_count,
-            operation="Waterfall plot",
-        )
+        if panel_count > common.MAX_WATERFALL_PANELS:
+            raise ValueError(f"selection creates {panel_count} panels; select fewer cuts or use mean aggregation")
+        common.validate_synchronous_plot_workload(operation="Waterfall", peak_slice_cells=peak_cells, total_cells=total_source)
+        common.validate_aggregate_image_cells(total_display, panel_count=panel_count, operation="Waterfall")
     except ValueError as exc:
         self.status.showMessage(f"Plot blocked: {exc}.")
         return
-
-    panel_data: list[dict[str, object]] = []
-    for dataset_name, dataset, az_indices, freq_indices, elev_indices, pol_indices in plans:
-        display_azimuths = self._plot_axis_values(
-            reference, dataset, "azimuth", dataset.azimuths[az_indices]
-        )
-        native_frequencies = np.asarray(dataset.frequencies[freq_indices], dtype=float)
-        display_frequencies = self._plot_axis_values(
-            reference, dataset, "frequency", native_frequencies
-        )
-        for elev_idx in elev_indices:
-            native_elevation = float(dataset.elevations[elev_idx])
-            display_elevation = float(
-                self._plot_axis_values(
-                    reference, dataset, "elevation", [native_elevation]
-                )[0]
-            )
-            if phase_mode:
-                raw = dataset.rcs_slice(
-                    np.ix_(az_indices, [elev_idx], freq_indices, [pol_indices[0]])
-                )[:, 0, :, 0]
-            else:
-                raw = dataset.rcs_power[
-                    np.ix_(az_indices, [elev_idx], freq_indices, [pol_indices[0]])
-                ][:, 0, :, 0]
-            display = self._display_from_values(
-                dataset,
-                raw,
-                frequency_value=native_frequencies.reshape(1, -1),
-            )
+    panels = []
+    for name, dataset, indices, pol_ids in plans:
+        nx = np.asarray(getattr(dataset, AXIS_ATTRIBUTES[x_axis])[indices[x_axis]])
+        ny = np.asarray(getattr(dataset, AXIS_ATTRIBUTES[y_axis])[indices[y_axis]])
+        x = self._plot_axis_values(reference, dataset, x_axis, nx)
+        y = self._plot_axis_values(reference, dataset, y_axis, ny)
+        for cut_index in ([None] if aggregate else indices[remaining]):
+            native_ids = [indices[axis] for axis in AXES] + [pol_ids]
+            display = heatmap_display_plane(dataset,native_ids,x_axis,y_axis,
+                remaining_index=cut_index,phase=phase,linear=self._plot_scale_is_linear())
             display = np.where(np.isfinite(display), display, np.nan)
             if not np.any(np.isfinite(display)):
                 continue
-            bounded_az, bounded_freq, bounded_display = self._bounded_plot_image(
-                display_azimuths, display_frequencies, display
-            )
-            panel_data.append(
-                {
-                    "dataset_name": dataset_name,
-                    "dataset": dataset,
-                    "display_unit": self._display_unit([(dataset_name, dataset)]),
-                    "elevation": display_elevation,
-                    "azimuths": bounded_az,
-                    "frequencies": bounded_freq,
-                    "display": bounded_display,
-                }
-            )
-
-    if not panel_data:
-        detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
-        self._show_plot_status(
-            "No compatible data for the selected waterfall axes and polarization."
-            f"{detail}"
-        )
+            bx, by, bd = self._bounded_plot_image(x, y, display)
+            snapshot = self._native_image_snapshot(x, y, display, reduced=bd.shape != display.shape)
+            remaining_values = getattr(dataset, AXIS_ATTRIBUTES[remaining])[indices[remaining]]
+            unit = self._plot_axis_unit(reference, remaining)
+            label = (f"{'Circular phase mean' if phase else 'Mean linear display quantity'} over {len(remaining_values)} {remaining} samples"
+                     if aggregate else f"{remaining.capitalize()} {self._plot_axis_values(reference, dataset, remaining, [getattr(dataset, AXIS_ATTRIBUTES[remaining])[cut_index]])[0]:g} {unit}")
+            title = f"{name} | Pol {dataset.polarizations[pol_ids[0]]} | {label} | {self._display_unit([(name,dataset)])}"
+            short_label = f"Mean {remaining} (n={len(remaining_values)})" if aggregate else label
+            panels.append(dict(name=title, short_title=f"{name[:20]} | {dataset.polarizations[pol_ids[0]]}\n{short_label} | {self._display_unit([(name,dataset)])}",dataset=dataset, x=bx, y=by, display=bd, snapshot=snapshot,
+                native_x=x, native_y=y,
+                metadata={"kind": "heatmap", "source_name":name, "polarization": str(dataset.polarizations[pol_ids[0]]),
+                    "frequency_aggregation":bool(aggregate and remaining == "frequency"),
+                    "remaining_selection": (remaining, "mean" if aggregate else float(getattr(dataset, AXIS_ATTRIBUTES[remaining])[cut_index]), common.axis_unit(dataset, remaining)),
+                    "coordinate_system": dataset.units.get("angular_coordinate_system", ""),
+                    "source_units": compact_metadata(dataset.units), "source_metadata": compact_metadata(dataset.extra),
+                    "frequency_values_hz": np.asarray(dataset._frequency_value_to_hz(dataset.frequencies[indices['frequency']])).tolist()}))
+    if not panels:
+        self._show_plot_status("No finite selected samples for this waterfall.")
         return
-
+    old_cuts = getattr(self.plot_figure, "_grim_linked_cuts", None)
+    if old_cuts is not None:
+        old_cuts.disconnect()
     self._remove_colorbar()
+    self._release_native_plot_samples()
     self.plot_figure.clear()
-    axes = self.plot_figure.subplots(
-        nrows=len(panel_data), ncols=1, sharex=False, sharey=False
-    )
-    if len(panel_data) == 1:
-        axes = [axes]
-    self.plot_axes = list(axes)
-    self.plot_ax = self.plot_axes[0]
     self.plot_figure.set_facecolor(self._current_plot_bg())
-    for ax in self.plot_axes:
+    self.plot_figure.set_layout_engine("constrained")
+    cut_axes = []
+    if show_cuts:
+        # Shared cut axes compare all panels without tripling the number of
+        # plot rows. Two image panels remain legible on a laptop canvas.
+        outer = self.plot_figure.add_gridspec(2,1,height_ratios=[3,1.35])
+        columns = min(3,len(panels))
+        images = outer[0].subgridspec(int(np.ceil(len(panels)/columns)),columns)
+        axes = [self.plot_figure.add_subplot(images[i//columns,i%columns]) for i in range(len(panels))]
+        cuts_grid = outer[1].subgridspec(1,2,width_ratios=[3,1])
+        horizontal = self.plot_figure.add_subplot(cuts_grid[0],sharex=axes[0])
+        vertical = self.plot_figure.add_subplot(cuts_grid[1],sharey=axes[0])
+        for ax in (horizontal,vertical):
+            self._style_axes(ax)
+            ax.tick_params(labelsize=7)
+        cut_axes = [(horizontal,vertical)]*len(panels)
+    else:
+        columns = min(3,int(np.ceil(np.sqrt(len(panels)))))
+        slots = self.plot_figure.subplots(int(np.ceil(len(panels)/columns)),columns,squeeze=False).ravel()
+        axes = list(slots[:len(panels)])
+        for extra in slots[len(panels):]:
+            self.plot_figure.delaxes(extra)
+    self.plot_axes, self.plot_ax = axes, axes[0]
+    zmin, zmax = self.spin_plot_zmin.value(), self.spin_plot_zmax.value()
+    shared = self.chk_colorbar_shared.isChecked()
+    limits = common.finite_data_limits(p["display"] for p in panels) if shared else None
+    vmin, vmax = (zmin, zmax) if zmin < zmax else (limits if limits else (None, None))
+    meshes, records = [], []
+    for panel_index,(ax, panel) in enumerate(zip(axes, panels),1):
         self._style_axes(ax)
-
-    cmap = self._effective_colormap()
-    zmin = self.spin_plot_zmin.value()
-    zmax = self.spin_plot_zmax.value()
-    use_clamp = zmin < zmax
-    shared_scale = bool(self.chk_colorbar_shared.isChecked())
-    shared_limits = (
-        common.finite_data_limits(panel["display"] for panel in panel_data)
-        if shared_scale and not use_clamp
-        else None
-    )
-    plot_vmin = zmin if use_clamp else (
-        shared_limits[0] if shared_limits is not None else None
-    )
-    plot_vmax = zmax if use_clamp else (
-        shared_limits[1] if shared_limits is not None else None
-    )
-    elev_name = self._plot_axis_name(reference, "elevation")
-    elev_unit = self._plot_axis_unit(reference, "elevation")
-    mixed_units = len({panel["display_unit"] for panel in panel_data}) > 1
-    meshes = []
-    xmins: list[float] = []
-    xmaxs: list[float] = []
-    ymins: list[float] = []
-    ymaxs: list[float] = []
-    for ax, panel in zip(self.plot_axes, panel_data):
-        panel_az = panel["azimuths"]
-        panel_freq = panel["frequencies"]
-        display = panel["display"]
-        mesh = ax.pcolormesh(
-            panel_az,
-            panel_freq,
-            display.T,
-            shading="auto",
-            cmap=cmap,
-            vmin=plot_vmin,
-            vmax=plot_vmax,
-        )
-        # Rectilinear coordinate lookup avoids constructing and testing a
-        # Python Path for every cell on each cursor event. Keep the physical
-        # edges, including nonuniform coordinates and masked cells.
-        coordinates = mesh.get_coordinates()
-        mesh._grim_rectilinear_data = (
-            coordinates[0, :, 0], coordinates[:, 0, 1], mesh.get_array().reshape(display.T.shape),
-        )
-        meshes.append(mesh)
-        panel_title = (
-            f"{panel['dataset_name']} | {elev_name} {panel['elevation']:g} {elev_unit}"
-        )
-        if mixed_units:
-            panel_title += f" | {panel['display_unit']}"
-        ax.set_title(
-            panel_title,
-            color=self._current_plot_text(),
-        )
-        ax.set_xlabel(self._plot_axis_label(reference, "azimuth"))
-        ax.set_ylabel(self._plot_axis_label(reference, "frequency"))
-        xmins.append(float(np.min(panel_az)))
-        xmaxs.append(float(np.max(panel_az)))
-        ymins.append(float(np.min(panel_freq)))
-        ymaxs.append(float(np.max(panel_freq)))
-
-    if self.chk_colorbar.isChecked():
-        if shared_scale:
-            colorbar = self.plot_figure.colorbar(meshes[-1], ax=self.plot_axes)
-            self.plot_colorbars = [colorbar]
-            colorbar_datasets = [[(panel["dataset_name"], panel["dataset"]) for panel in panel_data]]
+        image = panel["display"]
+        mesh = ax.pcolormesh(panel["x"], panel["y"], image.T, shading="auto", cmap=self._effective_colormap(), vmin=vmin, vmax=vmax)
+        coords = mesh.get_coordinates()
+        mesh._grim_rectilinear_data = (coords[0,:,0], coords[:,0,1], mesh.get_array().reshape(image.T.shape))
+        self._attach_native_image_snapshot(mesh, panel["snapshot"])
+        record_values = getattr(mesh, "_grim_native_rectilinear_data", None)
+        if record_values is not None:
+            rx, ry, rv = panel["native_x"], panel["native_y"], record_values[2]
+        elif panel["snapshot"] is False:
+            rx, ry, rv = panel["x"], panel["y"], mesh.get_array().reshape(image.T.shape)
         else:
-            self.plot_colorbars = [
-                self.plot_figure.colorbar(mesh, ax=ax)
-                for ax, mesh in zip(self.plot_axes, meshes)
-            ]
-            colorbar_datasets = [[(panel["dataset_name"], panel["dataset"])] for panel in panel_data]
-        for colorbar, sources in zip(self.plot_colorbars, colorbar_datasets):
+            rx, ry, rv = panel["native_x"], panel["native_y"], mesh.get_array().reshape(image.T.shape)
+        ds = panel["dataset"]
+        record = ImageRecord(panel["name"], rx, ry, rv, x_axis, y_axis,
+            self._plot_axis_unit(reference, x_axis), self._plot_axis_unit(reference, y_axis),
+            "phase" if phase else ds.linear_quantity() + ("_normalized_frequency_mean" if aggregate and remaining == "frequency" and ds.default_log_unit()=="dBke" and not self._plot_scale_is_linear() else ""), self._display_unit([(panel['name'], ds)]),
+            logarithmic=not phase and not self._plot_scale_is_linear(), phase=phase,
+            notes=("Display block maxima; native snapshot unavailable.",) if panel["snapshot"] is False else (), metadata=panel["metadata"])
+        mesh._grim_image_record = record
+        records.append(record)
+        meshes.append(mesh)
+        compact = show_cuts or len(panels)>1
+        ax.set_title((f"{panel_index} · " + panel["short_title"]) if compact else panel["name"], color=self._current_plot_text(),fontsize=9 if compact else 11)
+        ax.set_xlabel(self._plot_axis_label(reference, x_axis),fontsize=8 if compact else 10,labelpad=1)
+        ax.set_ylabel(self._plot_axis_label(reference, y_axis),fontsize=8 if compact else 10,labelpad=1)
+        ax.tick_params(labelsize=7 if compact else 10)
+    if self.chk_colorbar.isChecked():
+        self.plot_colorbars = ([self.plot_figure.colorbar(meshes[-1], ax=axes)] if shared
+            else [self.plot_figure.colorbar(mesh, ax=ax) for mesh, ax in zip(meshes, axes)])
+        for index, colorbar in enumerate(self.plot_colorbars):
             self._apply_colorbar_ticks(colorbar)
-            colorbar.set_label(
-                self._display_axis_label(sources), color=self._current_plot_text()
-            )
+            ds = datasets if shared else [(panels[index]["name"], panels[index]["dataset"])]
+            colorbar.set_label(self._display_axis_label(ds), color=self._current_plot_text())
             colorbar.ax.tick_params(colors=self._current_plot_text())
-            for label in colorbar.ax.get_yticklabels():
-                label.set_color(self._current_plot_text())
-
-    for spin in (
-        self.spin_plot_xmin,
-        self.spin_plot_xmax,
-        self.spin_plot_ymin,
-        self.spin_plot_ymax,
-    ):
-        spin.blockSignals(True)
-    common.set_spin_value(self.spin_plot_xmin, min(xmins))
-    common.set_spin_value(self.spin_plot_xmax, max(xmaxs))
-    common.set_spin_value(self.spin_plot_ymin, min(ymins))
-    common.set_spin_value(self.spin_plot_ymax, max(ymaxs))
-    for spin in (
-        self.spin_plot_xmin,
-        self.spin_plot_xmax,
-        self.spin_plot_ymin,
-        self.spin_plot_ymax,
-    ):
-        spin.blockSignals(False)
-
+    if show_cuts:
+        from GRIM_Backend.ui.image_analysis import LinkedImageCuts
+        self.plot_figure._grim_linked_cuts = LinkedImageCuts(self.plot_canvas, list(zip(axes, cut_axes, records)))
+    for spin, value in ((self.spin_plot_xmin, min(np.min(p['x']) for p in panels)),
+            (self.spin_plot_xmax, max(np.max(p['x']) for p in panels)),
+            (self.spin_plot_ymin, min(np.min(p['y']) for p in panels)),
+            (self.spin_plot_ymax, max(np.max(p['y']) for p in panels))):
+        blocked = spin.blockSignals(True)
+        common.set_spin_value(spin, float(value))
+        spin.blockSignals(blocked)
     self._apply_plot_limits()
-    status = "Waterfall plot updated."
-    if skipped:
-        status = f"{status[:-1]} Skipped: {', '.join(skipped)}."
-    self._show_plot_status(status)
+    self._show_plot_status("Waterfall updated." + (" Skipped: " + ", ".join(skipped) if skipped else ""))

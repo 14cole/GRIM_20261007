@@ -278,6 +278,7 @@ class DatasetPlotStyleMixin:
                 if getattr(artist, "_grim_dataset_key", None) == key
             ]
             for artist in artists:
+                self._release_artist_native_samples(artist)
                 artist.remove()
             legend = ax.get_legend()
             if legend is not None and any(_legend_label(a) for a in artists):
@@ -320,6 +321,7 @@ class DatasetPlotStyleMixin:
         ]
         self._drop_dataset_from_python_plot_spec(key)
         self._restore_plot_markers()
+        self._refresh_display_reduction_notice()
         self._update_legend_visibility()
         self._maybe_autoscale()
         self.plot_canvas.draw_idle()

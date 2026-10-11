@@ -93,6 +93,7 @@ class PlotSliderMixin:
             for ax in self.plot_figure.axes:
                 for artist in (*ax.lines, *ax.collections):
                     if getattr(artist, "_grim_slider_trace", False):
+                        self._release_artist_native_samples(artist)
                         artist.remove()
             before = {id(artist) for ax in self.plot_figure.axes
                       for artist in (*ax.lines, *ax.collections)}

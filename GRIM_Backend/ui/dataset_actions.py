@@ -3564,7 +3564,7 @@ class DatasetOpsMixin:
             else datasets[0][1]
         )
         try:
-            dlg = RegridDialog(reference, parent=self)
+            dlg = RegridDialog(reference, parent=self, dataset_entries=datasets)
         except (TypeError, ValueError) as exc:
             self.status.showMessage(
                 f"Regrid blocked: active reference metadata is invalid ({exc})"
@@ -3580,6 +3580,9 @@ class DatasetOpsMixin:
         stop = float(params["stop"])
         step = float(params["step"])
         display_unit = str(params["unit"])
+        maximum_gap = params.get("max_gap")
+        maximum_gap = None if maximum_gap is None else float(maximum_gap)
+        support = str(params.get("support", "interpolate"))
         if not all(np.isfinite(value) for value in (start, stop, step)):
             self.status.showMessage("Regrid: start, stop, and step must be finite.")
             return
@@ -3622,7 +3625,7 @@ class DatasetOpsMixin:
         # Keep one compact native-unit start/step pair per dataset. The full
         # n-point target is constructed only while that dataset is processed
         # in the worker, rather than retaining one large array per selection.
-        native_specs: list[tuple[float, float]] = []
+        native_specs: list[tuple[float, float, float | None]] = []
         downsampled: list[str] = []
         if axis == "frequency":
             try:
@@ -3673,7 +3676,8 @@ class DatasetOpsMixin:
                     and physical_step > source_step * 1.01
                 ):
                     downsampled.append(name)
-                native_specs.append((float(native_start), float(native_step)))
+                native_gap = None if maximum_gap is None else maximum_gap * native_step / step
+                native_specs.append((float(native_start), float(native_step), native_gap))
             except (TypeError, ValueError) as exc:
                 self.status.showMessage(f"Regrid blocked: {name} ({exc})")
                 return
@@ -3713,7 +3717,7 @@ class DatasetOpsMixin:
             for dataset_index, ((name, dataset), native_spec) in enumerate(
                 zip(datasets, native_specs)
             ):
-                native_start, native_step = native_spec
+                native_start, native_step, native_gap = native_spec
                 try:
                     native_values = (
                         native_start
@@ -3723,6 +3727,8 @@ class DatasetOpsMixin:
                         dataset,
                         axis,
                         values=native_values,
+                        max_gap=native_gap,
+                        support=support,
                     )
                 except (ValueError, TypeError) as exc:
                     skipped.append(f"{name} ({exc})")
@@ -3734,6 +3740,7 @@ class DatasetOpsMixin:
                         interpolated,
                         native_start,
                         native_step,
+                        native_gap,
                     )
                 )
             return results, skipped
@@ -3746,6 +3753,7 @@ class DatasetOpsMixin:
                 interpolated,
                 native_start,
                 native_step,
+                native_gap,
             ) in results:
                 history = (
                     f"Regrid {axis} [{start:g}..{resolved_stop:g} {display_unit}, "
@@ -3753,6 +3761,14 @@ class DatasetOpsMixin:
                 )
                 if name in downsampled_set:
                     history += "; coarser point sampling; no anti-alias filter"
+                coverage = json.loads(interpolated.extra["regrid_support_json"])
+                history += (
+                    f"; support={support}; measured coordinates={coverage['measured_coordinate_count']}, "
+                    f"interpolated={coverage['interpolated_coordinate_count']}, "
+                    f"policy-masked={coverage['excluded_coordinate_count']}"
+                )
+                if maximum_gap is not None:
+                    history += f"; maximum gap={maximum_gap:g} {display_unit}"
                 output_name = f"{name} [Regrid {axis}]"
                 output_id = self._add_dataset_row(
                     interpolated, output_name, history, file_name=""
@@ -3763,10 +3779,10 @@ class DatasetOpsMixin:
                     recorder.record_expression(
                         self._python_output_reference(output_id, output_name),
                         [source_ref],
-                        lambda variables, selected_axis=axis, first=native_start, increment=native_step, count=n: (
+                        lambda variables, selected_axis=axis, first=native_start, increment=native_step, count=n, gap=native_gap, policy=support: (
                             f"regrid_axis({variables[0]}, {selected_axis!r}, "
                             f"values={first!r} + {increment!r} * "
-                            f"np.arange({count}, dtype=float))"
+                            f"np.arange({count}, dtype=float), max_gap={gap!r}, support={policy!r})"
                         ),
                         comment=f"Regrid {name} on a resolved {axis} grid",
                     )
@@ -3777,7 +3793,7 @@ class DatasetOpsMixin:
                     if skipped else "Regrid created 0 datasets."
                 )
                 return
-            message = f"Regrid created {produced} dataset(s) on {axis}."
+            message = f"Regrid created {produced} dataset(s) on {axis}; coverage counts are in History and Provenance."
             if downsampled:
                 message += (
                     " Point-sampled without anti-alias filtering: "
@@ -3803,7 +3819,7 @@ class DatasetOpsMixin:
         if datasets is None:
             return
 
-        dlg = DecimateDialog(parent=self)
+        dlg = DecimateDialog(parent=self, dataset_entries=datasets)
         if dlg.exec() != QDialog.Accepted:
             dlg.deleteLater()
             return
@@ -3812,6 +3828,7 @@ class DatasetOpsMixin:
         axis = str(params["axis"])
         factor = int(params["factor"])
         mode = str(params["mode"])
+        partial = str(params.get("partial", "keep"))
         metadata_attested = False
         if mode == "coherent":
             attestation = self._confirm_coherent_metadata(
@@ -3835,6 +3852,7 @@ class DatasetOpsMixin:
                 factor=factor,
                 mode=mode,
                 metadata_attested=metadata_attested,
+                partial=partial,
             )
 
         def publish(results, skipped) -> None:
@@ -3857,6 +3875,7 @@ class DatasetOpsMixin:
                             "axis": axis,
                             "factor": factor,
                             "mode": mode,
+                            "partial": partial,
                             **(
                                 {"metadata_attested": True}
                                 if metadata_attested
@@ -3866,6 +3885,14 @@ class DatasetOpsMixin:
                         comment=f"Prefilter and decimate {name}",
                     )
             message = f"Decimate created {len(results)} dataset(s)."
+            nonuniform = [name for _index, name, result in results
+                          if not json.loads(result.extra["decimation_json"])["output_uniform"]]
+            discarded = sum(json.loads(result.extra["decimation_json"])["discarded_source_coordinate_count"]
+                            for _index, _name, result in results)
+            if nonuniform:
+                message += " Nonuniform output spacing: " + _compact_item_summary(nonuniform) + "."
+            if discarded:
+                message += f" Explicitly discarded {discarded:,} trailing source coordinates in total."
             if skipped:
                 message += f" Skipped: {_compact_item_summary(skipped)}"
             self.status.showMessage(message)

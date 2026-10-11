@@ -2844,9 +2844,16 @@ def compute_bands(params: dict):
                 return "ISAR computation superseded."
             max_side = min(common.MAX_IMAGE_SIDE, int(np.sqrt(common.MAX_IMAGE_CELLS)))
             original_shape = result["magnitude"].shape
-            result["magnitude"] = _decimate_display_max(
-                result["magnitude"], max_side=max_side
-            )
+            if max(original_shape) > max_side:
+                from GRIM_Backend.isar.geometry import pool_image_peaks
+                x_stride = max(1, int(np.ceil(original_shape[0] / max_side)))
+                y_stride = max(1, int(np.ceil(original_shape[1] / max_side)))
+                blocks = [(start, min(start + x_stride, original_shape[0]))
+                          for start in range(0, original_shape[0], x_stride)]
+                reduced, iy, ix = pool_image_peaks(result["magnitude"].T, y_stride, blocks)
+                result["magnitude"] = reduced.T
+                result["display_peak_x_indices"] = ix
+                result["display_peak_y_indices"] = iy
             result["display_decimated"] = result["magnitude"].shape != original_shape
             if result["display_decimated"]:
                 from GRIM_Backend.isar.geometry import reduced_axis_edges

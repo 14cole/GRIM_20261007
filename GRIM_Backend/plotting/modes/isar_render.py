@@ -4,7 +4,9 @@ from __future__ import annotations
 import numpy as np
 from . import common
 from . import isar_mode as computation
-from GRIM_Backend.isar.geometry import angular_bands, angular_sublooks, image_extent, draw_image
+from GRIM_Backend.isar.geometry import (
+    angular_bands, angular_sublooks, image_extent, draw_image, attach_block_peak_probe,
+)
 from GRIM_Backend.isar.quality import reconstruction_advisories
 
 
@@ -277,7 +279,11 @@ def render(self) -> None:
             n_az_fft = computation._next_fast_len(max(az_count, 256))
             n_freq_fft = computation._next_fast_len(max(len(freq_indices_sorted), 256))
             # Only the display-decimated magnitude outlives formation.
-            retained = 4 * common.bounded_image_cell_count(n_az_fft, n_freq_fft)
+            reduced = max(n_az_fft, n_freq_fft) > min(
+                common.MAX_IMAGE_SIDE, int(np.sqrt(common.MAX_IMAGE_CELLS)))
+            # Reduced overviews keep two native peak-index grids as well as
+            # magnitude; these remain bounded by the display cell budget.
+            retained = (12 if reduced else 4) * common.bounded_image_cell_count(n_az_fft, n_freq_fft)
         estimated_peak = max(estimated_peak, estimated_resident + working)
         estimated_resident += retained
     try:
@@ -356,6 +362,9 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
     n_bands = len(band_results)
 
     self._remove_colorbar()
+    release_native = getattr(self, "_release_native_plot_samples", None)
+    if callable(release_native):
+        release_native()
     self.plot_figure.clear()
     self.plot_figure.set_layout_engine('constrained')
     self.plot_figure._grim_isar_layout = True
@@ -408,6 +417,11 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
             vmin=plot_vmin,
             vmax=plot_vmax,
         )
+        if br.get("display_decimated") and "display_peak_x_indices" in br:
+            attach_block_peak_probe(mesh, br["display_x_edges"], br["display_y_edges"],
+                br["x_range"], br["y_range"], br["display_peak_x_indices"], br["display_peak_y_indices"])
+        from GRIM_Backend.plotting.image_analysis import attach_isar_record
+        attach_isar_record(self, mesh, br, params)
         if square_aspect:
             # Preserve the selected coordinate limits on every redraw. With
             # constrained layout and a colorbar, adjustable="datalim" can

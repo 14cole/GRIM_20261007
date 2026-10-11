@@ -24,7 +24,7 @@ from .isar_mode import (
     _ifft,
 )
 from GRIM_Backend.isar.interpolation import resample_pair
-from GRIM_Backend.isar.geometry import angular_bands
+from GRIM_Backend.isar.geometry import angular_bands, pool_image_peaks, attach_block_peak_probe
 
 
 def _prepare_uniform_frequency_history(
@@ -104,7 +104,7 @@ def _range_display_values(dataset, magnitude: np.ndarray, *, linear: bool) -> np
     return 10.0 * np.log10(np.maximum(intensity, 1.0e-12))
 
 
-def _range_display_grid(azimuths, ranges, image, *, azimuth_width, max_side):
+def _range_display_grid(azimuths, ranges, image, *, azimuth_width, max_side, return_peaks=False):
     """Draw contiguous selected samples with shared midpoint cell boundaries.
 
     Normal spacing changes and regular selection strides are not missing
@@ -159,19 +159,28 @@ def _range_display_grid(azimuths, ranges, image, *, azimuth_width, max_side):
         stride *= 2
     edges = [float(bounds[0][0])]
     columns = []
+    column_blocks = []
     block_count = 0
     for i, (sector, cell_edges) in enumerate(zip(sectors, bounds)):
         if i:
             columns.append(np.full(pooled.shape[0], np.nan))
+            column_blocks.append(None)
             edges.append(float(cell_edges[0]))
         for first in range(0, len(sector), stride):
             end = min(first + stride, len(sector))
             columns.append(np.fmax.reduce(pooled[:, sector[0]+first:sector[0]+end], axis=1))
+            column_blocks.append((sector[0] + first, sector[0] + end))
             edges.append(float(cell_edges[end]))
             block_count += 1
-    return np.asarray(edges), y_edges, np.column_stack(columns), (
-        len(y_starts) < len(ranges) or block_count < len(azimuths)
-    )
+    reduced = len(y_starts) < len(ranges) or block_count < len(azimuths)
+    result = (np.asarray(edges), y_edges, np.column_stack(columns), reduced)
+    if return_peaks:
+        if reduced:
+            values, iy, ix = pool_image_peaks(image,
+                max(1, int(np.ceil(len(ranges) / max_side))), column_blocks)
+            return (*result[:2], values, reduced, (ix, iy))
+        return (*result, None)
+    return result
 
 
 def render(self) -> None:
@@ -308,8 +317,9 @@ def render(self) -> None:
         float(np.deg2rad(1.0)) if self._plot_axis_unit(reference, "azimuth") == "rad" else 1.0
     )
     try:
-        x_edges, y_edges, display_for_plot, decimated = _range_display_grid(
-            az_values, range_axis, display.T, azimuth_width=width, max_side=max_side
+        x_edges, y_edges, display_for_plot, decimated, peak_indices = _range_display_grid(
+            az_values, range_axis, display.T, azimuth_width=width, max_side=max_side,
+            return_peaks=True,
         )
     except ValueError as exc:
         self.status.showMessage(f"Az vs Down-Range blocked: {exc}")
@@ -322,6 +332,9 @@ def render(self) -> None:
 
     # Build the figure.
     self._remove_colorbar()
+    release_native = getattr(self, "_release_native_plot_samples", None)
+    if callable(release_native):
+        release_native()
     self.plot_figure.clear()
     self.plot_ax = self.plot_figure.add_subplot(111)
     self.plot_axes = None
@@ -349,6 +362,28 @@ def render(self) -> None:
             **color_options,
         )
 
+    self._az_vs_range_mesh = mesh
+    mesh._grim_rectilinear_data = (x_edges, y_edges, display_for_plot)
+    from GRIM_Backend.plotting.image_analysis import ImageRecord, compact_metadata
+    source_name = next((name for name, candidate in getattr(self,"_selected_datasets",lambda:[])()
+                        if candidate is self.active_dataset),"Dataset")
+    mesh._grim_image_record = ImageRecord(
+        f"{source_name} | Azimuth–Down-Range | {self.active_dataset.polarizations[pol_idx]}",
+        (x_edges[:-1]+x_edges[1:])/2 if decimated else az_values,
+        (y_edges[:-1]+y_edges[1:])/2 if decimated else range_axis,
+        display_for_plot if decimated else display.T,
+        "azimuth", "range", self._plot_axis_unit(reference,"azimuth"), unit_name,
+        "range_profile_intensity", "linear" if self._plot_scale_is_linear() else "dB",
+        logarithmic=not self._plot_scale_is_linear(),
+        notes=("Overview block maxima: cuts/ROI/differences use displayed blocks.",) if decimated else (),
+        metadata={"kind":"az_vs_range", "source_name":source_name,
+            "polarization":str(self.active_dataset.polarizations[pol_idx]),
+            "frequency_values_hz":freq_hz.tolist(),
+            "remaining_selection":("elevation",float(self.active_dataset.elevations[elev_idx]),common.axis_unit(self.active_dataset,"elevation")),
+            "source_units":compact_metadata(self.active_dataset.units),
+            "source_metadata":compact_metadata(self.active_dataset.extra), "peak_normalized":peak_norm})
+    if peak_indices is not None:
+        attach_block_peak_probe(mesh, x_edges, y_edges, az_values, range_axis, *peak_indices)
     self.plot_ax.set_xlabel(self._plot_axis_label(reference, "azimuth"))
     self.plot_ax.set_ylabel(f"Down-Range ({unit_name})")
     elev_value = self.active_dataset.elevations[elev_idx]
@@ -407,4 +442,5 @@ def render(self) -> None:
             f" — {gap_count} missing frequency band(s) kept zero-weighted "
             f"({unsupported:.1f}% unsupported grid)"
         )
+    self._last_az_vs_range_generation = getattr(self, "_plot_render_generation", 0)
     self._show_plot_status(f"Az vs Down-Range updated{note}.")

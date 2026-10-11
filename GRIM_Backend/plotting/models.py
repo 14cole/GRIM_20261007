@@ -84,5 +84,6 @@ class PlotContext:
     delta_map_controls: Any = None
     isar_advanced: Any = None
     analysis_controls: Any = None
+    image_analysis_controls: Any = None
     plot_slider: Any = None
     spatial_overlays: Any = None

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 
 import numpy as np
 
 from GRIM_Backend.datasets.constants import (
+    C0,
     _ADOPT_CLEAN_ARRAYS_TOKEN,
     _ANGLE_UNITS,
     _FREQUENCY_UNITS,
@@ -15,6 +17,46 @@ from GRIM_Backend.datasets.constants import (
 
 class GridAxesMixin:
     """Axis selection, alignment, interpolation, cropping, and wrapping."""
+
+    def _frequency_relabel_extra(self, extra, old_frequencies, new_frequencies):
+        """Keep the normalized 2-D response unchanged when frequency labels move.
+
+        Solver amplitudes encode sqrt(k) as part of their normalization. A
+        coordinate relabel changes k, but must not change the response sample.
+        Work on the already-permuted raw pair so inline edits retain alignment.
+        """
+        old = np.asarray(old_frequencies, dtype=float)
+        new = np.asarray(new_frequencies, dtype=float)
+        if np.array_equal(old, new) or self.linear_quantity() != "sigma_2d":
+            return extra, None
+        if self._complete_authoritative_raw_arrays() is None:
+            return extra, None
+        for key in ("solver_metadata_json", "solver_certification", "requested_radar_grid_json"):
+            extra.pop(key, None)
+        if np.any(old <= 0.0) or np.any(new <= 0.0):
+            # Keep permissive coordinate relabeling. Invalid frequency labels
+            # cannot encode solver-normalized amplitudes, so retain canonical
+            # response samples instead and leave the frequency issue to Audit.
+            canonical = None
+            if np.all(old > 0.0):
+                field = (np.asarray(extra["rcs_amp_real"], dtype=np.float64)
+                         + 1j * np.asarray(extra["rcs_amp_imag"], dtype=np.float64))
+                k = 2.0 * np.pi * self._frequency_value_to_hz(old) / C0
+                field /= (2.0 * np.sqrt(k))[None, None, :, None]
+                canonical = (np.abs(field) ** 2, np.angle(field))
+            for key in ("rcs_amp_real", "rcs_amp_imag", "raw_complex_amplitude_preserved"):
+                extra.pop(key, None)
+            extra["frequency_relabel_normalization"] = (
+                "normalized response retained; raw solver encoding removed because relabeled frequencies are nonpositive"
+            )
+            return extra, canonical
+        scale = np.sqrt(new / old)[None, None, :, None]
+        for key in ("rcs_amp_real", "rcs_amp_imag"):
+            extra[key] = np.asarray(extra[key], dtype=np.float64) * scale
+        extra["frequency_relabel_normalization"] = (
+            "raw sigma_2d solver amplitudes rescaled to preserve normalized response"
+        )
+        return extra, None
 
     def _alignment_interpolation_plan(self, other):
         """Shrink first so intermediate grids never exceed the input/output."""
@@ -179,6 +221,12 @@ class GridAxesMixin:
 
             edited_extra[key] = extra_value
         self._drop_malformed_raw_metadata(edited_extra)
+        if axis_index == 2:
+            edited_extra, canonical = self._frequency_relabel_extra(
+                edited_extra, np.asarray(self.frequencies)[order], axes[2]
+            )
+            if canonical is not None:
+                power, phase = canonical
         self._invalidate_assembly_sampling_hash(
             edited_extra, f"edit-{str(name).strip().lower()}-axis"
         )
@@ -410,26 +458,37 @@ class GridAxesMixin:
     @staticmethod
     def _interp_complex_axis(data, x_old, x_new, axis):
         from GRIM_Backend.datasets.grid import RcsGrid
-        x_old = np.asarray(x_old, dtype=float)
-        x_new = np.asarray(x_new, dtype=float)
-        if x_new.min() < x_old.min() or x_new.max() > x_old.max():
-            raise ValueError("interp would require extrapolation")
         return RcsGrid._interp_linear_axis(data, x_old, x_new, axis)
 
     @staticmethod
     def _interp_real_axis(data, x_old, x_new, axis):
         from GRIM_Backend.datasets.grid import RcsGrid
-        x_old = np.asarray(x_old, dtype=float)
-        x_new = np.asarray(x_new, dtype=float)
-        if x_new.min() < x_old.min() or x_new.max() > x_old.max():
-            raise ValueError("interp would require extrapolation")
         return RcsGrid._interp_linear_axis(data, x_old, x_new, axis)
+
+    @staticmethod
+    def _snap_interpolation_coordinates(x_old, x_new):
+        """Snap only floating-point roundoff, not an engineering merge tolerance.
+
+        Unit conversion and start+step arithmetic may differ by a handful of
+        ULPs for the same coordinate. Resolve those to the actual source sample
+        before interpolation, including when an adjacent sample is missing.
+        """
+        old = np.asarray(x_old, dtype=float)
+        new = np.asarray(x_new, dtype=float)
+        right = np.clip(np.searchsorted(old, new), 0, len(old) - 1)
+        left = np.maximum(right - 1, 0)
+        nearest = np.where(np.abs(old[left] - new) <= np.abs(old[right] - new), left, right)
+        scale = max(float(np.max(np.abs(old))), np.finfo(np.float64).tiny)
+        tolerance = 8.0 * np.finfo(np.float64).eps * scale
+        exact = np.abs(old[nearest] - new) <= tolerance
+        return np.where(exact, old[nearest], new), exact
 
     @staticmethod
     def _interp_linear_axis(data, x_old, x_new, axis):
         """Vectorized adjacent-bin interpolation; NaNs remain local."""
+        from GRIM_Backend.datasets.grid import RcsGrid
         x_old = np.asarray(x_old, dtype=float)
-        x_new = np.asarray(x_new, dtype=float)
+        x_new, _exact = RcsGrid._snap_interpolation_coordinates(x_old, x_new)
         if x_new.min() < x_old.min() or x_new.max() > x_old.max():
             raise ValueError("interp would require extrapolation")
         moved = np.moveaxis(np.asarray(data), axis, 0)
@@ -449,11 +508,13 @@ class GridAxesMixin:
         out = moved[left] * (1.0 - w) + moved[right] * w
         return np.moveaxis(out.astype(moved.dtype, copy=False), 0, axis)
 
-    def interpolate_axis(self, axis_name, new_values):
+    def interpolate_axis(self, axis_name, new_values, *, max_gap=None, support="interpolate"):
         """Linearly interpolate the grid onto new values along one numeric axis.
 
         Other axes are left unchanged. Raises if `new_values` extends beyond
-        the existing axis range (no extrapolation).
+        the existing axis range (no extrapolation). Optional ``max_gap`` is in
+        native axis units; targets inside larger gaps become missing. With
+        ``support='measured-only'``, only exact source coordinates are retained.
         """
         axis_map = {"azimuth": 0, "elevation": 1, "frequency": 2}
         key = str(axis_name).strip().lower()
@@ -463,11 +524,16 @@ class GridAxesMixin:
         new_arr = np.asarray(new_values, dtype=float).ravel()
         if new_arr.size == 0:
             raise ValueError("new axis must have at least one value")
+        if not np.all(np.isfinite(new_arr)):
+            raise ValueError("new axis values must be finite")
         if new_arr.size > 1 and not np.all(np.diff(new_arr) > 0):
             raise ValueError("new axis must be strictly increasing")
 
         old_axes = [self.azimuths, self.elevations, self.frequencies]
         self._check_axis_sorted(old_axes[axis_idx], key)
+        exact, excluded = self._interpolation_support(
+            old_axes[axis_idx], new_arr, max_gap=max_gap, support=support
+        )
 
         new_axes = list(old_axes)
         new_axes[axis_idx] = new_arr
@@ -493,12 +559,33 @@ class GridAxesMixin:
             )
             power_interp[complex_valid] = np.abs(complex_interp[complex_valid]) ** 2
             phase_interp[complex_valid] = np.angle(complex_interp[complex_valid])
+        if np.any(excluded):
+            selection = [slice(None)] * 4
+            selection[axis_idx] = excluded
+            power_interp[tuple(selection)] = np.nan
+            phase_interp[tuple(selection)] = np.nan
         interp_extra = self._derived_response_extra(
             operation=f"interpolate-{key}", coherent=True
         )
         self._invalidate_assembly_sampling_hash(
             interp_extra, f"interpolate-{key}"
         )
+        interp_extra["regrid_support_json"] = json.dumps({
+            "schema": "grim.regrid-support.v1",
+            "axis": key,
+            "axis_unit": (self.units or {}).get(key, "GHz" if key == "frequency" else "deg"),
+            "support": support,
+            "maximum_gap": None if max_gap is None else float(max_gap),
+            "target_coordinate_count": int(new_arr.size),
+            "measured_coordinate_count": int(np.count_nonzero(exact)),
+            "interpolated_coordinate_count": int(np.count_nonzero(~exact & ~excluded)),
+            "excluded_coordinate_count": int(np.count_nonzero(excluded)),
+            "finite_power_sample_count": sum(
+                int(np.count_nonzero(np.isfinite(power_interp.flat[start:start + 262_144])))
+                for start in range(0, power_interp.size, 262_144)
+            ),
+            "total_sample_count": int(power_interp.size),
+        }, sort_keys=True, separators=(",", ":"))
         return self._new_grid(
             new_axes[0],
             new_axes[1],
@@ -509,6 +596,23 @@ class GridAxesMixin:
             rcs_domain="power_phase",
             extra=interp_extra,
         )
+
+    @staticmethod
+    def _interpolation_support(old_values, new_values, *, max_gap=None, support="interpolate"):
+        """Return exact-coordinate and policy-excluded masks without sample data."""
+        if support not in {"interpolate", "measured-only"}:
+            raise ValueError("support must be 'interpolate' or 'measured-only'")
+        if max_gap is not None and (not math.isfinite(float(max_gap)) or float(max_gap) <= 0.0):
+            raise ValueError("max_gap must be positive and finite, or None")
+        old = np.asarray(old_values, dtype=float)
+        from GRIM_Backend.datasets.grid import RcsGrid
+        new, exact = RcsGrid._snap_interpolation_coordinates(old, new_values)
+        right = np.clip(np.searchsorted(old, new, side="left"), 0, len(old) - 1)
+        left = np.where(exact, right, np.maximum(right - 1, 0))
+        excluded = ~exact if support == "measured-only" else np.zeros(new.shape, dtype=bool)
+        if max_gap is not None:
+            excluded |= ~exact & ((old[right] - old[left]) > float(max_gap))
+        return exact, excluded
 
     @staticmethod
     def _as_list(value):
@@ -1317,15 +1421,18 @@ class GridAxesMixin:
             axes.append(values)
         if not changed:
             return self
+        extra = self._exact_transform_extra(
+            coordinate_change="round-" + "-".join(changed)
+        )
+        extra, canonical = self._frequency_relabel_extra(extra, self.frequencies, axes[2])
+        power, phase = canonical if canonical is not None else (self.rcs_power, self.rcs_phase)
         return self._new_grid(
             *axes,
             np.array(self.polarizations, copy=True),
-            rcs_power=self.rcs_power,
-            rcs_phase=self.rcs_phase,
+            rcs_power=power,
+            rcs_phase=phase,
             rcs_domain="power_phase",
-            extra=self._exact_transform_extra(
-                coordinate_change="round-" + "-".join(changed)
-            ),
+            extra=extra,
         )
 
     def round_azimuths(self, decimals: int):

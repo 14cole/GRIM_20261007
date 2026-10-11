@@ -107,6 +107,7 @@ class _PbpBands:
             lower, upper, density = envelope.result()
             percentiles = envelope.percentiles
             envelope.close()
+            native_edges = (to_plot_x(x_values) if to_plot_x is not None else x_values, lower, upper)
             x_display, lower, upper, density = owner._bounded_plot_envelope(
                 x_values, lower, upper, density
             )
@@ -123,7 +124,7 @@ class _PbpBands:
             key = self._band_key()
             owner._plot_pbp_band(
                 x_display, lower, upper, label, polar, density=density,
-                key=key, color=color, heatmap=heatmap,
+                key=key, color=color, heatmap=heatmap, native_edges=native_edges,
             )
             for artist in owner._plot_item_artists(key):
                 artist._grim_pbp_identity = identity
@@ -289,6 +290,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _on_analysis_setting_changed(self, kind: str) -> None:
         """Re-render when an analysis setting affects this plot."""
+        save_preferences = getattr(self, "_save_analysis_preferences", None)
+        if callable(save_preferences):
+            save_preferences()
         mode = self.last_plot_mode
         affected = {
             "pbp": mode in ("azimuth_rect", "azimuth_polar", "frequency")
@@ -296,10 +300,12 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             "cdf": mode == "cdf",
             "sector": mode == "sector_stats",
             "range": mode == "range_freq",
+            "sweep": mode in ("frequency", "elevation_sweep"),
+            "heatmap": mode == "waterfall",
         }.get(kind, False)
         if not affected or getattr(self, "_active_plot_tab", "plotting") != "plotting":
             return
-        if self._button_checked(getattr(self, "btn_hold", None)):
+        if mode != "waterfall" and self._button_checked(getattr(self, "btn_hold", None)):
             self.status.showMessage(
                 "Setting saved. Hold is on, so plot again to apply it to the held canvas."
             )
@@ -638,6 +644,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         key=PBP_BAND_KEY,
         color: str | None = None,
         heatmap: bool = False,
+        native_edges=None,
     ) -> None:
         """Append one PBP fill and its edges as one selectable plot item."""
         if color is None:
@@ -646,10 +653,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             x_values, lower, upper, label, polar, density=density, key=key,
             color=color, heatmap=heatmap,
         )
-        for edge in (lower, upper):
+        for edge_index, edge in enumerate((lower, upper)):
             for line in self._plot_bounded_line(
                 self.plot_ax, x_values, edge, color=color, linewidth=1,
                 label="_nolegend_", zorder=1.9,
+                native_values=(native_edges[0], native_edges[edge_index + 1]) if native_edges is not None else None,
             ):
                 self._register_plot_line(line, key)
 
@@ -782,6 +790,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         desired = "polar" if projection == "polar" else "rectilinear"
         if self.plot_ax.name == desired and self.plot_axes is None and not hasattr(self.plot_ax, "_grim_delta_map"):
             return
+        self._release_native_plot_samples()
         self._remove_colorbar()
         self.plot_figure.clear()
         if desired == "polar":
@@ -792,6 +801,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self._style_plot_axes()
 
     def _clear_plot(self) -> None:
+        self._release_native_plot_samples()
         overlays = getattr(self, "spatial_overlays", None)
         if overlays is not None:
             overlays.clear()
@@ -1007,6 +1017,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if self.last_plot_mode != 'isar_image' and getattr(self.plot_figure, '_grim_isar_layout', False):
             self.plot_figure.set_layout_engine(None)
             self.plot_figure._grim_isar_layout = False
+        if self.last_plot_mode not in ("frequency", "elevation_sweep", "cdf") and getattr(
+            self.plot_figure, "_grim_analysis_constrained_layout", False
+        ):
+            self.plot_figure.set_layout_engine(None)
+            self.plot_figure._grim_analysis_constrained_layout = False
         selection_notice = getattr(self, "_pending_parameter_selection_notice", None)
         self._plot_render_notes = [selection_notice] if selection_notice else []
         self._pending_parameter_selection_notice = None
@@ -1024,10 +1039,73 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             notes.append(note)
 
     def _show_plot_status(self, message: str) -> None:
+        self._refresh_display_reduction_notice()
         notes = list(getattr(self, "_plot_render_notes", []))
         if notes:
             message = f"{message} " + " ".join(notes)
         self.status.showMessage(message)
+
+    @staticmethod
+    def _release_artist_native_samples(artist):
+        native = getattr(artist, "_grim_native_samples", None)
+        if native is not None:
+            # Image records may share a view of the native mapping. Captures
+            # own separate frozen storage; live records expire with the plot.
+            artist._grim_image_record = None
+            artist._grim_native_rectilinear_data = None
+            native.close()
+            artist._grim_native_samples = None
+        artist._grim_native_rectilinear_data = None
+
+    def _release_native_plot_samples(self):
+        linked_cuts = getattr(self.plot_figure, "_grim_linked_cuts", None)
+        if linked_cuts is not None:
+            linked_cuts.disconnect()
+            self.plot_figure._grim_linked_cuts = None
+        for ax in self.plot_figure.axes:
+            for artist in (*ax.lines, *ax.collections, *ax.images):
+                self._release_artist_native_samples(artist)
+
+    def _dispose_native_plot_snapshots(self):
+        """Release both tabs' temporary resources after an accepted close."""
+        figures = {context.plot_figure for context in getattr(self, "_plot_contexts", {}).values()}
+        figures.add(self.plot_figure)
+        self._clear_plot_markers(redraw=False)
+        for figure in figures:
+            linked_cuts = getattr(figure, "_grim_linked_cuts", None)
+            if linked_cuts is not None:
+                linked_cuts.disconnect()
+                figure._grim_linked_cuts = None
+            for ax in figure.axes:
+                for artist in (*ax.lines, *ax.collections, *ax.images):
+                    if getattr(artist, "_grim_native_samples", None) is not None:
+                        self._release_artist_native_samples(artist)
+                        # A closed Qt window can be shown again by its owner.
+                        # Its existing reduced view then has display-only
+                        # probes until the next plot rebuilds the snapshot.
+                        artist._grim_native_probe_unavailable = True
+            self._refresh_display_reduction_notice(figure)
+
+    def _refresh_display_reduction_notice(self, figure=None):
+        figure = self.plot_figure if figure is None else figure
+        old = getattr(figure, "_grim_reduction_notice", None)
+        if old is not None and old in figure.texts:
+            old.remove()
+        figure._grim_reduction_notice = None
+        reduced = [artist for ax in figure.axes
+                   for artist in (*ax.lines, *ax.collections, *ax.images)
+                   if getattr(artist, "_grim_display_reduced", False)]
+        if not reduced:
+            return
+        fallback = any(getattr(a, "_grim_native_probe_unavailable", False) for a in reduced)
+        overview = any(getattr(a, "_grim_native_probe", None) is not None for a in reduced)
+        suffix = "display-only probing (native snapshot unavailable)" if fallback else (
+            "native samples / labeled block-peak probes" if overview else "probes use native samples")
+        figure._grim_reduction_notice = figure.text(
+            0.995, 0.005, "Display reduced; " + suffix, ha="right", va="bottom",
+            fontsize=8, color=self._current_plot_text(),
+            bbox={"facecolor": self._current_plot_bg(), "alpha": 0.9, "edgecolor": "none"},
+        )
 
     def _preflight_plot_datasets(self, datasets):
         try:
@@ -1128,6 +1206,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
         self._ensure_axes(projection)
         if not hold:
+            self._release_native_plot_samples()
             self.plot_ax.clear()
             self._style_plot_axes()
         figure._grim_line_plot_signature = signature
@@ -1210,7 +1289,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         ))
 
     def _plot_bounded_line(self, ax, x_values, y_values, *args, dataset=None,
-                           trace_key=None, **kwargs):
+                           trace_key=None, native_values=None, **kwargs):
         limit = getattr(self, "_plot_line_point_limit", plot_common.MAX_LINE_POINTS)
         x_display, y_display, decimated = plot_common.decimate_line(
             x_values, y_values, max_points=limit
@@ -1235,6 +1314,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             removed = False
             for existing in list(ax.lines):
                 if trace_key is not None and getattr(existing, "_grim_trace_key", None) == trace_key:
+                    self._release_artist_native_samples(existing)
                     existing.remove()
                     removed = True
             if removed:
@@ -1256,8 +1336,17 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if dataset is not None:
             kwargs.setdefault("linestyle", "-")
         lines = ax.plot(x_display, y_display, *args, **kwargs)
+        native_x, native_y = native_values if native_values is not None else (x_values, y_values)
+        reduced = decimated or len(native_x) != len(x_display)
         for line in lines:
             line._grim_trace_key = trace_key
+            line._grim_display_reduced = reduced
+            if reduced:
+                try:
+                    line._grim_native_samples = plot_common.NativeSamples.curve(native_x, native_y)
+                except (OSError, MemoryError, ValueError):
+                    line._grim_native_probe_unavailable = True
+                    self._note_plot_render("Native snapshot unavailable; markers use displayed samples only.")
         if dataset is not None:
             for line in lines:
                 self._register_dataset_line(line, dataset)
@@ -1281,10 +1370,33 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         )
         if decimated:
             self._note_plot_render(
-                "Image and hover show block maxima; narrow the selected axes for full "
-                "display resolution. Numerical exports use full data; figure exports use this display."
+                "Image shows block maxima; native cell probes use original samples. "
+                "Numerical exports use full data; figure exports use this display."
             )
         return x_display, y_display, image_display
+
+    def _native_image_snapshot(self, x_values, y_values, image, *, reduced):
+        """Optional exact cursor data for a reduced ordinary image."""
+        if not reduced:
+            return None
+        try:
+            native = plot_common.NativeSamples.image(image)
+            return (plot_common.coordinate_edges(x_values), plot_common.coordinate_edges(y_values), native)
+        except (OSError, MemoryError, ValueError):
+            self._note_plot_render("Native image snapshot unavailable; hover shows displayed block maxima only.")
+            return False
+
+    @staticmethod
+    def _attach_native_image_snapshot(artist, snapshot):
+        if snapshot is None:
+            return
+        artist._grim_display_reduced = True
+        if snapshot is False:
+            artist._grim_native_probe_unavailable = True
+            return
+        x_edges, y_edges, native = snapshot
+        artist._grim_native_samples = native
+        artist._grim_native_rectilinear_data = (x_edges, y_edges, native.values.T)
 
     def _zoom_target_axes(self) -> list:
         axes = self.plot_axes or [self.plot_ax]
@@ -1924,7 +2036,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         # Cine mode: keep stepping while Play stays toggled and renders succeed.
         play_btn = getattr(self, "btn_isar_ap_play", None)
         if ok and play_btn is not None and play_btn.isChecked():
-            QTimer.singleShot(30, self._isar_play_step)
+            generation = getattr(self, "_isar_play_generation", 0)
+            QTimer.singleShot(30, lambda: self._isar_play_step(generation))
 
     # ------------------------------------------------------------------
     # Aperture scrubbing (center/width + step/play) and peak-relative clim
@@ -1935,17 +2048,27 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         width_spin = getattr(self, "spin_isar_ap_width", None)
         if center_spin is None or width_spin is None:
             return
+        mode = "az_vs_range" if self.last_plot_mode == "az_vs_range" else "isar_image"
         chk = getattr(self, "chk_isar_aperture", None)
-        if chk is not None and not chk.isChecked():
-            chk.setChecked(True)  # toggling also triggers a render on the ISAR tab
         width = float(width_spin.value())
         step = width / 2.0 if width > 0.0 else 1.0  # 50% overlap between looks
         new_center = float(np.mod(center_spin.value() + direction * step, 360.0))
-        old_center = float(center_spin.value())
-        center_spin.setValue(new_center)  # valueChanged triggers the render
-        if np.isclose(new_center, old_center) or self.last_plot_mode != "isar_image":
-            # Value didn't change (no signal) or ISAR was never plotted yet —
-            # kick the render explicitly so the button always does something.
+        # Change both controls atomically, then form exactly one image in the
+        # current mode. Their live signals would otherwise draw an intermediate
+        # aperture and used to switch a range map into full ISAR.
+        controls = [center_spin] + ([chk] if chk is not None else [])
+        blocked = [widget.blockSignals(True) for widget in controls]
+        try:
+            if chk is not None:
+                chk.setChecked(True)
+            center_spin.setValue(new_center)
+        finally:
+            for widget, previous in zip(controls, blocked):
+                widget.blockSignals(previous)
+        self._invalidate_isar_result()
+        if mode == "az_vs_range":
+            self._plot_az_vs_range()
+        else:
             self._plot_isar_image()
 
     def _on_isar_ap_prev(self) -> None:
@@ -1954,26 +2077,48 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     def _on_isar_ap_next(self) -> None:
         self._isar_step_aperture(+1)
 
-    def _isar_play_step(self) -> None:
+    def _isar_play_step(self, generation=None) -> None:
+        if generation is not None and generation != getattr(self, "_isar_play_generation", 0):
+            return
         play_btn = getattr(self, "btn_isar_ap_play", None)
         if play_btn is None or not play_btn.isChecked():
             return
+        mode = getattr(self, "_isar_play_mode", self.last_plot_mode)
+        if self.last_plot_mode != mode:
+            play_btn.setChecked(False)
+            return
+        previous_range_generation = getattr(self, "_last_az_vs_range_generation", None)
         self._isar_step_aperture(+1)
+        # Range maps finish synchronously; coherent ISAR schedules its next
+        # frame in the worker completion handler above.
+        if mode == "az_vs_range" and play_btn.isChecked():
+            generation = getattr(self, "_last_az_vs_range_generation", None)
+            if generation is not None and generation != previous_range_generation:
+                play_generation = getattr(self, "_isar_play_generation", 0)
+                QTimer.singleShot(30, lambda: self._isar_play_step(play_generation))
+            else:
+                play_btn.setChecked(False)
 
     def _on_isar_ap_play(self, checked: bool) -> None:
+        self._isar_play_generation = getattr(self, "_isar_play_generation", 0) + 1
         if checked:
+            self._isar_play_mode = (
+                "az_vs_range" if self.last_plot_mode == "az_vs_range" else "isar_image"
+            )
+            if self.last_plot_mode not in ("isar_image", "az_vs_range"):
+                self.last_plot_mode = "isar_image"
             self._isar_play_step()
 
     def _on_isar_peak_scale(self) -> None:
         """Set the color scale to [peak − N, peak] of the rendered image —
         the standard ISAR dynamic-range convention. Works on the displayed
         data, so it's instant (no recompute)."""
-        if self.last_plot_mode != "isar_image":
-            self.status.showMessage("Peak scaling applies to a rendered ISAR image.")
+        if self.last_plot_mode not in ("isar_image", "az_vs_range"):
+            self.status.showMessage("Peak scaling applies to a rendered ISAR or azimuth/range image.")
             return
-        meshes = [m for m in getattr(self, "_isar_meshes", None) or [] if m.axes is not None]
+        meshes = self._current_isar_image_meshes()
         if not meshes:
-            self.status.showMessage("No ISAR image to scale — plot one first.")
+            self.status.showMessage("No image to scale — plot one first.")
             return
         peak = float("-inf")
         for mesh in meshes:
@@ -1997,7 +2142,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self.spin_plot_zmin.blockSignals(False)
         self.spin_plot_zmax.blockSignals(False)
         self._on_isar_clim_changed()
-        self.status.showMessage(f"ISAR color scale set to peak − {drop:g} dB.")
+        self.status.showMessage(f"Image color scale set to peak − {drop:g} dB.")
 
     def _on_phase_toggled(self) -> None:
         if self.last_plot_mode == "delta_map" and self._button_checked(self.btn_phase):
@@ -2019,13 +2164,13 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         """Retune the rendered ISAR image's color scale in place. Unlike the
         Apply button this does NOT re-run the imaging — clim changes only
         touch the existing AxesImage, so they can respond per keystroke."""
-        if self.last_plot_mode != "isar_image":
+        if self.last_plot_mode not in ("isar_image", "az_vs_range"):
             return
         zmin = self.spin_plot_zmin.value()
         zmax = self.spin_plot_zmax.value()
         if zmin >= zmax:
             return
-        meshes = [m for m in getattr(self, "_isar_meshes", None) or [] if m.axes is not None]
+        meshes = self._current_isar_image_meshes()
         if not meshes:
             return
         for mesh in meshes:
@@ -2034,6 +2179,15 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             self._apply_colorbar_ticks(colorbar)
         self._update_current_python_plot_style()
         self.plot_canvas.draw_idle()
+
+    def _current_isar_image_meshes(self) -> list:
+        if self.last_plot_mode == "az_vs_range":
+            mesh = getattr(self, "_az_vs_range_mesh", None)
+            candidates = [mesh] if mesh is not None else []
+        else:
+            candidates = getattr(self, "_isar_meshes", None) or []
+        axes = self.plot_figure.axes
+        return [mesh for mesh in candidates if mesh.axes in axes]
 
 
     def _fit_polar_y_range(self) -> tuple[float, float]:
@@ -2226,11 +2380,25 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         return float(finite[0])
 
     def _hover_z_from_axes(self, ax, event) -> float | None:
+        self._hover_native_location = None
+        self._hover_display_only = False
         artists = []
         artists.extend(reversed(getattr(ax, "collections", [])))
         artists.extend(reversed(getattr(ax, "images", [])))
         for artist in artists:
-            rectilinear = getattr(artist, "_grim_rectilinear_data", None)
+            probe = getattr(artist, "_grim_native_probe", None)
+            if probe is not None:
+                value = probe(getattr(event, "xdata", None), getattr(event, "ydata", None))
+                if isinstance(value, tuple) and len(value) == 3:
+                    self._hover_native_location = value[:2]
+                    return self._cursor_data_to_scalar(value[2])
+                if value is not None:
+                    return self._cursor_data_to_scalar(value)
+                continue
+            rectilinear = getattr(artist, "_grim_native_rectilinear_data", None)
+            if rectilinear is None:
+                rectilinear = getattr(artist, "_grim_rectilinear_data", None)
+            self._hover_display_only = bool(getattr(artist, "_grim_native_probe_unavailable", False))
             if rectilinear is not None:
                 x_edges, y_edges, values = rectilinear
                 x, y = getattr(event, "xdata", None), getattr(event, "ydata", None)
@@ -2393,6 +2561,14 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             return
 
         z_val = self._hover_z_from_axes(ax, event)
+        peak_location = getattr(self, "_hover_native_location", None)
+        if peak_location is not None:
+            label.setText(
+                f"Overview block peak at x: {self._format_hover_number(peak_location[0])}"
+                f"   y: {self._format_hover_number(peak_location[1])}"
+                f"   z: {self._format_hover_number(z_val)}"
+            )
+            return
         if z_val is None:
             label.setText(
                 f"x: {self._format_hover_number(x_val)}   y: {self._format_hover_number(y_val)}"
@@ -2401,6 +2577,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         label.setText(
             f"x: {self._format_hover_number(x_val)}   y: {self._format_hover_number(y_val)}"
             f"   z: {self._format_hover_number(z_val)}"
+            + (" (displayed block maximum; native probe unavailable)" if self._hover_display_only else "")
         )
 
     def _update_legend_visibility(self, checked: bool | None = None) -> None:
@@ -2541,19 +2718,21 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             "elevation_sweep",
             "isar_image",
             "delta_map",
+            "cdf",
+            "waterfall",
         }
         if mode not in supported_modes:
             spec = (
                 "unsupported",
                 mode,
                 "the recorder supports rectangular/polar azimuth, frequency, "
-                "elevation-sweep, Delta Map, and ISAR plots only",
+                "elevation-sweep, CDF, waterfall, Delta Map, and ISAR plots only",
             )
             self.last_python_plot_spec = spec
             if emit:
                 recorder.record_unsupported_plot(spec[1], spec[2])
             return
-        if mode != "delta_map" and self._button_checked(getattr(self, "btn_pbp", None)):
+        if mode not in ("delta_map", "cdf", "waterfall") and self._button_checked(getattr(self, "btn_pbp", None)):
             spec = (
                 "unsupported",
                 mode,
@@ -2563,7 +2742,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             if emit:
                 recorder.record_unsupported_plot(spec[1], spec[2])
             return
-        if mode != "delta_map" and self._button_checked(getattr(self, "btn_hold", None)):
+        if mode not in ("delta_map", "waterfall") and self._button_checked(getattr(self, "btn_hold", None)):
             spec = (
                 "unsupported",
                 mode,
@@ -2628,6 +2807,20 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             "polar_zero": self._polar_zero_location(),
         }
         parameters.update(override)
+        analysis = getattr(self, "analysis_controls", None)
+        if mode in ("frequency", "elevation_sweep") and callable(getattr(analysis, "sweep_aggregation", None)):
+            parameters["sweep_options"] = analysis.sweep_aggregation()
+        if mode == "cdf" and callable(getattr(analysis, "cdf_options", None)):
+            parameters["cdf_options"] = analysis.cdf_options()
+        image_analysis = getattr(self, "image_analysis_controls", None)
+        if mode == "waterfall" and callable(getattr(image_analysis, "options", None)):
+            parameters["heatmap_options"] = image_analysis.options()
+            parameters["show_colorbar"] = bool(self.chk_colorbar.isChecked())
+            parameters["shared_colorbar"] = bool(self.chk_colorbar_shared.isChecked())
+            parameters["color_limits"] = (
+                (float(self.spin_plot_zmin.value()), float(self.spin_plot_zmax.value()))
+                if self.spin_plot_zmin.value() < self.spin_plot_zmax.value() else None
+            )
         if mode == "isar_image":
             parameters.update(self._current_isar_python_display_style())
         spec = (

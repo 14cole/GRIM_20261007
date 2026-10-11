@@ -1,68 +1,19 @@
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 
 from . import common
+from .. import sweep_analysis
 
 
 def _series(self, reference, plan, *, p50_mode, az_bounds):
     """Yield (x, display, label, trace_key) for one dataset, one per frequency."""
     name, dataset, freq_indices, az_indices, elev_indices, pol_indices = plan
-    freq_unit = self._plot_axis_unit(reference, "frequency")
-    az_unit = self._plot_axis_unit(reference, "azimuth")
-    az_name = self._plot_axis_name(reference, "azimuth")
-    az_min, az_max = az_bounds
-    x_values = self._plot_axis_values(
-        reference, dataset, "elevation", dataset.elevations[elev_indices]
+    yield from sweep_analysis.iter_series(
+        name, dataset, reference, (az_indices, elev_indices, freq_indices, pol_indices),
+        sweep_axis="elevation", config=sweep_analysis.owner_options(self),
+        phase=self._button_checked(self.btn_phase), scale=self._plot_scale_mode(),
     )
-    pol_value = dataset.polarizations[pol_indices[0]]
-    selected_azimuths = tuple(float(value) for value in dataset.azimuths[az_indices])
-    selected_elevations = tuple(float(value) for value in dataset.elevations[elev_indices])
-    for freq_idx in freq_indices:
-        native_frequency = float(dataset.frequencies[freq_idx])
-        frequency = float(
-            self._plot_axis_values(reference, dataset, "frequency", [native_frequency])[0]
-        )
-        if self._button_checked(self.btn_phase):
-            raw = dataset.rcs_slice(
-                np.ix_(az_indices, elev_indices, [freq_idx], [pol_indices[0]])
-            )[:, :, 0, 0]
-            phase_degrees = self._phase_display_degrees(dataset, raw)
-            display = (
-                self._wrap_phase_degrees(
-                    dataset, self._phase_p50(phase_degrees, axis=0)
-                )
-                if p50_mode else phase_degrees[0]
-            )
-        else:
-            power = dataset.rcs_power[
-                np.ix_(az_indices, elev_indices, [freq_idx], [pol_indices[0]])
-            ][:, :, 0, 0]
-            power = np.where(np.isfinite(power), power, np.nan)
-            if p50_mode:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", category=RuntimeWarning)
-                    linear = np.nanmedian(power, axis=0)
-            else:
-                linear = power[0]
-            display = self._display_from_linear(
-                dataset, linear, frequency_value=native_frequency
-            )
-        if p50_mode:
-            label = (
-                f"{name} | Pol {pol_value}, Freq {frequency:.12g} {freq_unit}, "
-                f"P50 over {az_name} ({az_min:.12g},{az_max:.12g}) {az_unit}"
-            )
-        else:
-            label = (
-                f"{name} | Pol {pol_value}, Freq {frequency:.12g} {freq_unit}, "
-                f"{az_name} {az_min:.12g} {az_unit}"
-            )
-        trace_key = ("p50" if p50_mode else "cut", selected_azimuths,
-                     selected_elevations, native_frequency, str(pol_value))
-        yield x_values, display, label, trace_key
 
 
 def render(self) -> None:
@@ -92,6 +43,8 @@ def render(self) -> None:
     if polarization is None:
         return
 
+    config = sweep_analysis.owner_options(self)
+    individual = config["mode"] == "individual"
     p50_mode = az_values.size > 1
     skipped: list[str] = []
     plans = []
@@ -127,7 +80,7 @@ def render(self) -> None:
             f"frequency, and polarization values.{detail}"
         )
         return
-    self._configure_line_budget(sum(len(plan[2]) for plan in plans))
+    self._configure_line_budget(sum(len(plan[2]) * (len(plan[3]) if individual else 1) for plan in plans))
     try:
         common.validate_synchronous_plot_workload(
             operation="Elevation sweep",
@@ -147,12 +100,16 @@ def render(self) -> None:
     ):
         return
 
+    self.plot_figure.set_layout_engine("constrained")
+    self.plot_figure._grim_analysis_constrained_layout = True
+
     rendered = 0
     omitted = 0
     for plan in plans:
         name, dataset, freq_indices = plan[0], plan[1], plan[2]
+        candidates = len(freq_indices) * (len(plan[3]) if individual else 1)
         if rendered >= common.MAX_LINE_SERIES:
-            omitted += len(freq_indices)
+            omitted += candidates
             continue
         series = series_for(plan)
         for candidate_index, (x_values, display, label, trace_key) in enumerate(series):
@@ -163,7 +120,7 @@ def render(self) -> None:
                                         dataset=dataset, trace_key=trace_key)
                 rendered += 1
                 if rendered >= common.MAX_LINE_SERIES:
-                    omitted += len(freq_indices) - candidate_index - 1
+                    omitted += candidates - candidate_index - 1
                     break
 
     if rendered == 0:
@@ -180,7 +137,7 @@ def render(self) -> None:
         )
 
     self.plot_ax.set_xlabel(self._plot_axis_label(reference, "elevation"))
-    tag = " P50" if p50_mode else ""
+    tag = sweep_analysis.axis_tag(config, phase=self._button_checked(self.btn_phase)) if p50_mode or config["mode"] != "median" else ""
     self.plot_ax.set_ylabel(self._display_axis_label(datasets, tag=tag))
     self._update_legend_visibility()
     self.spin_plot_xmin.blockSignals(True)

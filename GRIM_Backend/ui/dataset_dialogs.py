@@ -218,9 +218,10 @@ class RegridDialog(QDialog):
         "frequency": "Frequency",
     }
 
-    def __init__(self, reference: "RcsGrid", parent=None) -> None:
+    def __init__(self, reference: "RcsGrid", parent=None, *, dataset_entries=None) -> None:
         super().__init__(parent)
         self._reference = reference
+        self._dataset_entries = list(dataset_entries or [("Active dataset", reference)])
         self.setWindowTitle("Regrid")
         self.setMinimumWidth(500)
         layout = QVBoxLayout(self)
@@ -258,6 +259,21 @@ class RegridDialog(QDialog):
         grid.addWidget(self._spin_step, 3, 1)
         layout.addLayout(grid)
 
+        self._support = QComboBox()
+        self._support.addItem("Interpolate between measured coordinates", "interpolate")
+        self._support.addItem("Keep measured coordinates only; mask new coordinates", "measured-only")
+        layout.addWidget(self._support)
+        gap_row = QHBoxLayout()
+        self._limit_gap = QCheckBox("Mask interpolation across gaps larger than")
+        self._max_gap = QDoubleSpinBox()
+        self._max_gap.setDecimals(9)
+        self._max_gap.setRange(1e-9, 1e300)
+        self._max_gap.setEnabled(False)
+        self._limit_gap.toggled.connect(self._max_gap.setEnabled)
+        gap_row.addWidget(self._limit_gap)
+        gap_row.addWidget(self._max_gap)
+        layout.addLayout(gap_row)
+
         self._summary = QLabel()
         self._summary.setWordWrap(True)
         self._summary.setStyleSheet("color: gray;")
@@ -265,6 +281,9 @@ class RegridDialog(QDialog):
         self._axis.currentIndexChanged.connect(self._load_axis_defaults)
         for spin in (self._spin_start, self._spin_stop, self._spin_step):
             spin.valueChanged.connect(self._update_summary)
+        self._support.currentIndexChanged.connect(self._update_summary)
+        self._limit_gap.toggled.connect(self._update_summary)
+        self._max_gap.valueChanged.connect(self._update_summary)
         self._load_axis_defaults()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -296,6 +315,10 @@ class RegridDialog(QDialog):
         self._spin_start.setValue(float(np.min(values)))
         self._spin_stop.setValue(float(np.max(values)))
         self._spin_step.setValue(step)
+        self._max_gap.blockSignals(True)
+        self._max_gap.setSuffix(f" {unit}")
+        self._max_gap.setValue(step * 2.0)
+        self._max_gap.blockSignals(False)
         for spin in (self._spin_start, self._spin_stop, self._spin_step):
             spin.blockSignals(False)
         self._update_summary()
@@ -311,6 +334,36 @@ class RegridDialog(QDialog):
             f"Resolved grid: {count:,} samples; final coordinate {resolved:.9g}. "
             "The stop value is not exceeded."
         )
+        if count > 100_000:
+            self._summary.setText(self._summary.text() + "\nDetailed coverage counts will be recorded in output provenance.")
+            return
+        target = start + np.arange(count, dtype=float) * step
+        axis = str(self._axis.currentData())
+        unit = self._axis_values_and_unit(axis)[1]
+        lines = [self._summary.text()]
+        for name, dataset in self._dataset_entries:
+            try:
+                if axis in {"azimuth", "elevation"}:
+                    source = _angle_axis_degrees(dataset, axis)
+                else:
+                    source_unit = _canonical_frequency_unit((dataset.units or {}).get("frequency", "GHz"))
+                    source = np.asarray(dataset.frequencies) * (_FREQUENCY_TO_HZ[source_unit.lower()] / _FREQUENCY_TO_HZ[unit.lower()])
+                snapped_target, _exact = RcsGrid._snap_interpolation_coordinates(source, target)
+                if snapped_target[0] < np.min(source) or snapped_target[-1] > np.max(source):
+                    lines.append(f"{name}: requested range extends outside measured support.")
+                    continue
+                exact, excluded = RcsGrid._interpolation_support(
+                    source, target,
+                    max_gap=self._max_gap.value() if self._limit_gap.isChecked() else None,
+                    support=str(self._support.currentData()),
+                )
+                lines.append(f"{name}: {np.count_nonzero(exact):,} measured, "
+                             f"{np.count_nonzero(~exact & ~excluded):,} interpolated, "
+                             f"{np.count_nonzero(excluded):,} policy-masked coordinates.")
+            except (ValueError, TypeError) as exc:
+                lines.append(f"{name}: {exc}")
+        lines.append("Coordinate counts describe sampling; existing missing response samples remain missing.")
+        self._summary.setText("\n".join(lines))
 
     def get_values(self) -> tuple[float, float, float]:
         return (
@@ -327,6 +380,8 @@ class RegridDialog(QDialog):
             "stop": stop,
             "step": step,
             "unit": self._axis_values_and_unit(str(self._axis.currentData()))[1],
+            "max_gap": float(self._max_gap.value()) if self._limit_gap.isChecked() else None,
+            "support": str(self._support.currentData()),
         }
 
 InterpolateDialog = RegridDialog
@@ -1023,9 +1078,10 @@ class WrapDialog(QDialog):
 class DecimateDialog(QDialog):
     """Configure boxcar-prefiltered integer-factor downsampling."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, dataset_entries=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Decimate with Prefilter")
+        self._dataset_entries = list(dataset_entries or [])
         layout = QVBoxLayout(self)
         note = QLabel(
             "Average adjacent bins on a uniformly sampled source axis before "
@@ -1045,20 +1101,34 @@ class DecimateDialog(QDialog):
         self._mode = QComboBox()
         self._mode.addItem("Linear-power mean (phase becomes unknown)", "power")
         self._mode.addItem("Coherent complex-field mean", "coherent")
+        self._partial = QComboBox()
+        self._partial.addItem("Keep final partial bin (may make spacing nonuniform)", "keep")
+        self._partial.addItem("Drop trailing partial bin (uniform output spacing)", "drop")
         grid.addWidget(QLabel("Axis:"), 0, 0)
         grid.addWidget(self._axis, 0, 1)
         grid.addWidget(QLabel("Integer factor:"), 1, 0)
         grid.addWidget(self._factor, 1, 1)
         grid.addWidget(QLabel("Filter domain:"), 2, 0)
         grid.addWidget(self._mode, 2, 1)
+        grid.addWidget(QLabel("Incomplete final bin:"), 3, 0)
+        grid.addWidget(self._partial, 3, 1)
         layout.addLayout(grid)
         warning = QLabel(
-            "The final partial bin is retained using its actual sample count. "
+            "Keeping a partial bin preserves its samples but can make the output "
+            "unsuitable for uniform-grid FFT processing. Dropping it discards only "
+            "the trailing samples shown below. Boxcar filtering has limited stopband rejection. "
             "A coherent mean requires finite phase and represents filtered field, "
             "not averaged RCS power."
         )
         warning.setWordWrap(True)
         layout.addWidget(warning)
+        self._preview = QLabel()
+        self._preview.setWordWrap(True)
+        layout.addWidget(self._preview)
+        self._axis.currentIndexChanged.connect(self._update_preview)
+        self._factor.valueChanged.connect(self._update_preview)
+        self._partial.currentIndexChanged.connect(self._update_preview)
+        self._update_preview()
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -1069,7 +1139,27 @@ class DecimateDialog(QDialog):
             "axis": str(self._axis.currentData()),
             "factor": int(self._factor.value()),
             "mode": str(self._mode.currentData()),
+            "partial": str(self._partial.currentData()),
         }
+
+    def _update_preview(self, *_args) -> None:
+        from GRIM_Backend.datasets.transforms import decimation_axis_plan
+        axis = str(self._axis.currentData())
+        lines = []
+        for name, dataset in self._dataset_entries:
+            try:
+                values, report = decimation_axis_plan(
+                    dataset.get_axis(axis), self._factor.value(), str(self._partial.currentData()))
+                unit = (dataset.units or {}).get(axis, "GHz" if axis == "frequency" else "deg")
+                spacing = "uniform" if report["output_uniform"] else "NONUNIFORM"
+                lines.append(f"{name}: {len(values):,} output coordinates, {spacing}; "
+                             f"{report['discarded_source_coordinate_count']:,} trailing coordinates discarded.")
+                if report["output_step_min"] is not None:
+                    lines.append(f"  Step {report['output_step_min']:.9g}…{report['output_step_max']:.9g} {unit}; "
+                                 f"partial bin contains {report['partial_bin_sample_count']} source coordinates.")
+            except (ValueError, TypeError) as exc:
+                lines.append(f"{name}: {exc}")
+        self._preview.setText("\n".join(lines) or "Select datasets to preview output sampling.")
 
 class MedianizeDialog(QDialog):
     """Pick the sliding-window parameters for a median smoothing pass along
