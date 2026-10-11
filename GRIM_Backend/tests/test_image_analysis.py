@@ -248,7 +248,7 @@ def test_controls_recover_from_invalid_settings_and_keep_distinct_axes(app):
     assert len(set(controls.axes()))==2
     settings={"axes":["elevation","azimuth"],"aggregation":"mean_power","linked_cuts":False}
     controls.restore_options(settings)
-    assert controls.options()==settings
+    assert controls.options()=={**settings, "horizontal_cuts":False, "vertical_cuts":False, "cut_position":None}
 
 
 def test_dialog_links_views_blinks_swipes_summarizes_roi_and_releases_on_reject(app):

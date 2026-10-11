@@ -1,10 +1,12 @@
 """Offscreen workflows exercise native data, controls, and dialog lifetime."""
+import csv
+import io
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from matplotlib.figure import Figure
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QFileDialog, QWidget
 
 from GRIM_Backend.plotting.markers import PlotMarkersMixin
 from GRIM_Backend.ui.engineering_analysis import show_engineering_analysis
@@ -136,6 +138,15 @@ def test_reference_cut_matches_physical_fixed_coordinate_not_integer_index(owner
     b.azimuths = np.array([-.5, 0., .5])
     with pytest.raises(ValueError, match="no matching azimuth"):
         dialog._cut(reference=True)
+    dialog.phase_view.setCurrentIndex(dialog.phase_view.findData("residual"))
+    assert not dialog.detail_sections["phase"].header.isChecked()
+    assert dialog.analysis_errors["phase"].isVisible()
+    assert "no matching azimuth" in dialog.analysis_errors["phase"].text()
+    assert not dialog._panels["phase"][2].rows
+    b.azimuths = np.deg2rad([-90., 0., 90.])
+    dialog._update_current()
+    assert dialog.analysis_errors["phase"].isHidden()
+    assert dialog._panels["phase"][2].rows
 
 
 def test_refresh_with_no_sources_clears_all_old_results(owner):
@@ -159,18 +170,71 @@ def test_released_native_trace_cannot_silently_fall_back_to_overview(owner):
     line._grim_native_samples.values = None
     dialog._update_current()
     assert "released" in dialog._panels["measure"][3].text()
+    assert dialog.analysis_errors["measure"].isVisible()
+    assert "released" in dialog.analysis_errors["measure"].text()
+    assert not dialog.detail_sections["measure"].header.isChecked()
     assert not dialog._panels["measure"][2].rows
 
 
 def test_reject_cleanup_allows_singleton_to_reopen(owner, application):
-    first = show_engineering_analysis(owner)
+    first = show_engineering_analysis(owner, "phase")
+    assert show_engineering_analysis(owner) is first
+    assert first.tabs.currentIndex() == 1
+    assert show_engineering_analysis(owner, "polarization") is first
+    assert first.tabs.currentIndex() == 2
     first.reject(); application.processEvents()
     assert owner._engineering_analysis_dialog is None
-    second = show_engineering_analysis(owner, "polarization")
+    second = show_engineering_analysis(owner)
     assert second is not first
     assert second.tabs.currentIndex() == 2
+    show_engineering_analysis(owner, "measure")
+    assert second.tabs.currentIndex() == 0
     second.close(); application.processEvents()
     assert owner._engineering_analysis_dialog is None
+
+
+def test_collapsed_details_keep_complete_numerical_copy_and_export(owner, monkeypatch, tmp_path):
+    dialog = show_engineering_analysis(owner, "phase")
+    dialog.phase_view.setCurrentIndex(dialog.phase_view.findData("slope"))
+    table = dialog._panels["phase"][2]
+    expected = [["Metric", "Value", "Unit / context"], *table.rows]
+    assert not dialog.detail_sections["phase"].header.isChecked()
+    assert not table.isVisible()
+    table.copy()
+    assert list(csv.reader(io.StringIO(QApplication.clipboard().text()), delimiter="\t")) == expected
+    output = tmp_path / "phase-results.csv"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *_args: (str(output), "CSV (*.csv)"))
+    dialog._export_results("phase")
+    with output.open(encoding="utf-8-sig", newline="") as stream:
+        assert list(csv.reader(stream)) == expected
+    assert any("apparent delay" in row[0] for row in expected)
+    assert any(row[0] == "Conventions and interpretation" for row in expected)
+
+
+def test_contextual_controls_follow_the_analysis_source_and_view(owner):
+    ax = owner.plot_figure.add_subplot(111)
+    owner.lines = list(ax.plot([0., 1., 2.], [0., 2., 0.], label="Plot trace"))
+    dialog = show_engineering_analysis(owner)
+    assert not dialog.advanced_section.header.isChecked()
+    dialog.trace_combo.setCurrentIndex(1)
+    assert not dialog.dataset_combo.isVisible()
+    assert not dialog.axis_combo.isVisible()
+    assert dialog._measurement[2]["peak"]["y"] == 2.
+    dialog.tabs.setCurrentIndex(1)
+    assert dialog.dataset_combo.isVisible()
+    assert not dialog.reference_combo.isVisible()
+    assert not dialog.phase_sign.isVisible()
+    dialog.phase_view.setCurrentIndex(dialog.phase_view.findData("residual"))
+    assert dialog.reference_combo.isVisible()
+    dialog.phase_view.setCurrentIndex(dialog.phase_view.findData("slope"))
+    assert not dialog.reference_combo.isVisible()
+    assert dialog.phase_sign.isVisible()
+    dialog.tabs.setCurrentIndex(2)
+    assert not dialog.fixed["polarization"].isVisible()
+    assert not dialog.pol_a.isVisible()
+    dialog.pol_view.setCurrentIndex(dialog.pol_view.findData("phase"))
+    assert dialog.pol_a.isVisible() and dialog.pol_b.isVisible()
+    assert len(dialog._panels["polarization"][0].axes) == 2
 
 
 def test_optional_gap_limit_breaks_rendered_phase_lines(owner):

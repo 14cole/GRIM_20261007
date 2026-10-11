@@ -176,6 +176,111 @@ def test_headless_heatmap_physical_planes_and_linked_cuts(axes):
     assert len(fig.axes)==3
 
 
+def waterfall_example(*, options=None, legacy=False, multiple=False):
+    data = 100.*np.arange(3)[:, None] + 10.*np.arange(4)[None, :]
+    ds = grid(data[:, None, :, None], az=[-3., .75, 9.5], frequencies=[2., 4., 11., 16.])
+    datasets = [("A", ds)]
+    if multiple:
+        datasets.append(("B", grid((data+1000.)[:, None, :, None], az=ds.azimuths, frequencies=ds.frequencies)))
+    fig = plot_datasets(datasets, mode="waterfall", azimuths=ds.azimuths,
+                        elevations=ds.elevations, frequencies=ds.frequencies,
+                        polarization="HH", scale="linear", heatmap_cuts=legacy,
+                        heatmap_options=options, show_colorbar=False)
+    return fig, ds, data
+
+
+@pytest.mark.parametrize("horizontal,vertical", [(False,False), (True,False), (False,True), (True,True)])
+def test_headless_waterfall_independent_cuts_use_requested_irregular_sample(horizontal, vertical):
+    fig, ds, data = waterfall_example(options={"linked_cuts":True,
+        "horizontal_cuts":horizontal,"vertical_cuts":vertical,"cut_position":[5.,8.]})
+    assert len(fig.axes) == 1 + horizontal + vertical
+    image = fig.axes[0]
+    assert len(image.lines) == horizontal + vertical
+    assert len(fig._grim_heatmap_cut_callbacks) == int(horizontal or vertical)
+    slot = 1
+    if horizontal:
+        cut = fig.axes[slot]; slot += 1
+        np.testing.assert_allclose(cut.lines[0].get_xdata(), ds.azimuths)
+        np.testing.assert_allclose(cut.lines[0].get_ydata(), data[:,2])
+        assert "11 GHz" in cut.get_title()
+        np.testing.assert_allclose(image.lines[0].get_ydata(), [11.,11.])
+    if vertical:
+        cut = fig.axes[slot]
+        np.testing.assert_allclose(cut.lines[0].get_xdata(), ds.frequencies)
+        np.testing.assert_allclose(cut.lines[0].get_ydata(), data[1,:])
+        assert "0.75 deg" in cut.get_title()
+        np.testing.assert_allclose(image.lines[-1].get_xdata(), [.75,.75])
+
+
+@pytest.mark.parametrize("options,legacy,expected", [
+    (None,True,2), ({"linked_cuts":True},False,2),
+    ({"linked_cuts":True,"horizontal_cuts":False},False,1),
+    ({"vertical_cuts":False},True,1),
+    ({"horizontal_cuts":True},False,1),
+    ({"linked_cuts":False},True,0),
+])
+def test_headless_waterfall_legacy_flags_and_default_position(options, legacy, expected):
+    fig, ds, data = waterfall_example(options=options, legacy=legacy)
+    assert len(fig.axes) == 1 + expected
+    for cut in fig.axes[1:]:
+        if cut.get_xlabel().startswith("Azimuth"):
+            np.testing.assert_allclose(cut.lines[0].get_ydata(), data[:,2])
+        else:
+            np.testing.assert_allclose(cut.lines[0].get_ydata(), data[1,:])
+
+
+def test_headless_waterfall_outside_position_snaps_to_endpoints():
+    fig, ds, data = waterfall_example(options={"linked_cuts":True,"cut_position":[99.,-100.]})
+    np.testing.assert_allclose(fig.axes[1].lines[0].get_ydata(), data[:,0])
+    np.testing.assert_allclose(fig.axes[2].lines[0].get_ydata(), data[-1,:])
+    assert "2 GHz" in fig.axes[1].get_title()
+    assert "9.5 deg" in fig.axes[2].get_title()
+
+
+def test_headless_waterfall_reversed_axes_use_display_coordinates_for_snapping():
+    # X is now frequency and Y is azimuth. A tie at 7.5 GHz consistently
+    # chooses the first sorted sample (4 GHz), not an interpolated column.
+    fig, ds, data = waterfall_example(options={"axes":["frequency","azimuth"],
+        "linked_cuts":True,"cut_position":[7.5,6.]})
+    horizontal, vertical = fig.axes[1:]
+    np.testing.assert_allclose(horizontal.lines[0].get_xdata(),ds.frequencies)
+    np.testing.assert_allclose(horizontal.lines[0].get_ydata(),data[-1,:])
+    np.testing.assert_allclose(vertical.lines[0].get_xdata(),ds.azimuths)
+    np.testing.assert_allclose(vertical.lines[0].get_ydata(),data[:,1])
+    assert "9.5 deg" in horizontal.get_title()
+    assert "4 GHz" in vertical.get_title()
+
+
+def test_headless_waterfall_click_updates_enabled_cuts_on_each_panel():
+    from matplotlib.backend_bases import MouseEvent
+    fig, ds, data = waterfall_example(options={"vertical_cuts":True,"cut_position":[-3.,2.]},multiple=True)
+    fig.canvas.draw()
+    image_a, cut_a, image_b, cut_b = fig.axes
+    assert len(image_a.lines) == len(image_b.lines) == 1
+    click = MouseEvent("button_press_event", fig.canvas, *image_b.transData.transform((8.,5.)), button=1)
+    fig.canvas.callbacks.process("button_press_event",click)
+    np.testing.assert_allclose(cut_a.lines[0].get_ydata(),data[-1,:])
+    # Navigation tools own mouse input while active.
+    fig.canvas.toolbar = SimpleNamespace(mode="pan/zoom")
+    click = MouseEvent("button_press_event", fig.canvas, *image_a.transData.transform((-2.,3.)), button=1)
+    fig.canvas.callbacks.process("button_press_event",click)
+    np.testing.assert_allclose(cut_a.lines[0].get_ydata(),data[-1,:])
+    fig.canvas.toolbar = None
+    np.testing.assert_allclose(cut_b.lines[0].get_ydata(),data[-1,:]+1000.)
+    np.testing.assert_allclose(image_a.lines[0].get_xdata(),[9.5,9.5])
+    np.testing.assert_allclose(image_b.lines[0].get_xdata(),[9.5,9.5])
+    # A context-menu click must not change the selected sample.
+    click = MouseEvent("button_press_event", fig.canvas, *image_a.transData.transform((-2.,3.)), button=3)
+    fig.canvas.callbacks.process("button_press_event",click)
+    np.testing.assert_allclose(cut_a.lines[0].get_ydata(),data[-1,:])
+
+
+@pytest.mark.parametrize("position", [[1.], [1.,2.,3.], [np.nan,2.], [1.,np.inf]])
+def test_headless_waterfall_invalid_positions_have_clear_error(position):
+    with pytest.raises(ValueError,match="two finite displayed coordinates"):
+        waterfall_example(options={"horizontal_cuts":True,"cut_position":position})
+
+
 def test_new_headless_modes_never_import_qt():
     code=r'''
 import importlib.abc, sys
@@ -189,7 +294,7 @@ from GRIM_Backend.datasets.grid import RcsGrid
 from GRIM_Backend.scripting.plotting import plot_datasets
 d=RcsGrid([0,1],[0],[9,10],['HH'],rcs_power=np.ones((2,1,2,1)))
 args=dict(datasets=[('Run',d)],azimuths=d.azimuths,elevations=d.elevations,frequencies=d.frequencies,polarization='HH')
-for mode,options in [('frequency',{'sweep_options':{'mode':'max'}}),('cdf',{'cdf_options':{'threshold_enabled':True}}),('heatmap',{'heatmap_options':{'axes':['azimuth','frequency'],'linked_cuts':True}})]:
+for mode,options in [('frequency',{'sweep_options':{'mode':'max'}}),('cdf',{'cdf_options':{'threshold_enabled':True}}),('heatmap',{'heatmap_options':{'axes':['azimuth','frequency'],'linked_cuts':True}}),('waterfall',{'heatmap_options':{'horizontal_cuts':True,'vertical_cuts':False,'cut_position':[.9,9.4]}})]:
     f=plot_datasets(mode=mode,**args,**options)
     f.canvas.draw()
 assert not any(n.startswith(('PySide','PyQt')) for n in sys.modules)

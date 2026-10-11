@@ -294,6 +294,17 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if callable(save_preferences):
             save_preferences()
         mode = self.last_plot_mode
+        if kind == "heatmap_position":
+            # A cursor move changes only the frozen display recipe. Keep its
+            # original dataset selections even if the lists have since changed.
+            spec = getattr(self, "last_python_plot_spec", None)
+            if spec and spec[0] == "supported" and spec[3] == "waterfall":
+                parameters = dict(spec[4])
+                options = dict(parameters.get("heatmap_options", {}))
+                options["cut_position"] = self.image_analysis_controls.options()["cut_position"]
+                parameters["heatmap_options"] = options
+                self.last_python_plot_spec = (*spec[:4], parameters)
+            return
         affected = {
             "pbp": mode in ("azimuth_rect", "azimuth_polar", "frequency")
             and self._button_checked(getattr(self, "btn_pbp", None)),
@@ -1005,6 +1016,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     # --- renderer preflight, unit conversion, and display bounding ----------
 
     def _start_plot_render(self) -> None:
+        image_controls = getattr(self, "image_analysis_controls", None)
+        if image_controls is not None and self.last_plot_mode != "waterfall":
+            bar = getattr(image_controls, "cut_bar", None)
+            if bar is not None:
+                bar.hide()
         overlays = getattr(self, "spatial_overlays", None)
         if overlays is not None:
             overlays.stop_interaction()
@@ -2220,12 +2236,31 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             ymax += pad
         return ymin, ymax
 
+    def _waterfall_coordinate_limits(self, coordinate):
+        """Fit image cells, excluding cut cursors from data bounds.
+
+        Matplotlib relim() omits QuadMesh collections, so a lone crosshair
+        otherwise collapses the corresponding image axis to one sample.
+        """
+        if self.last_plot_mode != "waterfall":
+            return None
+        edges = [artist._grim_rectilinear_data[coordinate]
+                 for ax in (self.plot_axes or [self.plot_ax]) for artist in ax.collections
+                 if getattr(artist, "_grim_image_record", None) is not None
+                 and getattr(artist, "_grim_rectilinear_data", None) is not None]
+        if not edges:
+            return None
+        return min(float(np.min(v)) for v in edges), max(float(np.max(v)) for v in edges)
+
     def _fit_x(self) -> None:
         if self.plot_ax.name == "polar":
             return
 
         delta = getattr(self.plot_ax, "_grim_delta_map", None)
-        if delta is not None:
+        waterfall_limits = self._waterfall_coordinate_limits(0)
+        if waterfall_limits is not None:
+            self.plot_ax.set_xlim(*waterfall_limits)
+        elif delta is not None:
             edges = delta_map_mode.cell_edges(delta.x)
             self.plot_ax.set_xlim(edges[0], edges[-1])
         else:
@@ -2264,6 +2299,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                 ax.set_ylim(ymin, ymax)
             self.plot_canvas.draw_idle()
             return
+        elif self._waterfall_coordinate_limits(1) is not None:
+            ymin, ymax = self._waterfall_coordinate_limits(1)
+            self.plot_ax.set_ylim(ymin, ymax)
         elif hasattr(self.plot_ax, "_grim_delta_map"):
             edges = delta_map_mode.cell_edges(self.plot_ax._grim_delta_map.y)
             ymin, ymax = edges[0], edges[-1]

@@ -124,9 +124,7 @@ PLOT_OPS_SPECS = {
             ("Overlays", "overlays"),
         ),
         (
-            ("Measure…", "measure"),
-            ("Phase Diagnostics…", "phase_diagnostics"),
-            ("Polarization…", "polarization_diagnostics"),
+            ("Engineering Analysis…", "engineering_analysis"),
             ("Images A/B…", "image_compare"),
         ),
     ),
@@ -147,13 +145,24 @@ PLOT_OPS_SPECS = {
             ("Auto Scale", "auto_scale"),
         ),
         (
-            ("Measure…", "measure"),
-            ("Phase Diagnostics…", "phase_diagnostics"),
-            ("Polarization…", "polarization_diagnostics"),
+            ("Engineering Analysis…", "engineering_analysis"),
             ("Images A/B…", "image_compare"),
         ),
     ),
 }
+
+# Plotting groups reuse the same buttons and signal wiring. The common
+# controls sit beside the tab headings and remain available on either page.
+PLOTTING_CONTROL_GROUPS = (
+    ("Plots", (
+        ("azimuth_rect", "azimuth_polar", "frequency", "elevation_sweep", "waterfall", "cdf"),
+        ("compare", "delta_map", "sector_stats", "range_freq", "pbp", "image_compare"),
+    )),
+    ("Plot Manipulation", (
+        ("fit_x", "fit_y", "fit_both", "zoom_box", "pan", "auto_plot", "phase"),
+        ("markers", "slider", "overlays", "engineering_analysis"),
+    )),
+)
 
 
 def _extract_supported_drop_paths(mime: QMimeData) -> list[str]:
@@ -919,13 +928,10 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.lbl_az.doubleClicked.connect(lambda: self.list_az.selectAll())
 
         for tab_key, controls in self._plot_controls_by_tab.items():
-            for role, diagnostic_tab in (("measure", "measure"),
-                                         ("phase_diagnostics", "phase"),
-                                         ("polarization_diagnostics", "polarization")):
-                if role in controls:
-                    controls[role].clicked.connect(
-                        lambda _checked=False, tab=diagnostic_tab: self._show_engineering_tool(tab)
-                    )
+            if "engineering_analysis" in controls:
+                controls["engineering_analysis"].clicked.connect(
+                    lambda _checked=False: self._show_engineering_tool()
+                )
             if "image_compare" in controls:
                 controls["image_compare"].clicked.connect(self._show_image_comparison)
             if "azimuth_rect" in controls:
@@ -1326,7 +1332,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         finally:
             dialog.deleteLater()
 
-    def _show_engineering_tool(self, tab="measure") -> None:
+    def _show_engineering_tool(self, tab=None) -> None:
         from GRIM_Backend.ui.engineering_analysis import show_engineering_analysis
         show_engineering_analysis(self, tab=tab)
 
@@ -1854,6 +1860,8 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         plot_layout.addWidget(compare_sector_bar)
         delta_map_controls = DeltaMapControls()
         plot_layout.addWidget(delta_map_controls)
+        if image_analysis_controls is not None:
+            plot_layout.addWidget(image_analysis_controls.cut_bar)
         spatial_overlays = SpatialOverlayPanel(self, plot_canvas)
         plot_layout.addWidget(spatial_overlays)
         plot_layout.addWidget(plot_canvas, 1)
@@ -1879,10 +1887,8 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             lambda event, lbl=hover_readout: self._reset_hover_readout(lbl),
         )
 
-        # Plot-operations toolbar — docked above the plot, actions split across
-        # two rows so the toolbar's minimum width stays narrow (otherwise a
-        # single long row forces the whole plot area wider than the screen and
-        # pushes the right-hand buttons off-screen when the side panels open).
+        # Reuse these controls across compact pages on Plotting; ISAR retains
+        # its toolbar rows. Only the presentation changes, not the actions.
         row_specs = PLOT_OPS_SPECS[tab_key]
         plot_controls: dict[str, QToolButton] = {}
 
@@ -1914,9 +1920,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 "frequency": "Frequency response by elevation/polarization. Choose individual angular cuts, linear-power mean, median, percentile, or maximum in Plot Settings.",
                 "elevation_sweep": "Elevation response by frequency/polarization. Choose individual angular cuts or an explicit aggregation in Plot Settings; coverage is reported.",
                 "waterfall": "Waterfall view over any pair of azimuth, elevation, and frequency, with linked horizontal and vertical cuts. Choose axes in Plot Settings.",
-                "measure": "Search native samples for peaks, minima, crossings and bandwidth; inspect cursor-region statistics and copy results.",
-                "phase_diagnostics": "Inspect paired magnitude/phase, unwrap, I/Q, reference residuals, and a controlled phase-slope fit on an explicit cut.",
-                "polarization_diagnostics": "Compare polarization channels, co/cross ratios, reciprocity, and channel phase differences on explicit cuts.",
+                "engineering_analysis": "Open Measurements, Phase, and Polarization analysis in one window. Find numerical features, investigate phase differences, and compare polarization channels.",
                 "image_compare": "Compare captured images with locked coordinates and scales, linked cursors, blink/swipe, signed differences, and region statistics.",
                 "sector_stats": (
                     "Mean, median, max, min, or a percentile of linear power inside "
@@ -1953,8 +1957,8 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 btn.setToolTip(tooltips[role])
             return btn
 
-        # Legend toggle sits at the head of the toolbar (left of Hold); it
-        # replaces the old "Show Legend" checkbox in the Plot Settings window.
+        # Legend remains outside the grouped pages, alongside the common
+        # controls. ISAR keeps it at the start of its first toolbar row.
         chk_plot_legend = QToolButton(text="Legend")
         chk_plot_legend.setCheckable(True)
         chk_plot_legend.setChecked(True)
@@ -1965,15 +1969,50 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         plot_ops_bar_layout = QVBoxLayout(plot_ops_bar)
         plot_ops_bar_layout.setContentsMargins(8, 6, 8, 6)
         plot_ops_bar_layout.setSpacing(4)
-        for _row_index, _specs in enumerate(row_specs):
-            bar_row = QHBoxLayout()
-            bar_row.setSpacing(4)
-            if _row_index == 0:
-                bar_row.addWidget(chk_plot_legend)
+        for _specs in row_specs:
             for label, role in _specs:
-                bar_row.addWidget(_make_plot_button(label, role))
-            bar_row.addStretch(1)
-            plot_ops_bar_layout.addLayout(bar_row)
+                _make_plot_button(label, role)
+        if tab_key == "plotting":
+            plot_ops_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            groups = QTabWidget()
+            groups.setObjectName("plottingControlTabs")
+            groups.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            groups.setStyleSheet(
+                "QTabWidget#plottingControlTabs::right-corner { top: 1px; }"
+            )
+            common_controls = QWidget()
+            common_controls.setObjectName("plottingCommonControls")
+            common_layout = QHBoxLayout(common_controls)
+            common_layout.setContentsMargins(8, 0, 0, 0)
+            common_layout.setSpacing(4)
+            common_layout.addWidget(chk_plot_legend)
+            for role in ("auto_scale", "hold", "clear"):
+                common_layout.addWidget(plot_controls[role])
+            groups.setCornerWidget(common_controls, Qt.TopRightCorner)
+            for title, rows in PLOTTING_CONTROL_GROUPS:
+                page = QWidget()
+                page_layout = QVBoxLayout(page)
+                page_layout.setContentsMargins(6, 5, 6, 5)
+                page_layout.setSpacing(4)
+                for roles in rows:
+                    bar_row = QHBoxLayout()
+                    bar_row.setSpacing(4)
+                    for role in roles:
+                        bar_row.addWidget(plot_controls[role])
+                    bar_row.addStretch(1)
+                    page_layout.addLayout(bar_row)
+                groups.addTab(page, title)
+            plot_ops_bar_layout.addWidget(groups)
+        else:
+            for _row_index, _specs in enumerate(row_specs):
+                bar_row = QHBoxLayout()
+                bar_row.setSpacing(4)
+                if _row_index == 0:
+                    bar_row.addWidget(chk_plot_legend)
+                for _label, role in _specs:
+                    bar_row.addWidget(plot_controls[role])
+                bar_row.addStretch(1)
+                plot_ops_bar_layout.addLayout(bar_row)
         self._plot_controls_by_tab[tab_key] = plot_controls
 
         left_layout.addWidget(plot_frame, 1)
@@ -2123,9 +2162,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_slider = controls.get("slider")
         self.btn_cdf = controls.get("cdf")
         self.btn_sector_stats = controls.get("sector_stats")
-        self.btn_measure = controls.get("measure")
-        self.btn_phase_diagnostics = controls.get("phase_diagnostics")
-        self.btn_polarization_diagnostics = controls.get("polarization_diagnostics")
+        self.btn_engineering_analysis = controls.get("engineering_analysis")
         self.btn_image_compare = controls.get("image_compare")
 
         context = self._plot_contexts[tab_key]

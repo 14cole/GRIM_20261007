@@ -41,10 +41,8 @@ class RfAnalysisIntegrationTests(unittest.TestCase):
             for key in ("plotting", "isar"):
                 self.window._activate_plot_tab(key)
                 controls = self.window._plot_controls_by_tab[key]
-                for role, tab in (("measure", "measure"), ("phase_diagnostics", "phase"),
-                                  ("polarization_diagnostics", "polarization")):
-                    controls[role].click()
-                    launch.assert_called_with(self.window, tab=tab)
+                controls["engineering_analysis"].click()
+                launch.assert_called_with(self.window, tab=None)
                 controls["image_compare"].click()
                 images.assert_called_with(self.window)
         self.assertEqual(self.window._plot_controls_by_tab["plotting"]["waterfall"].text(), "Waterfall")
@@ -108,13 +106,15 @@ class RfAnalysisIntegrationTests(unittest.TestCase):
         self.window._plot_waterfall()
         spec = self.window.last_python_plot_spec
         self.assertEqual(spec[0], "supported")
-        self.assertEqual(spec[4]["heatmap_options"], options)
+        self.assertEqual(spec[4]["heatmap_options"], {**options, "horizontal_cuts":False,
+                         "vertical_cuts":False, "cut_position":[10., 10.]})
         replay = plot_datasets([("Measured", dataset)], mode=spec[3], **spec[4])
         gui = self.window.plot_ax.collections[0].get_array()
         scripted = replay.axes[0].collections[0].get_array()
         np.testing.assert_allclose(gui, scripted)
         saved = json.loads(self.app_settings.values["plotting/analysis-options-v1"])
-        self.assertEqual(saved["image"], options)
+        self.assertEqual(saved["image"], {**options, "horizontal_cuts":False,
+                         "vertical_cuts":False, "cut_position":None})
 
     def test_heatmap_settings_apply_even_when_line_hold_is_on(self):
         self.load_sample()

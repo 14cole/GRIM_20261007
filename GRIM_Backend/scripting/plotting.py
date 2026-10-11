@@ -160,6 +160,10 @@ def plot_datasets(
     reduction. ``cdf_options`` selects groups, weighting and an inclusive
     threshold; the returned figure exposes ``_grim_cdf_lookup_table``.
     ``heatmap_options`` selects axes, panels/mean_power and linked cuts.
+    ``horizontal_cuts`` and ``vertical_cuts`` independently override the legacy
+    ``linked_cuts`` flag. ``cut_position=[x, y]`` uses displayed physical units;
+    each panel snaps to its nearest samples, without interpolation. Omission
+    starts at the center sample of the first panel.
     """
 
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -249,10 +253,20 @@ def plot_datasets(
     if mode_key == "waterfall":
         from GRIM_Backend.plotting.image_analysis import AXES, AXIS_ATTRIBUTES, heatmap_display_plane
         from matplotlib.colors import Normalize
-        if heatmap_options:
-            heatmap_axes = heatmap_options.get("axes", heatmap_axes)
-            heatmap_aggregation = heatmap_options.get("aggregation", heatmap_aggregation)
-            heatmap_cuts = bool(heatmap_options.get("linked_cuts", heatmap_cuts))
+        options = dict(heatmap_options or {})
+        heatmap_axes = options.get("axes", heatmap_axes)
+        heatmap_aggregation = options.get("aggregation", heatmap_aggregation)
+        legacy_cuts = bool(options.get("linked_cuts", heatmap_cuts))
+        horizontal_cuts = bool(options.get("horizontal_cuts", legacy_cuts))
+        vertical_cuts = bool(options.get("vertical_cuts", legacy_cuts))
+        cut_position = options.get("cut_position")
+        if cut_position is not None:
+            try:
+                cut_position = np.asarray(cut_position, dtype=float)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Waterfall cut_position must contain two finite displayed coordinates [x, y]") from exc
+            if cut_position.shape != (2,) or not np.all(np.isfinite(cut_position)):
+                raise ValueError("Waterfall cut_position must contain two finite displayed coordinates [x, y]")
         x_axis, y_axis = tuple(heatmap_axes)
         if x_axis not in AXES or y_axis not in AXES or x_axis == y_axis:
             raise ValueError("Waterfall needs two different physical axes")
@@ -281,14 +295,19 @@ def plot_datasets(
             raise ValueError("No compatible Waterfall coordinates")
         figure = Figure(figsize=(10., max(4., 4.*len(panels))), dpi=100, facecolor="white")
         FigureCanvasAgg(figure)
-        spec = figure.add_gridspec(len(panels), 3 if heatmap_cuts else 1, width_ratios=(2,1,1) if heatmap_cuts else None)
+        cut_count = int(horizontal_cuts) + int(vertical_cuts)
+        spec = figure.add_gridspec(len(panels), 1 + cut_count,
+                                  width_ratios=(2, *([1] * cut_count)) if cut_count else None)
+        if cut_position is None:
+            first_x, first_y = panels[0][1:3]
+            cut_position = (first_x[len(first_x) // 2], first_y[len(first_y) // 2])
         norms = {}
         for _title, _x, _y, data, response in panels:
             finite = data[np.isfinite(data)]
             if finite.size:
                 old = norms.get(response, (np.inf, -np.inf))
                 norms[response] = (min(old[0], float(np.min(finite))), max(old[1], float(np.max(finite))))
-        callbacks, image_axes, meshes = [], [], []
+        callbacks, image_axes, meshes, cut_views = [], [], [], []
         global_limits = (min(v[0] for v in norms.values()), max(v[1] for v in norms.values())) if norms else None
         for i, (title, x, y, data, response) in enumerate(panels):
             ax = figure.add_subplot(spec[i, 0])
@@ -301,27 +320,51 @@ def plot_datasets(
             image_axes.append(ax); meshes.append(mesh)
             if show_colorbar and not shared_colorbar:
                 figure.colorbar(mesh, ax=ax, label=response)
-            if heatmap_cuts:
-                horizontal = figure.add_subplot(spec[i, 1])
-                vertical = figure.add_subplot(spec[i, 2])
-                ix, iy = len(x)//2, len(y)//2
-                row, = horizontal.plot(x, data[:, iy])
-                column, = vertical.plot(y, data[ix, :])
-                hline = ax.axhline(y[iy], color="white", linewidth=.8)
-                vline = ax.axvline(x[ix], color="white", linewidth=.8)
-                horizontal.set(xlabel=plot_common.axis_label(reference, x_axis), ylabel=response, title=f"{y_axis} = {y[iy]:g}")
-                vertical.set(xlabel=plot_common.axis_label(reference, y_axis), ylabel=response, title=f"{x_axis} = {x[ix]:g}")
-                def update(event, ax=ax, x=x, y=y, data=data, row=row, column=column, hline=hline, vline=vline, horizontal=horizontal, vertical=vertical):
-                    if event.inaxes is not ax or event.xdata is None or event.ydata is None:
-                        return
-                    ix, iy = int(np.argmin(abs(x-event.xdata))), int(np.argmin(abs(y-event.ydata)))
-                    row.set_ydata(data[:, iy]); column.set_ydata(data[ix, :])
-                    hline.set_ydata([y[iy], y[iy]]); vline.set_xdata([x[ix], x[ix]])
-                    horizontal.set_title(f"{y_axis} = {y[iy]:g}"); vertical.set_title(f"{x_axis} = {x[ix]:g}")
-                    for cut_ax in (horizontal, vertical):
-                        cut_ax.relim(); cut_ax.autoscale_view()
-                    figure.canvas.draw_idle()
-                callbacks.append(figure.canvas.mpl_connect("button_press_event", update))
+            if cut_count:
+                ix = int(np.argmin(abs(x - cut_position[0])))
+                iy = int(np.argmin(abs(y - cut_position[1])))
+                horizontal = vertical = row = column = hline = vline = None
+                slot = 1
+                if horizontal_cuts:
+                    horizontal = figure.add_subplot(spec[i, slot])
+                    slot += 1
+                    row, = horizontal.plot(x, data[:, iy])
+                    hline = ax.axhline(y[iy], color="white", linewidth=.8)
+                    horizontal.set(xlabel=plot_common.axis_label(reference, x_axis), ylabel=response,
+                                   title=f"{y_axis} = {y[iy]:g} {plot_common.axis_unit(reference, y_axis)}")
+                    horizontal.grid(bool(show_grid))
+                if vertical_cuts:
+                    vertical = figure.add_subplot(spec[i, slot])
+                    column, = vertical.plot(y, data[ix, :])
+                    vline = ax.axvline(x[ix], color="white", linewidth=.8)
+                    vertical.set(xlabel=plot_common.axis_label(reference, y_axis), ylabel=response,
+                                 title=f"{x_axis} = {x[ix]:g} {plot_common.axis_unit(reference, x_axis)}")
+                    vertical.grid(bool(show_grid))
+                cut_views.append((x, y, data, horizontal, vertical, row, column, hline, vline))
+        if cut_views:
+            def update(event):
+                if (event.inaxes not in image_axes or event.button != 1
+                        or event.xdata is None or event.ydata is None
+                        or not np.isfinite(event.xdata) or not np.isfinite(event.ydata)):
+                    return
+                toolbar = getattr(figure.canvas, "toolbar", None)
+                if toolbar is not None and getattr(toolbar, "mode", None):
+                    return
+                for x, y, data, horizontal, vertical, row, column, hline, vline in cut_views:
+                    ix = int(np.argmin(abs(x - event.xdata)))
+                    iy = int(np.argmin(abs(y - event.ydata)))
+                    if horizontal is not None:
+                        row.set_ydata(data[:, iy])
+                        hline.set_ydata([y[iy], y[iy]])
+                        horizontal.set_title(f"{y_axis} = {y[iy]:g} {plot_common.axis_unit(reference, y_axis)}")
+                        horizontal.relim(); horizontal.autoscale_view()
+                    if vertical is not None:
+                        column.set_ydata(data[ix, :])
+                        vline.set_xdata([x[ix], x[ix]])
+                        vertical.set_title(f"{x_axis} = {x[ix]:g} {plot_common.axis_unit(reference, x_axis)}")
+                        vertical.relim(); vertical.autoscale_view()
+                figure.canvas.draw_idle()
+            callbacks.append(figure.canvas.mpl_connect("button_press_event", update))
         if show_colorbar and shared_colorbar:
             response = panels[0][4] if len({p[4] for p in panels}) == 1 else "Mixed dB"
             figure.colorbar(meshes[-1], ax=image_axes, label=response)

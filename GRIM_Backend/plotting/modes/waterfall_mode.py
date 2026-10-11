@@ -24,7 +24,9 @@ def render(self) -> None:
         return
     remaining = next(axis for axis in AXES if axis not in (x_axis, y_axis))
     aggregate = controls is not None and controls.aggregation() == "mean_power"
-    show_cuts = controls is not None and controls.linked_cuts()
+    show_horizontal = controls is not None and getattr(controls, "horizontal_cuts", controls.linked_cuts)()
+    show_vertical = controls is not None and getattr(controls, "vertical_cuts", controls.linked_cuts)()
+    show_cuts = show_horizontal or show_vertical
     selected = {}
     for axis, widget in (("azimuth", self.list_az), ("elevation", self.list_elev), ("frequency", self.list_freq)):
         selected[axis] = np.asarray(sorted(self._selected_values(widget)), float)
@@ -109,21 +111,27 @@ def render(self) -> None:
     self.plot_figure.clear()
     self.plot_figure.set_facecolor(self._current_plot_bg())
     self.plot_figure.set_layout_engine("constrained")
-    cut_axes = []
+    horizontal = vertical = None
     if show_cuts:
         # Shared cut axes compare all panels without tripling the number of
         # plot rows. Two image panels remain legible on a laptop canvas.
-        outer = self.plot_figure.add_gridspec(2,1,height_ratios=[3,1.35])
+        outer = (self.plot_figure.add_gridspec(2,1,height_ratios=[3,1.35]) if show_horizontal
+                 else self.plot_figure.add_gridspec(1,2,width_ratios=[3,1]))
         columns = min(3,len(panels))
         images = outer[0].subgridspec(int(np.ceil(len(panels)/columns)),columns)
         axes = [self.plot_figure.add_subplot(images[i//columns,i%columns]) for i in range(len(panels))]
-        cuts_grid = outer[1].subgridspec(1,2,width_ratios=[3,1])
-        horizontal = self.plot_figure.add_subplot(cuts_grid[0],sharex=axes[0])
-        vertical = self.plot_figure.add_subplot(cuts_grid[1],sharey=axes[0])
+        if show_horizontal and show_vertical:
+            cuts_grid = outer[1].subgridspec(1,2,width_ratios=[3,1])
+            horizontal = self.plot_figure.add_subplot(cuts_grid[0],sharex=axes[0])
+            vertical = self.plot_figure.add_subplot(cuts_grid[1],sharey=axes[0])
+        elif show_horizontal:
+            horizontal = self.plot_figure.add_subplot(outer[1],sharex=axes[0])
+        else:
+            vertical = self.plot_figure.add_subplot(outer[1],sharey=axes[0])
         for ax in (horizontal,vertical):
-            self._style_axes(ax)
-            ax.tick_params(labelsize=7)
-        cut_axes = [(horizontal,vertical)]*len(panels)
+            if ax is not None:
+                self._style_axes(ax)
+                ax.tick_params(labelsize=7)
     else:
         columns = min(3,int(np.ceil(np.sqrt(len(panels)))))
         slots = self.plot_figure.subplots(int(np.ceil(len(panels)/columns)),columns,squeeze=False).ravel()
@@ -172,9 +180,18 @@ def render(self) -> None:
             ds = datasets if shared else [(panels[index]["name"], panels[index]["dataset"])]
             colorbar.set_label(self._display_axis_label(ds), color=self._current_plot_text())
             colorbar.ax.tick_params(colors=self._current_plot_text())
-    if show_cuts:
+    if show_cuts or callable(getattr(controls, "bind", None)):
         from GRIM_Backend.ui.image_analysis import LinkedImageCuts
-        self.plot_figure._grim_linked_cuts = LinkedImageCuts(self.plot_canvas, list(zip(axes, cut_axes, records)))
+        def can_select():
+            busy = any(self._button_checked(getattr(self, role, None)) for role in ("btn_pan", "btn_zoom_box", "btn_markers"))
+            overlays = getattr(self, "spatial_overlays", None)
+            return not busy and not (overlays is not None and (
+                overlays.drawing is not None or overlays.drag is not None))
+        controller = LinkedImageCuts(self.plot_canvas,
+            list(zip(axes, [(horizontal,vertical)]*len(panels), records)), can_select=can_select)
+        self.plot_figure._grim_linked_cuts = controller
+        if callable(getattr(controls, "bind", None)):
+            controls.bind(controller)
     for spin, value in ((self.spin_plot_xmin, min(np.min(p['x']) for p in panels)),
             (self.spin_plot_xmax, max(np.max(p['x']) for p in panels)),
             (self.spin_plot_ymin, min(np.min(p['y']) for p in panels)),
