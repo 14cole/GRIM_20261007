@@ -373,7 +373,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _on_colormap_changed(self) -> None:
         if self.last_plot_mode == "delta_map":
-            # Signed delta maps keep a fixed, zero-centered diverging palette.
+            self._update_current_python_plot_style()
+            for mesh in self.plot_ax.collections:
+                if hasattr(mesh, "_grim_delta_labels"):
+                    delta_map_mode.set_colormap(mesh, self._effective_colormap())
+            self.plot_canvas.draw_idle()
             return
         # A colormap switch is a style-only change. Reuse the ScalarMappables
         # already on the canvas instead of repeating FFTs, gridding, or large

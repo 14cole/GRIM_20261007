@@ -21,6 +21,8 @@ class ImageComparisonDialog(QDialog):
     def __init__(self, owner):
         super().__init__(owner if hasattr(owner, "winId") else None)
         self.owner = owner
+        selected_colormap = getattr(owner, "_effective_colormap", None)
+        self.colormap = selected_colormap() if callable(selected_colormap) else "turbo"
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setWindowTitle("Images A/B — frozen images and linked inspection")
         from GRIM_Backend.ui.widgets import initial_window_size
@@ -186,7 +188,7 @@ class ImageComparisonDialog(QDialog):
                 except (ValueError,MemoryError,OSError) as image_error:
                     ax.text(.5,.5,str(image_error),transform=ax.transAxes,ha="center",wrap=True)
                     continue
-                mesh = self._mesh(ax,x,y,values,cmap="viridis")
+                mesh = self._mesh(ax,x,y,values,cmap=self.colormap)
                 self.figure.colorbar(mesh, ax=ax, label=record.value_unit)
                 ax.set_title(("A: " if i == 0 else "B: ") + record.name)
                 ax.set_xlabel(f"{record.x_axis} ({record.x_unit})")
@@ -205,9 +207,9 @@ class ImageComparisonDialog(QDialog):
         self.image_axes = [self.figure.add_subplot(grid[0,i]) for i in range(3)]
         for ax in self.image_axes[1:]:
             ax.sharex(self.image_axes[0]); ax.sharey(self.image_axes[0])
-        self.mesh_a = self._mesh(self.image_axes[0],x,y,a,cmap="viridis",norm=Normalize(*limits))
-        mesh_b = self._mesh(self.image_axes[1],x,y,b,cmap="viridis",norm=self.mesh_a.norm)
-        mesh_d = self._mesh(self.image_axes[2],x,y,delta,cmap="RdBu_r",norm=TwoSlopeNorm(vcenter=0.,vmin=-scale,vmax=scale))
+        self.mesh_a = self._mesh(self.image_axes[0],x,y,a,cmap=self.colormap,norm=Normalize(*limits))
+        mesh_b = self._mesh(self.image_axes[1],x,y,b,cmap=self.colormap,norm=self.mesh_a.norm)
+        mesh_d = self._mesh(self.image_axes[2],x,y,delta,cmap=self.colormap,norm=TwoSlopeNorm(vcenter=0.,vmin=-scale,vmax=scale))
         for ax,title in zip(self.image_axes,("A","B","Signed A − B")):
             ax.set_title(title)
             ax.set_xlabel(f"{self.a.x_axis} ({self.a.x_unit})")

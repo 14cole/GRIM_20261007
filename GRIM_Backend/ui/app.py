@@ -1486,6 +1486,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         combo_colormap = QComboBox()
         for name in ("viridis", "plasma", "inferno", "magma", "cividis", "turbo"):
             combo_colormap.addItem(name, name)
+        combo_colormap.setCurrentText("turbo")
         settings_layout.addWidget(combo_colormap, row, 1)
         chk_colorbar = QCheckBox("Show Colorbar")
         chk_colorbar.setChecked(True)

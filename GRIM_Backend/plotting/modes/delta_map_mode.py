@@ -153,14 +153,25 @@ def cell_text(result, x, y):
         f"A - B {delta_label}"])
 
 
-def draw(figure, axes, result, *, limit=None, show_values=False, show_colorbar=True):
-    """Render real coordinate cells with a symmetric diverging scale."""
+def set_colormap(mesh, name):
+    """Keep unavailable cells gray and value labels readable after recoloring."""
+    cmap = colormaps[name].with_extremes(bad="#888888")
+    mesh.set_cmap(cmap)
+    for label, value in getattr(mesh, "_grim_delta_labels", ()):
+        color = "black"
+        if np.isfinite(value):
+            color = "white" if np.dot(cmap(mesh.norm(value))[:3], [0.2126, 0.7152, 0.0722]) < 0.45 else "black"
+        label.set_color(color)
+
+
+def draw(figure, axes, result, *, limit=None, show_values=False, show_colorbar=True, colormap="turbo"):
+    """Render real coordinate cells with symmetric limits around zero."""
     if limit is None:
         limit = max(float(np.nanmax(np.abs(result.delta_db))), 0.1)
     limit = float(limit)
     if not np.isfinite(limit) or limit <= 0:
         raise ValueError("Delta color limit must be finite and greater than zero")
-    cmap = colormaps["RdBu_r"].with_extremes(bad="#888888")
+    cmap = colormaps[colormap].with_extremes(bad="#888888")
     mesh = axes.pcolormesh(cell_edges(result.x), cell_edges(result.y),
                           np.ma.masked_invalid(result.delta_db), shading="flat",
                           cmap=cmap, norm=Normalize(-limit, limit), rasterized=True)
@@ -174,16 +185,15 @@ def draw(figure, axes, result, *, limit=None, show_values=False, show_colorbar=T
                    fontsize=10)
     axes._grim_delta_map = result
     axes.format_coord = lambda x, y: cell_text(result, x, y) or ""
+    mesh._grim_delta_labels = []
     if show_values and result.delta_db.size <= MAX_CELL_LABELS:
         for row, y in enumerate(result.y):
             for col, x in enumerate(result.x):
                 value = result.delta_db[row, col]
-                color = "black"
-                if np.isfinite(value):
-                    rgba = cmap(mesh.norm(value))
-                    color = "white" if np.dot(rgba[:3], [0.2126, 0.7152, 0.0722]) < 0.45 else "black"
-                axes.text(x, y, f"{value:+.1f}" if np.isfinite(value) else "--",
-                          ha="center", va="center", fontsize=8, color=color, clip_on=True)
+                label = axes.text(x, y, f"{value:+.1f}" if np.isfinite(value) else "--",
+                                  ha="center", va="center", fontsize=8, clip_on=True)
+                mesh._grim_delta_labels.append((label, value))
+    set_colormap(mesh, colormap)
     colorbar = None
     if show_colorbar:
         extends = "both" if np.any(np.abs(result.delta_db[np.isfinite(result.delta_db)]) > limit) else "neither"
@@ -244,7 +254,8 @@ def render(self):
     self._style_axes(self.plot_ax)
     mesh, colorbar = draw(self.plot_figure, self.plot_ax, result,
                          limit=options["limit"], show_values=options["show_values"],
-                         show_colorbar=self.chk_colorbar.isChecked())
+                         show_colorbar=self.chk_colorbar.isChecked(),
+                         colormap=self._effective_colormap())
     self.plot_ax.title.set_color(self._current_plot_text())
     self.plot_figure.text(0.01, 0.01, controls.source_label.text(), fontsize=8,
                           color=self._current_plot_text(), wrap=True)

@@ -126,7 +126,7 @@ def plot_datasets(
     polarization: str | Sequence[str],
     phase: bool = False,
     scale: str = "dbsm",
-    colormap: str = "viridis",
+    colormap: str = "turbo",
     show_grid: bool = True,
     show_legend: bool = True,
     polar_zero: str = "N",
@@ -230,7 +230,7 @@ def plot_datasets(
         axes = figure.add_subplot(111)
         delta_map_mode.draw(figure, axes, result, limit=options.get("limit"),
                             show_values=bool(options.get("show_values", False)),
-                            show_colorbar=bool(show_colorbar))
+                            show_colorbar=bool(show_colorbar), colormap=colormap)
         figure.text(0.01, 0.01, f"A: {result.names[0]}   |   B: {result.names[1]}   |   A - B (dB)", fontsize=8, wrap=True)
         figure.set_layout_engine("tight", rect=(0, 0.07, 1, 1))
         return figure

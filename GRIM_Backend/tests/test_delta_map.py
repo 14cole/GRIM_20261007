@@ -267,7 +267,7 @@ class DeltaMapGuiTests(unittest.TestCase):
         w.chk_colorbar.setChecked(False)
         self.assertEqual(len(w.plot_figure.axes), 1)
         w.combo_colormap.setCurrentIndex(1)
-        self.assertEqual(w.plot_ax.collections[0].cmap.name, "RdBu_r")
+        self.assertEqual(w.plot_ax.collections[0].cmap.name, "plasma")
         w.plot_ax.set_xlim(-1, 1)
         w.plot_ax.set_ylim(9, 10)
         w._fit_both()
