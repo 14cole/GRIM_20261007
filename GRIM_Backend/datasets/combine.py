@@ -76,7 +76,8 @@ class GridCombineMixin:
         an entire power/phase sample atomically in input order. ``power-mean``
         averages finite linear power and makes phase unknown only at cells
         with multiple contributors. ``coherent-mean`` averages complex fields
-        and therefore requires finite phase plus compatible coherent metadata.
+        using authoritative raw fields when available. A zero field is valid
+        even without phase; nonzero samples need a usable complex response.
 
         Overlaps follow the selected policy and are recorded in the report.
         Processing uses bounded blocks; ``max_output_bytes`` caps the estimated
@@ -241,7 +242,6 @@ class GridCombineMixin:
             negative_power_count = 0
             minimum_negative = None
             infinite_phase_count = 0
-            missing_coherent_phase_count = 0
             iterator = np.nditer(
                 (power, phase),
                 flags=["external_loop", "buffered", "zerosize_ok"],
@@ -263,12 +263,6 @@ class GridCombineMixin:
                         else min(minimum_negative, block_minimum)
                     )
                 infinite_phase_count += int(np.count_nonzero(np.isinf(phase_block)))
-                if policy == "coherent-mean":
-                    missing_coherent_phase_count += int(
-                        np.count_nonzero(
-                            np.isfinite(power_block) & ~np.isfinite(phase_block)
-                        )
-                    )
             if infinite_power_count or infinite_phase_count:
                 raise ValueError(
                     f"stitch input {input_index} contains infinite samples "
@@ -280,7 +274,6 @@ class GridCombineMixin:
                     "negative power sample(s); minimum is "
                     f"{minimum_negative:.17g}"
                 )
-            coherent_missing_phase_count += missing_coherent_phase_count
 
         if len(grids) == 1:
             az_union = np.array(ref.azimuths, copy=True)
@@ -305,13 +298,23 @@ class GridCombineMixin:
         cell_count = 1
         for dimension in shape:
             cell_count *= int(dimension)
+        # Validate each raw-pair contract once, then reconstruct only bounded
+        # slices. Raw fields may carry precision absent from display storage.
+        field_readers = [
+            grid._bounded_complex_slice_reader(include_authority=True)
+            for grid in grids
+        ]
+        field_storage_dtypes = [dtype for _reader, dtype, _raw in field_readers]
         if policy in {"power-mean", "coherent-mean"}:
             output_dtype = np.result_type(
-                *[grid.rcs_power.dtype for grid in grids], np.float64
+                *[grid.rcs_power.dtype for grid in grids],
+                *field_storage_dtypes,
+                np.float64,
             )
         else:
             output_dtype = np.result_type(
-                *[grid.rcs_power.dtype for grid in grids]
+                *[grid.rcs_power.dtype for grid in grids],
+                *field_storage_dtypes,
             )
         itemsize = np.dtype(output_dtype).itemsize
         output_bytes = cell_count * itemsize * 2
@@ -368,7 +371,9 @@ class GridCombineMixin:
                     )
             mapped_indices.append(indices)
 
-        for grid, indices in zip(grids, mapped_indices):
+        for grid, indices, (field_reader, _dtype, authoritative) in zip(
+            grids, mapped_indices, field_readers
+        ):
             az_idx, el_idx, f_idx, p_idx = indices
             incoming_power = np.asarray(grid.rcs_power)
             incoming_phase = np.asarray(grid.rcs_phase)
@@ -408,8 +413,37 @@ class GridCombineMixin:
                             block_power = incoming_power[source]
                             block_phase = incoming_phase[source]
                             valid = np.isfinite(block_power)
+                            incoming_field = None
+                            if policy == "coherent-mean" or authoritative:
+                                incoming_field = np.asarray(field_reader(source))
+                                finite_field = (
+                                    np.isfinite(incoming_field.real)
+                                    & np.isfinite(incoming_field.imag)
+                                )
                             if policy == "coherent-mean":
-                                valid &= np.isfinite(block_phase)
+                                coherent_missing_phase_count += int(
+                                    np.count_nonzero(valid & ~finite_field)
+                                )
+                                valid &= finite_field
+                            elif authoritative:
+                                # Preserve authoritative field precision in the
+                                # canonical power/phase arrays. A power mean has
+                                # no field at overlaps, so raw arrays cannot be
+                                # retained as an authoritative whole-grid pair.
+                                block_power = np.array(
+                                    block_power, dtype=output_dtype, copy=True
+                                )
+                                block_phase = np.array(
+                                    block_phase, dtype=output_dtype, copy=True
+                                )
+                                usable_field = valid & finite_field
+                                block_power[usable_field] = (
+                                    np.abs(incoming_field[usable_field]) ** 2
+                                )
+                                block_phase[usable_field] = np.angle(
+                                    incoming_field[usable_field]
+                                )
+                                block_phase[usable_field & (block_power == 0.0)] = np.nan
                             if not np.any(valid):
                                 continue
 
@@ -418,18 +452,6 @@ class GridCombineMixin:
                             count_block = contributor_counts[target]
                             conflict_block = conflict_flags[target]
                             overlap = valid & (count_block > 0)
-
-                            incoming_field = None
-                            if policy == "coherent-mean":
-                                incoming_field = np.asarray(grid.rcs_slice(source))
-                                invalid_field = valid & (
-                                    ~np.isfinite(incoming_field.real)
-                                    | ~np.isfinite(incoming_field.imag)
-                                )
-                                if np.any(invalid_field):
-                                    valid &= ~invalid_field
-                                    if not np.any(valid):
-                                        continue
 
                             if np.any(overlap):
                                 if policy == "power-mean":
@@ -470,9 +492,14 @@ class GridCombineMixin:
                                         & (reference_power == 0.0)
                                         & (incoming_field_power == 0.0)
                                     )
-                                    phase_delta = np.abs(
-                                        np.angle(reference_field / incoming_field)
+                                    phase_difference = (
+                                        np.angle(reference_field)
+                                        - np.angle(incoming_field)
                                     )
+                                    phase_delta = np.abs(np.arctan2(
+                                        np.sin(phase_difference),
+                                        np.cos(phase_difference),
+                                    ))
                                     phase_conflict = (
                                         overlap
                                         & power_equal
@@ -593,19 +620,8 @@ class GridCombineMixin:
         output_phase_wrap = str(
             (ref.units or {}).get("phase_wrap", "")
         ).strip() or "-180_180"
-        for start in range(0, cell_count, _JOIN_MERGE_BLOCK_CELLS):
-            stop = min(start + _JOIN_MERGE_BLOCK_CELLS, cell_count)
-            phase_block = flat_phase[start:stop]
-            finite_phase = np.isfinite(phase_block)
-            if output_phase_wrap == "0_360":
-                phase_block[finite_phase] = np.mod(
-                    phase_block[finite_phase], 2.0 * np.pi
-                )
-            else:
-                phase_block[finite_phase] = (
-                    np.mod(phase_block[finite_phase] + np.pi, 2.0 * np.pi)
-                    - np.pi
-                )
+        # The constructor applies this convention once, preserving phases
+        # that already lie inside the requested interval.
 
         contributing_count = 0
         output_finite_count = 0

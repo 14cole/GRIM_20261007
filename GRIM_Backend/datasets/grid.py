@@ -21,7 +21,7 @@ from GRIM_Backend.datasets.coordinates import (
     canonical_angular_coordinate_system,
     strip_angular_coordinate_declarations,
 )
-from GRIM_Backend.datasets.memory import _real_storage_dtype
+from GRIM_Backend.datasets.memory import _bounded_grid_selections, _real_storage_dtype
 from GRIM_Backend.datasets.metadata import GridMetadataMixin
 from GRIM_Backend.io.cst import CstFormatMixin
 from GRIM_Backend.io.native import NativeFormatMixin
@@ -184,13 +184,29 @@ class RcsGrid(
                 )
 
 
-            with np.errstate(invalid="ignore"):
-                if phase_wrap == "0_360":
-                    np.remainder(self.rcs_phase, 2.0 * np.pi, out=self.rcs_phase)
-                else:
-                    np.add(self.rcs_phase, np.pi, out=self.rcs_phase)
-                    np.remainder(self.rcs_phase, 2.0 * np.pi, out=self.rcs_phase)
-                    np.subtract(self.rcs_phase, np.pi, out=self.rcs_phase)
+            # Keep phases already in range unchanged: adding and subtracting
+            # pi can erase small, physically meaningful phase differences.
+            # Bound the masks and temporary values even for a large grid.
+            if self.rcs_phase.size:
+                for selection in _bounded_grid_selections(
+                    self.rcs_phase.shape, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS
+                ):
+                    phase_block = self.rcs_phase[selection]
+                    finite = np.isfinite(phase_block)
+                    if phase_wrap == "0_360":
+                        needs_wrap = finite & (
+                            (phase_block < 0.0) | (phase_block >= 2.0 * np.pi)
+                        )
+                        wrapped = np.remainder(phase_block[needs_wrap], 2.0 * np.pi)
+                        # A tiny negative phase may round up to the endpoint.
+                        wrapped[wrapped >= 2.0 * np.pi] = 0.0
+                    else:
+                        needs_wrap = finite & (
+                            (phase_block < -np.pi) | (phase_block >= np.pi)
+                        )
+                        wrapped = (phase_block[needs_wrap] + np.pi) % (2.0 * np.pi) - np.pi
+                        wrapped[wrapped >= np.pi] = -np.pi
+                    phase_block[needs_wrap] = wrapped
 
 
         # Every dataset uses plain azimuth/elevation axes. Coordinate-system
@@ -223,7 +239,12 @@ class RcsGrid(
         if power.shape != phase.shape:
             raise ValueError(f"power/phase shapes {power.shape}/{phase.shape} do not match")
         out = np.full(power.shape, np.nan + 1j * np.nan, dtype=complex_dtype)
-        valid = np.isfinite(power) & np.isfinite(phase)
+        # A zero field is fully known even though its phase is undefined.
+        # Keep it in coherent arithmetic and sample counts without inventing
+        # a stored phase for diagnostics or treating missing power as zero.
+        zero = power == 0.0
+        out[zero] = 0.0 + 0.0j
+        valid = np.isfinite(power) & np.isfinite(phase) & ~zero
         if np.any(valid):
             out[valid] = (
                 np.sqrt(power[valid]) * np.exp(1j * phase[valid])
@@ -310,13 +331,18 @@ class RcsGrid(
             return None
         return self._authoritative_raw_amplitude_from_pair(pair, selection)
 
-    def _bounded_complex_slice_reader(self):
+    def _bounded_complex_slice_reader(self, *, include_authority=False):
         """Return a bounded field reader and its real precision.
 
         The authoritative raw-pair contract is validated once when the reader
         is created, instead of rescanning the entire grid for every azimuth
         block.  Every returned slice is newly allocated and may be used as an
         in-place arithmetic work buffer by internal dense operations.
+
+        With ``include_authority=True``, a third return value indicates whether
+        the reader uses a validated raw pair with known normalization. Callers
+        can retain stored power/phase exactly when the reader uses fallback
+        reconstruction, without validating the raw pair a second time.
         """
 
         pair = self._complete_authoritative_raw_arrays()
@@ -328,21 +354,23 @@ class RcsGrid(
                 if np.any(~np.isfinite(k0)) or np.any(k0 <= 0.0):
                     pair = None
             if pair is not None:
-                return (
+                result = (
                     lambda selection: self._authoritative_raw_amplitude_from_pair(
                         pair, selection
                     ),
                     np.dtype(np.float64),
                 )
+                return (*result, True) if include_authority else result
         real_dtype = np.dtype(
             _real_storage_dtype(self.rcs_power, self.rcs_phase)
         )
-        return (
+        result = (
             lambda selection: self._complex_from_power_phase(
                 self.rcs_power[selection], self.rcs_phase[selection]
             ),
             real_dtype,
         )
+        return (*result, False) if include_authority else result
 
     @property
     def rcs(self):

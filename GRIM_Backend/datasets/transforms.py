@@ -9,6 +9,7 @@ import numpy as np
 
 from GRIM_Backend.datasets.grid import RcsGrid
 from GRIM_Backend.datasets.constants import C0
+from GRIM_Backend.datasets.memory import _bounded_grid_selections
 
 
 _MAX_EXPLICIT_AXIS_POINTS = 1_000_000
@@ -356,6 +357,37 @@ def offset_db(dataset: RcsGrid, value_db: float) -> RcsGrid:
     """Shift all displayed RCS values by a constant number of decibels."""
 
     scale = 10.0 ** (float(value_db) / 10.0)
+    raw_pair = dataset._complete_authoritative_raw_arrays()
+    quantity = dataset.linear_quantity()
+    use_raw = (
+        raw_pair is not None and quantity in {"sigma_2d", "sigma_3d"}
+        and dataset.rcs_power.size > 0
+    )
+    if use_raw and quantity == "sigma_2d":
+        frequency_hz = dataset._frequency_value_to_hz(dataset.frequencies)
+        use_raw = bool(
+            np.all(np.isfinite(frequency_hz)) and np.all(frequency_hz > 0.0)
+        )
+    if use_raw:
+        # The display cache may be float32 even when solver quadratures are
+        # float64. Normalize those authoritative fields before scaling, keeping
+        # the derived response in float64 for later coherent residuals.
+        shape = dataset.rcs_power.shape
+        power = np.empty(shape, dtype=np.float64)
+        phase = np.empty(shape, dtype=np.float64)
+        for selection in _bounded_grid_selections(shape, (16 * 1024**2) // 48):
+            field = dataset._authoritative_raw_amplitude_from_pair(
+                raw_pair, selection
+            )
+            power_block = power[selection]
+            np.multiply(field.real, field.real, out=power_block)
+            power_block += field.imag * field.imag
+            power_block *= scale
+            np.arctan2(field.imag, field.real, out=phase[selection])
+        return _copy_grid(
+            dataset, rcs_power=power, rcs_phase=phase,
+            rcs_domain=dataset.rcs_domain,
+        )
     return _copy_grid(
         dataset,
         rcs_power=dataset.rcs_power * scale,
@@ -815,6 +847,7 @@ def medianize_azimuth(
     the closing repeat disagrees with the opening sample, ``seam_conflict``
     ``"first"`` (default) keeps the opening sample and records the discarded
     cells in history, while ``"error"`` rejects the cut instead.
+    Windows containing no source coordinates remain missing (NaN).
     ``return_report=True`` returns ``(grid, report)``.
     """
 
@@ -896,7 +929,7 @@ def medianize_azimuth(
                 )
             centers = first + np.arange(int(count_float), dtype=float) * slide
     shape = (centers.size,) + dataset.rcs_power.shape[1:]
-    power = np.empty(shape, dtype=dataset.rcs_power.dtype)
+    power = np.full(shape, np.nan, dtype=dataset.rcs_power.dtype)
     for index, center in enumerate(centers):
         if periodic:
             left = int(np.searchsorted(augmented_azimuth, center - half, side="left"))
@@ -907,13 +940,7 @@ def medianize_azimuth(
             right = int(np.searchsorted(azimuth, center + half, side="right"))
             samples = np.arange(left, right, dtype=np.int64)
         if samples.size == 0:
-            if periodic:
-                distance = np.abs(
-                    (sample_azimuth - center + 180.0) % 360.0 - 180.0
-                )
-            else:
-                distance = np.abs(azimuth - center)
-            samples = np.asarray([int(np.argmin(distance))])
+            continue
         sample_power = dataset.rcs_power[samples]
         if merged_seam_power is not None and np.any(samples == 0):
 
