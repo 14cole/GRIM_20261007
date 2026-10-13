@@ -1292,7 +1292,7 @@ class DatasetOpsMixin:
             (
                 "btn_coherent_add", "btn_coherent_sub", "btn_incoherent_add",
                 "btn_incoherent_sub", "btn_join", "btn_overlap",
-                "btn_align", "btn_compatibility", "btn_support_reference",
+                "btn_align", "btn_compatibility",
             ),
             selected_count >= 2,
         )

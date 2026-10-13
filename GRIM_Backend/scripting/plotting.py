@@ -680,6 +680,8 @@ def plot_datasets(
         )
         compatible_count = 1
         figure.clear()
+        # Match the GUI's centered fixed-aspect image/colorbar group.
+        figure.set_layout_engine("compressed" if square_aspect else "constrained")
         axes_values = figure.subplots(1, len(bands), squeeze=False)[0]
         style_axes = list(axes_values)
         displays = []
@@ -869,5 +871,6 @@ def plot_datasets(
         handles, labels = axis.get_legend_handles_labels()
         if show_legend and handles:
             axis.legend()
-    figure.tight_layout()
+    if mode_key != "isar_image":
+        figure.tight_layout()
     return figure

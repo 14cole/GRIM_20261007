@@ -13,7 +13,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QMenu, QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPushButton, QVBoxLayout,
 )
 
 from GRIM_Backend.plotting.dataset_style import LINE_TYPES
@@ -22,14 +22,18 @@ from GRIM_Backend.plotting.overlay_data import (
     axis_info, format_coordinate, measurement_text, project_points,
     read_overlay_points, supports_overlays,
 )
+from GRIM_Backend.ui.overlay_transform import OverlayTransformDialog
 
 
-class SpatialOverlayPanel(QWidget):
+class SpatialOverlayPanel(QDialog):
     """Coordinates outlive artists, so ordinary re-plots preserve drawings."""
 
     def __init__(self, owner, canvas):
-        super().__init__()
+        super().__init__(owner, Qt.Tool)
+        self.setWindowTitle("Overlays")
+        self.setModal(False)
         self.owner, self.canvas = owner, canvas
+        self.transform_dialog = None
         self.paths: list[OverlayPath] = []
         self.axes = []
         self.active = self.drawing = self.drag = None
@@ -38,7 +42,7 @@ class SpatialOverlayPanel(QWidget):
         self._drawing_number = 0
         self.setObjectName("spatialOverlayPanel")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(4)
         row = QHBoxLayout()
         self.load_button = QPushButton("Load overlay…")
@@ -61,11 +65,13 @@ class SpatialOverlayPanel(QWidget):
         self.path_combo.setMinimumContentsLength(10)
         self.path_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.visible_check = QCheckBox("Show")
+        self.edit_button = QPushButton("Edit overlay…")
+        self.edit_button.setToolTip("Rotate, move, or mirror the selected overlay in a floating editor.")
         self.save_button = QPushButton("Save XY…")
         self.remove_button = QPushButton("Remove")
         row.addWidget(QLabel("Overlay"))
         row.addWidget(self.path_combo, 1)
-        for widget in (self.visible_check, self.save_button, self.remove_button):
+        for widget in (self.visible_check, self.edit_button, self.save_button, self.remove_button):
             row.addWidget(widget)
         layout.addLayout(row)
         row = QHBoxLayout()
@@ -103,6 +109,7 @@ class SpatialOverlayPanel(QWidget):
         self.panel_combo.currentIndexChanged.connect(self._select_panel)
         self.path_combo.currentIndexChanged.connect(self._select_path)
         self.remove_button.clicked.connect(self.remove_active)
+        self.edit_button.clicked.connect(self.edit_overlay)
         self.save_button.clicked.connect(self.save_xy)
         self.color_button.clicked.connect(self.choose_color)
         self.style_combo.currentIndexChanged.connect(self._controls_changed)
@@ -148,6 +155,7 @@ class SpatialOverlayPanel(QWidget):
         ax.add_artist(item.artist)
 
     def refresh(self):
+        self.cancel_transform()
         self.drag = None
         self.axes = [ax for ax in self.canvas.figure.axes if supports_overlays(ax)]
         previous = self.panel_combo.currentIndex()
@@ -172,6 +180,7 @@ class SpatialOverlayPanel(QWidget):
         self._render_measurement()
         self.help_label.setText(
             "Click Draw points, then click to connect points; Escape finishes. "
+            "Use Edit overlay to rotate, move, or mirror the outline. "
             "Drag a point to move it; right-click to edit. Click a line for its length, "
             "or choose Measure and click two points."
             if self.axes else "Plot an image with a distance axis to load or draw an overlay."
@@ -202,9 +211,14 @@ class SpatialOverlayPanel(QWidget):
 
     def _sync_controls(self):
         item = self.active
-        for widget in (self.save_button, self.remove_button, self.color_button,
+        editing = self.transform_dialog is not None
+        for widget in (self.load_button, self.draw_button, self.measure_button):
+            widget.setEnabled(bool(self.axes) and not editing)
+        for widget in (self.panel_combo, self.path_combo):
+            widget.setEnabled(not editing)
+        for widget in (self.edit_button, self.save_button, self.remove_button, self.color_button,
                        self.style_combo, self.width_spin, self.points_check, self.visible_check):
-            widget.setEnabled(item is not None)
+            widget.setEnabled(item is not None and not editing)
         if item is None:
             return
         for widget, value in ((self.style_combo, item.linestyle), (self.width_spin, item.linewidth),
@@ -438,7 +452,13 @@ class SpatialOverlayPanel(QWidget):
         self.measure_between((item, index), (item, index+1))
 
     def hideEvent(self, event):
+        self.cancel_transform()
         self.stop_interaction()
+        button = getattr(self, "toggle_button", None)
+        if button is not None:
+            button.blockSignals(True)
+            button.setChecked(False)
+            button.blockSignals(False)
         super().hideEvent(event)
 
     def show_controls(self):
@@ -446,6 +466,35 @@ class SpatialOverlayPanel(QWidget):
         if button is not None:
             button.setChecked(True)
         self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def edit_overlay(self):
+        if self.transform_dialog is not None:
+            self.transform_dialog.raise_()
+            self.transform_dialog.activateWindow()
+            return
+        item = self.active
+        if item is None or self._axis(item) is None:
+            return
+        self.stop_interaction()
+        self.show_controls()
+        dialog = OverlayTransformDialog(self, item)
+        self.transform_dialog = dialog
+        dialog.finished.connect(self._transform_finished)
+        self._sync_controls()
+        dialog.show()
+
+    def _transform_finished(self, *_):
+        dialog = self.transform_dialog
+        self.transform_dialog = None
+        self._sync_controls()
+        if dialog is not None:
+            dialog.deleteLater()
+
+    def cancel_transform(self):
+        if self.transform_dialog is not None:
+            self.transform_dialog.reject()
 
     def _hit(self, event, *, include_lines=False):
         if event.inaxes not in self.axes or event.x is None or event.y is None:
@@ -512,6 +561,8 @@ class SpatialOverlayPanel(QWidget):
 
     def on_press(self, event):
         if event.canvas is not self.canvas or event.button != MouseButton.LEFT:
+            return False
+        if self.transform_dialog is not None:
             return False
         if any(self.owner._button_checked(getattr(self.owner, name, None))
                for name in ("btn_pan", "btn_zoom_box", "btn_markers")):
@@ -642,6 +693,9 @@ class SpatialOverlayPanel(QWidget):
             self.canvas.draw_idle()
 
     def context_menu(self, pos):
+        if self.transform_dialog is not None:
+            self.edit_overlay()
+            return True
         x, y = self.canvas.mouseEventCoords(pos)
         event = MouseEvent("button_press_event", self.canvas, x, y, button=3)
         hit = self._hit(event, include_lines=True)
@@ -652,6 +706,7 @@ class SpatialOverlayPanel(QWidget):
         self._activate(item)
         menu = QMenu(self)
         menu.addSection(item.name)
+        menu.addAction("Edit overlay…", self.edit_overlay)
         if index is not None:
             menu.addAction("Edit coordinates…", lambda: self.edit_point(item, index))
             menu.addAction("Remove point", lambda: self.remove_point(item, index))
@@ -678,6 +733,7 @@ class SpatialOverlayPanel(QWidget):
         return True
 
     def remove_active(self):
+        self.cancel_transform()
         self.stop_interaction()
         if self.active is not None:
             self._clear_measurement_for(self.active)
@@ -688,6 +744,7 @@ class SpatialOverlayPanel(QWidget):
             self.canvas.draw_idle()
 
     def clear(self):
+        self.cancel_transform()
         self.stop_interaction()
         self.clear_measurement()
         for item in self.paths:
@@ -701,6 +758,9 @@ class SpatialOverlayPanel(QWidget):
                    and item.artist.get_visible() for item in self.paths)
 
     def save_xy(self):
+        if self.transform_dialog is not None:
+            self.owner.status.showMessage("Apply or cancel the overlay preview before saving.")
+            return
         item = self.active
         ax = self._axis(item) if item is not None else None
         if ax is None:

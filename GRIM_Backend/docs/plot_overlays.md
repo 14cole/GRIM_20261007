@@ -2,6 +2,8 @@
 
 Use **Overlays** in the Plotting or ISAR toolbar to load coordinates or draw connected points. Available on ISAR images, Az. vs D.R., and Range–Freq maps. Create a plot first; controls become available when an axis shows a distance unit.
 
+The controls open in a movable, nonmodal popup. They do not take space away from the plot; you can move them beside it or onto another monitor. Closing the popup keeps the overlays visible. Each plot tab has its own controls; switching tabs closes the previous tab's popup.
+
 ## Load an outline
 
 1. Open **Overlays**. If the figure has several panels, choose the target **Panel**.
@@ -33,6 +35,20 @@ Points connect in file order. Repeating the first coordinate at the end closes a
 - **Show** hides or reveals the selected overlay. **Remove** deletes the selected overlay. The plot's existing **Clear** button clears the plot and that tab's overlays.
 
 Overlays survive ordinary redraws and length-unit changes while the application remains open. Plotting and ISAR keep separate overlays. They return only on a compatible axis type and their original panel number, preventing a distance outline from appearing on an unrelated frequency/power plot. Their coordinates stay in the chosen plot frame; changing the ISAR look angle does not rotate them as a 3D object.
+
+## Rotate, move, or mirror an existing overlay
+
+Load the file, select it in **Overlay**, and click **Edit overlay…**. You can also right-click an overlay point or line and choose **Edit overlay…**. The floating editor previews changes on the plot while you can still pan and zoom.
+
+- **Rotate** uses degrees, positive from +X toward +Y (counterclockwise on standard axes). Rotation uses physical distances even when the two axes display different length units. On distance/angle or distance/frequency plots, rotation is unavailable because those coordinates have different physical meanings; movement and mirroring remain available.
+- **Move X / Y** uses each axis's displayed units. Enter a signed value; scientific notation is accepted.
+- **Flip X** swaps left and right; **Flip Y** swaps up and down, relative to the selected pivot.
+- Choose **Overlay center** (the midpoint of its coordinate bounds), **Origin (0, 0)**, or a **Custom point** for the rotation/mirror pivot. Operations run in the order mirror, rotate, then move.
+- Preview values always apply to the coordinates from opening the editor or the last **Apply**. **Apply** keeps that result and resets the controls for another operation. **OK** applies and closes. **Reset** discards the current preview; **Cancel**, Escape, or the window close button restores the last applied coordinates. Closing the controls, switching tabs, clearing, or replotting also cancels an unapplied preview.
+
+The editor transforms the whole selected outline, including disconnected segments, and measurements follow the preview. Other overlays, image values, color scales, and plot limits are preserved. Editing individual points and saving are available again after closing the editor.
+
+Use **Save XY…** after applying edits to save the resulting coordinates as a file. Loading and editing does not automatically overwrite the source. For XYZ input, editing and saving operate on the selected two-dimensional projection.
 
 ## Measure
 

@@ -942,10 +942,14 @@ RCS dataset for plotting, export, and calibration.
 Generic theta/phi TXT input requires a unit-bearing column header and either an
 explicit `frequency_ghz=` argument or a unit-qualified filename such as
 `f=10GHz`; headerless column order and unitless filename numbers are not guessed.
-Pioneer PIO input likewise requires explicit X/Y axis units, and any explicit
-Elevation value must carry ElevationUnits. Explicit XVals/YVals are authoritative;
-redundant Start/Stop/Step summaries may be rounded to their written decimal
-precision, while materially contradictory summaries are rejected. A closed
+Pioneer PIO input likewise requires explicit X/Y axis units. Elevation values
+default to degrees when ElevationUnits is absent or blank; an explicit elevation
+unit is honored independently of the X axis unit. Explicit XVals/YVals are
+authoritative: conflicting or invalid redundant Start/Stop/Step summaries are
+noted in dataset history and do not prevent loading. Explicit coordinates must
+still match the declared sample count and contain finite, valid sweep coordinates.
+When explicit values are absent, the summary fields must define a consistent
+axis. A closed
 full-turn azimuth sweep is
 stored half-open: GRIM keeps the opening measurement and removes the repeated
 closing row by periodic equivalence, even when the seam is an arbitrary measured

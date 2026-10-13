@@ -641,7 +641,6 @@ class UnifiedGuiShellTest(unittest.TestCase):
         self.window.main_tabs.setCurrentWidget(self.window.tab_simple_plots)
         active_index = self.window.main_tabs.currentIndex()
         plotting.settings_frame.show()
-        plotting.settings_frame.filter_edit.setText("plot color")
         self.app.processEvents()
 
         self.window._application_palette_actions["Light"].trigger()
@@ -661,9 +660,6 @@ class UnifiedGuiShellTest(unittest.TestCase):
         )
         self.assertEqual(self.window.main_tabs.currentIndex(), active_index)
         self.assertTrue(plotting.settings_frame.isVisible())
-        self.assertEqual(
-            plotting.settings_frame.filter_edit.text(), "plot color"
-        )
         self.assertEqual(plotting.combo_colormap.currentText(), "plasma")
         self.assertEqual(isar.combo_colormap.currentText(), "cividis")
         self.assertEqual(
@@ -866,12 +862,7 @@ class UnifiedGuiShellTest(unittest.TestCase):
         self.assertEqual(workspace.scene_canvas.display_units, "Inches")
         self.assertEqual(workspace.scene_canvas.axes.xaxis.get_major_formatter()(.0254), "1")
 
-    def test_support_reference_button_and_dialog_make_roles_and_limits_explicit(self) -> None:
-        self.assertEqual(self.window.btn_support_reference.text(), "Support Ref -")
-        tooltip = self.window.btn_support_reference.toolTip()
-        self.assertIn("target+support minus support-only", tooltip)
-        self.assertIn("does not reconstruct a free-space target", tooltip)
-
+    def test_support_reference_dialog_makes_roles_and_limits_explicit(self) -> None:
         entries = [("Vehicle on support", _grid(3.0)), ("Support only", _grid(1.0))]
         dialog = SupportReferenceDifferenceDialog(entries, parent=self.window)
         ok_button = dialog.buttons.button(QDialogButtonBox.Ok)
@@ -944,7 +935,7 @@ class UnifiedGuiShellTest(unittest.TestCase):
                 side_effect=_run_worker_now,
             ),
         ):
-            self.window.btn_support_reference.click()
+            self.window._support_reference_difference_selected()
 
         self.assertEqual(self.window.table.rowCount(), 3)
         result_item = self.window.table.item(2, 0)

@@ -119,6 +119,8 @@ class ImageComparisonDialog(QDialog):
             second = next((i for i,r in enumerate(records[1:],1) if r.metadata.get("source_name") != source_name),1)
             self.combo_source.setCurrentIndex(second)
             self.capture("b")
+        if self.a is None and self.b is None:
+            self.render()
 
     def refresh_sources(self):
         index = self.combo_source.currentIndex()
@@ -156,17 +158,54 @@ class ImageComparisonDialog(QDialog):
     def _mesh(ax, x, y, values, **kwargs):
         return ax.pcolormesh(coordinate_edges(x), coordinate_edges(y), np.ma.masked_invalid(values), shading="flat", **kwargs)
 
+    def _render_pending_captures(self):
+        """Show the first frozen image while the engineer prepares the second."""
+        instructions = ("Render a Waterfall, ISAR image, or Azimuth–Down-Range image "
+                        "in the main plot, then refresh and capture it here.")
+        if self.a is None and self.b is None:
+            ax = self.figure.add_subplot(111)
+            ax.set_axis_off()
+            ax.text(.5, .6, "No image captured", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=14)
+            ax.text(.5, .4, "Render an image in the main plot.\n"
+                    "Refresh panels, then Capture as A or Capture as B.",
+                    transform=ax.transAxes, ha="center", va="center")
+            self.advisory.setText(instructions)
+            return
+        for index, (side, record) in enumerate((("A", self.a), ("B", self.b)), 1):
+            ax = self.figure.add_subplot(1, 2, index)
+            if record is None:
+                ax.set_axis_off()
+                ax.set_title(f"{side}: not captured")
+                ax.text(.5, .5, f"Render the next image in the main plot.\n"
+                        f"Refresh panels, then Capture as {side}.",
+                        transform=ax.transAxes, ha="center", va="center")
+                continue
+            ax.set_title(f"{side}: {record.name}", wrap=True)
+            try:
+                x, y, values = ordered(record)
+                mesh = self._mesh(ax, x, y, values, cmap=self.colormap)
+                self.figure.colorbar(mesh, ax=ax, label=record.value_unit)
+                ax.set_xlabel(f"{record.x_axis} ({record.x_unit})")
+                ax.set_ylabel(f"{record.y_axis} ({record.y_unit})")
+            except (ValueError, MemoryError, OSError) as exc:
+                ax.text(.5, .5, str(exc), transform=ax.transAxes, ha="center", wrap=True)
+        missing = "A" if self.a is None else "B"
+        self.advisory.setText(f"Capture {missing} to compare. The existing capture stays fixed "
+                             "while you change the main image.")
+
     def render(self, *_args):
         self.timer.stop()
         for selector in self._selectors:
             selector.disconnect_events()
         self._selectors = []
         self.result = None
+        self.summary.clear()
         self.figure.clear()
         self.image_axes = []
         self.names.setText(f"A: {self.a.name if self.a else 'not captured'}\nB: {self.b.name if self.b else 'not captured'}")
         if self.a is None or self.b is None:
-            self.advisory.setText("Capture both A and B. Captures stay fixed while the main image changes.")
+            self._render_pending_captures()
             self.canvas.draw_idle()
             return
         try:
@@ -368,9 +407,6 @@ class ImageComparisonDialog(QDialog):
 def open_image_comparison(owner):
     dialog = getattr(owner,"_image_comparison_dialog",None)
     if dialog is None:
-        if not records_from_figure(owner) and getattr(owner,"_active_plot_tab","plotting") == "plotting":
-            from GRIM_Backend.plotting.modes import waterfall_mode
-            waterfall_mode.render(owner)
         dialog = ImageComparisonDialog(owner)
         owner._image_comparison_dialog = dialog
     else:

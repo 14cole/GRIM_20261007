@@ -54,7 +54,8 @@ class RfAnalysisIntegrationTests(unittest.TestCase):
         categories = [label.text() for label in self.window.findChildren(QLabel)
                       if label.objectName() == "opsCategory"]
         self.assertEqual(categories, ["Combine", "Transform", "Calibration, Geometry & Quality"])
-        for attribute in ("btn_range_cal", "btn_support_reference", "btn_audit", "btn_compatibility",
+        self.assertFalse(hasattr(self.window, "btn_support_reference"))
+        for attribute in ("btn_range_cal", "btn_audit", "btn_compatibility",
                           "btn_provenance", "btn_axis_units", "btn_el_to_az360", "btn_swap_el_az",
                           "btn_sentri_elevation", "btn_extrusion", "btn_wedge_to_conic", "btn_phase_center"):
             self.assertIsNotNone(getattr(self.window, attribute))

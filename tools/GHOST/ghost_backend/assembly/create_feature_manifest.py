@@ -403,7 +403,7 @@ def _normalized_surface_units(value: 'Any') -> 'str':
 
 
 def _check_line_extensions(manifest: 'Mapping[str, Any]', *, label: 'str') -> 'None':
-    """Check line fields that travel with the current fixed solver behavior."""
+    """Check the declared line-model settings without requiring a preset."""
 
     applicability = manifest.get("applicability")
     if not isinstance(applicability, Mapping):
@@ -423,10 +423,9 @@ def _check_line_extensions(manifest: 'Mapping[str, Any]', *, label: 'str') -> 'N
         calibration.get("grazing_taper_deg"),
         f"{label}: line_phase_calibration.grazing_taper_deg",
     )
-    if not math.isclose(taper, GRAZING_TAPER_DEG, abs_tol=1.0e-12):
+    if taper < 0.0:
         raise ValueError(
-            f"{label}: grazing_taper_deg must be {GRAZING_TAPER_DEG:g}, "
-            "matching the Assembly line-expansion implementation."
+            f"{label}: grazing_taper_deg must be nonnegative (0 disables it)."
         )
 
 

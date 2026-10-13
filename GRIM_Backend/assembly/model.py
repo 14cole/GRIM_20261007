@@ -70,7 +70,7 @@ UNIT_ABBREVIATIONS = {
 FEATURE_SELECTION_DISPLAY_ID_LIMIT = 8
 
 FEATURE_RECIPE_SCHEMA = "grim.feature-assembly-recipe"
-FEATURE_RECIPE_VERSION = 5
+FEATURE_RECIPE_VERSION = 6
 FEATURE_RECIPE_SUFFIX = ".assembly.json"
 # Hash normal placement/library inputs while keeping recipe saves responsive for
 # very large vehicle meshes and clean-body response files. Large inputs still
@@ -525,6 +525,7 @@ def parse_study_samples(value):
 from GRIM_Backend.assembly.values import (
     FeatureAssemblyValues,
     LoadedFeatureAssemblyRecipe,
+    normalize_response_settings,
 )
 
 
@@ -2266,6 +2267,8 @@ class FeatureAssemblyFormModel:
         adapter = coerce_feature_workflow(service)
         self.validate()
         values = self.values
+        point_settings = normalize_response_settings(values.point_response_settings, "point")
+        line_settings = normalize_response_settings(values.line_response_settings, "line")
         return adapter.request_factory(
             **{key: getattr(values, key) for key in ("study_frequencies_ghz", "study_azimuths_deg", "study_elevations_deg")},
             base_grim=_clean_path(values.base_grim),
@@ -2286,12 +2289,20 @@ class FeatureAssemblyFormModel:
                 for key in self.active_point_dataset_ids()
             },
             enabled_point_placement_ids=self.enabled_point_placement_ids,
+            point_response_settings={
+                key: point_settings[key] for key in self.active_point_dataset_ids()
+                if key in point_settings
+            },
             line_locations_csv=_clean_path(values.line_locations_csv) or None,
             line_datasets={
                 key: _clean_path(values.line_datasets[key])
                 for key in self.active_line_dataset_ids()
             },
             enabled_line_ids=self.enabled_line_ids,
+            line_response_settings={
+                key: line_settings[key] for key in self.active_line_dataset_ids()
+                if key in line_settings
+            },
             skin_tol_m=float(values.skin_tol_m),
             skin_phase_tol_deg=float(values.skin_phase_tol_deg),
             normal_tol_deg=float(values.normal_tol_deg),
@@ -2330,6 +2341,8 @@ class FeatureAssemblyFormModel:
             bool(values.flip_surface_normals),
             bool(values.shadow),
             values.shadow_bias_m,
+            json.dumps(normalize_response_settings(values.point_response_settings, "point"), sort_keys=True),
+            json.dumps(normalize_response_settings(values.line_response_settings, "line"), sort_keys=True),
             path_signature(values.point_locations_csv),
             self.enabled_point_placement_ids,
             tuple(

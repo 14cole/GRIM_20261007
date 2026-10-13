@@ -2729,7 +2729,8 @@ def point_scatterer_amplitude(pattern, location, aperture_normal, directions,
                               _oriented_pattern_cache=None,
                               _visibility=None,
                               cancel_check: 'Optional[Callable[[], bool]]' = None,
-                              progress_callback: 'Optional[Callable[[int, int], None]]' = None
+                              progress_callback: 'Optional[Callable[[int, int], None]]' = None,
+                              one_sided: 'bool' = True,
                               ) -> 'Dict[str, np.ndarray]':
     """Place a precomputed 3-D delta pattern at a single body coordinate.
 
@@ -2754,9 +2755,12 @@ def point_scatterer_amplitude(pattern, location, aperture_normal, directions,
                          (its projection perpendicular to the normal); default
                          is an arbitrary transverse vector.
     ``directions``       (n,3) COMING-FROM look directions in the body frame.
+    ``one_sided``        retain the aperture front-face gate by default. False
+                         uses the supplied pattern on both sides, independently
+                         of geometric body shadowing.
 
     Returns {"F_vv","F_hh","F_vh"}.  Contributes only where the aperture faces
-    the radar (d.normal > 0).  The remaining approximation is single-bounce:
+    the radar (d.normal > 0) when one_sided is True. The remaining approximation is single-bounce:
     body<->cavity mutual coupling is not modeled.
     """
     from scipy.interpolate import RegularGridInterpolator
@@ -2837,12 +2841,14 @@ def point_scatterer_amplitude(pattern, location, aperture_normal, directions,
     if (_oriented_pattern_cache is not None
             and (occluder is None or visibility is not None)
             and len(dirs) * 48 <= 32 * 1024**2):
-        oriented_key = (id(pattern), j, zc.tobytes(), xc.tobytes(), id(directions))
+        oriented_key = (id(pattern), j, zc.tobytes(), xc.tobytes(),
+                        id(directions), bool(one_sided))
         origin_field = _oriented_pattern_cache.get(oriented_key)
         if origin_field is None:
             origin_field = point_scatterer_amplitude(
                 pattern, np.zeros(3), zc, directions, frequency_ghz,
                 roll_ref=xc, tol_ghz=tol_ghz,
+                one_sided=one_sided,
                 _interpolator_cache=_interpolator_cache,
                 cancel_check=cancel_check,
             )
@@ -2873,7 +2879,7 @@ def point_scatterer_amplitude(pattern, location, aperture_normal, directions,
     e_vv, e_hh = _pol_unit_vectors(dirs)
     F = {c: np.zeros(len(dirs), complex) for c in ("F_vv", "F_hh", "F_vh")}
 
-    lit = (dirs @ zc) > 0.0
+    lit = ((dirs @ zc) > 0.0 if one_sided else np.ones(len(dirs), dtype=bool))
     if not np.any(lit):
         return F
     dc = dirs @ R
@@ -2886,7 +2892,7 @@ def point_scatterer_amplitude(pattern, location, aperture_normal, directions,
         bad = el_q[outside]
         raise ValueError(
             "point pattern elevation support is incomplete for the requested "
-            f"lit look(s): support is [{el[0]:g}, {el[-1]:g}] deg, queried "
+            f"active look(s): support is [{el[0]:g}, {el[-1]:g}] deg, queried "
             f"{float(np.min(bad)):g}..{float(np.max(bad)):g} deg. "
             "Out-of-support fields are not assumed to be zero.")
     el_q = np.clip(el_q, el[0], el[-1])
@@ -3097,6 +3103,19 @@ def directions_from_aspect_roll(aspects_deg: 'Sequence[float]',
     return d, np.degrees(A), np.degrees(R)
 
 
+def _point_shadow_facing_normals(points):
+    """Skip front-face culling in ray tracing when any point is two-sided.
+
+    The field evaluator still gates each one-sided point. Keeping the shadow
+    mask purely geometric for a mixed group preserves two-sided responses.
+    """
+    if any(not bool(point.get("one_sided", True)) for point in points):
+        return None
+    return np.asarray(
+        [point["aperture_normal"] for point in points], dtype=float
+    ).reshape(len(points), 3)
+
+
 def sum_features(bor_result: 'Dict[str, Any]',
                  placements: 'Sequence[Dict[str, Any]]',
                  directions: 'np.ndarray',
@@ -3127,6 +3146,9 @@ def sum_features(bor_result: 'Dict[str, Any]',
                        "scale": <optional per-feature unit scale>,
                        "segment_normals": <optional (n,2,3) endpoint normals>,
                        "normal": <optional constant (3,) outward normal>,
+                       "psi_tm_deg": <optional per-feature TM phase correction>,
+                       "psi_te_deg": <optional per-feature TE phase correction>,
+                       "grazing_taper_deg": <optional taper; 0 disables it>,
                        "normal_fn": <optional callable overriding the body one>}
                     ``segment_normals`` is mutually exclusive with ``normal``
                     and ``normal_fn`` and is interpolated along each segment.
@@ -3263,8 +3285,9 @@ def sum_features(bor_result: 'Dict[str, Any]',
             None if segment_normals is not None else _placement_normal_fn(pl),
             dirs,
             frequency_ghz=frequency_ghz,
-            psi_tm_deg=psi_tm_deg, psi_te_deg=psi_te_deg,
-            grazing_taper_deg=GRAZING_TAPER_DEG,
+            psi_tm_deg=float(pl.get("psi_tm_deg", psi_tm_deg)),
+            psi_te_deg=float(pl.get("psi_te_deg", psi_te_deg)),
+            grazing_taper_deg=float(pl.get("grazing_taper_deg", GRAZING_TAPER_DEG)),
             max_piece_length_m=pl.get("max_piece_length_m"),
             occluder=occluder,
             shadow_points=pl.get("shadow_points"),
@@ -3313,9 +3336,7 @@ def sum_features(bor_result: 'Dict[str, Any]',
                 [point.get("shadow_location", point["location"])
                  for point in points], dtype=float
             ).reshape(len(points), 3)
-            facing_normals = np.asarray(
-                [point["aperture_normal"] for point in points], dtype=float
-            ).reshape(len(points), 3)
+            facing_normals = _point_shadow_facing_normals(points)
             if callable(getattr(occluder, "visible_many_packed", None)):
                 point_visibility = occluder.visible_many_packed(
                     locations,
@@ -3337,6 +3358,7 @@ def sum_features(bor_result: 'Dict[str, Any]',
         point_feature = point_scatterer_amplitude(
             pt["pattern"], pt["location"], pt["aperture_normal"], dirs, frequency_ghz,
             roll_ref=pt.get("roll_ref"), occluder=occluder,
+            one_sided=bool(pt.get("one_sided", True)),
             _interpolator_cache=point_interpolator_cache,
             _oriented_pattern_cache=oriented_pattern_cache,
             _visibility=(
@@ -3745,9 +3767,7 @@ def export_signature_grim(out_path: 'str', *,
             [point.get("shadow_location", point["location"])
              for point in points], dtype=float
         ).reshape(len(points), 3)
-        point_normals = np.asarray(
-            [point["aperture_normal"] for point in points], dtype=float
-        ).reshape(len(points), 3)
+        point_normals = _point_shadow_facing_normals(points)
         if callable(getattr(occluder, "visible_many_packed", None)):
             point_visibility = occluder.visible_many_packed(
                 point_locations, dirs, facing_normals=point_normals
@@ -4113,9 +4133,7 @@ def export_radar_grim(out_path: 'str', *,
             [point.get("shadow_location", point["location"])
              for point in points], dtype=float
         ).reshape(len(points), 3)
-        point_normals = np.asarray(
-            [point["aperture_normal"] for point in points], dtype=float
-        ).reshape(len(points), 3)
+        point_normals = _point_shadow_facing_normals(points)
         last_shadow_progress = -1
 
         def shadow_progress(done, total):
@@ -5572,6 +5590,20 @@ def add_features_to_monostatic_grim(
         profile = load_body_profile_grim(
             base, require_feature_surface=bool(placements or points or corners))
 
+    line_settings = [
+        {
+            "line_id": str(item.get("line_id", index + 1)),
+            "psi_tm_deg": float(item.get("psi_tm_deg", psi_tm_deg)),
+            "psi_te_deg": float(item.get("psi_te_deg", psi_te_deg)),
+            "grazing_taper_deg": float(item.get("grazing_taper_deg", GRAZING_TAPER_DEG)),
+        }
+        for index, item in enumerate(placements)
+    ]
+
+    def uniform_line_setting(name, default):
+        values = {item[name] for item in line_settings}
+        return next(iter(values)) if len(values) == 1 else (default if not values else None)
+
     new_provenance_record = {
         "schema": "ghost.workflow.coherent-feature-addition.v1",
         "source_monostatic_sha256": base_snapshot_sha256,
@@ -5579,17 +5611,26 @@ def add_features_to_monostatic_grim(
         "compact_feature_count": int(len(points)),
         "corner_estimate_count": int(len(corners)),
         "line_phase_mapping_deg": {
-            "TM": float(psi_tm_deg),
-            "TE": float(psi_te_deg),
+            "TM": uniform_line_setting("psi_tm_deg", float(psi_tm_deg)),
+            "TE": uniform_line_setting("psi_te_deg", float(psi_te_deg)),
         },
-        "line_grazing_taper_deg": float(GRAZING_TAPER_DEG),
+        "line_grazing_taper_deg": uniform_line_setting("grazing_taper_deg", float(GRAZING_TAPER_DEG)),
+        "line_response_settings": line_settings,
+        "line_default_phase_mapping_deg": {"TM": float(psi_tm_deg), "TE": float(psi_te_deg)},
+        "line_default_grazing_taper_deg": float(GRAZING_TAPER_DEG),
+        "point_response_settings": [
+            {"placement_id": str(item.get("placement_id", index + 1)),
+             "one_sided": bool(item.get("one_sided", True))}
+            for index, item in enumerate(points)
+        ],
         "model_scope": {
             "translation_phase": "exp(+2j*k*d_dot_r)",
             "body_feature_mutual_coupling": False,
             "multiple_scattering": False,
             "line_mapping_evidence": (
-                "legacy empirical mapping; checked-in validation covers "
-                "the circumferential PEC groove only"
+                "166.9/-9.2 degree legacy preset is empirical; checked-in "
+                "validation of that preset covers the circumferential PEC "
+                "groove only. Per-line settings record the applied corrections."
             ),
             "point_pattern_requirement": (
                 "local installed-feature-minus-clean-skin complex Jones field"

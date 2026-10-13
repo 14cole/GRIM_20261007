@@ -2313,7 +2313,7 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
             panel._apply_requirements_to_tables()
             panel._update_workflow_readiness()
 
-            self.assertEqual(panel.point_mapping.table.columnCount(), 4)
+            self.assertEqual(panel.point_mapping.table.columnCount(), 5)
             self.assertFalse(hasattr(panel, "expected_host_material"))
             self.assertNotIn("host material", panel.next_step_label.text().lower())
 

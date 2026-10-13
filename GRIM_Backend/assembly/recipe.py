@@ -4,7 +4,7 @@ Form values and preflight policies are resolved lazily from the Qt-free model.
 """
 from __future__ import annotations
 
-from GRIM_Backend.assembly.values import FeatureAssemblyValues, LoadedFeatureAssemblyRecipe
+from GRIM_Backend.assembly.values import FeatureAssemblyValues, LoadedFeatureAssemblyRecipe, normalize_response_settings
 
 import json
 import os
@@ -119,6 +119,8 @@ def feature_assembly_recipe_payload(
         )
 
     serialized_values: dict[str, Any] = {
+        "point_response_settings": normalize_response_settings(values.point_response_settings, "point"),
+        "line_response_settings": normalize_response_settings(values.line_response_settings, "line"),
         **{key: getattr(values, key) for key in ("study_frequencies_ghz", "study_azimuths_deg", "study_elevations_deg")},
         "base_grim": relative(values.base_grim),
         "output_grim": relative(values.output_grim),
@@ -303,10 +305,10 @@ def read_feature_assembly_recipe(
             f"Not a {FEATURE_RECIPE_SCHEMA!r} Assembly recipe."
         )
     version = payload.get("version")
-    if type(version) is not int or version != FEATURE_RECIPE_VERSION:
+    if type(version) is not int or version not in (5, FEATURE_RECIPE_VERSION):
         raise ValueError(
             f"Unsupported Assembly recipe version {version!r}; this GRIM build "
-            f"requires version {FEATURE_RECIPE_VERSION}."
+            f"supports versions 5 and {FEATURE_RECIPE_VERSION}."
         )
     name = payload.get("name")
     variant = payload.get("variant")
@@ -408,6 +410,8 @@ def read_feature_assembly_recipe(
     )
     recipe_dir = source.parent
     values = FeatureAssemblyValues(
+        point_response_settings=normalize_response_settings(raw_values.get("point_response_settings", {}), "point"),
+        line_response_settings=normalize_response_settings(raw_values.get("line_response_settings", {}), "line"),
         base_grim=_recipe_absolute_path(raw_values["base_grim"], recipe_dir=recipe_dir),
         output_grim=_recipe_absolute_path(raw_values["output_grim"], recipe_dir=recipe_dir),
         coordinate_units=coordinate_units,

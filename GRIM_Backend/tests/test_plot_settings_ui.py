@@ -73,7 +73,6 @@ class PlotSettingsUiTest(unittest.TestCase):
         self.assertEqual(isar_popup.windowTitle(), "ISAR Settings")
         self.assertEqual(self.plot_context.btn_settings.text(), "Plot Settings")
         self.assertEqual(self.isar_context.btn_settings.text(), "ISAR Settings")
-        self.assertIsNot(plot_popup.filter_edit, isar_popup.filter_edit)
 
         for popup in (plot_popup, isar_popup):
             self.assertIsInstance(popup.scroll_area, QScrollArea)
@@ -110,54 +109,7 @@ class PlotSettingsUiTest(unittest.TestCase):
         self.assertFalse(self._label(isar_popup, "Plot X Min").isVisible())
         self.assertGreater(isar_popup.scroll_area.verticalScrollBar().maximum(), 0)
 
-    def test_filter_is_row_based_case_insensitive_and_preserves_values(self) -> None:
-        popup = self.isar_context.settings_frame
-        popup.show()
-        self.app.processEvents()
-        original_width = self.isar_context.spin_isar_ap_width.value()
-        changed_values: list[float] = []
-        changed_scales: list[int] = []
-        self.isar_context.spin_isar_ap_width.valueChanged.connect(
-            changed_values.append
-        )
-        self.isar_context.combo_plot_scale.currentIndexChanged.connect(
-            changed_scales.append
-        )
-
-        popup.filter_edit.setText("ApErTuRe center")
-        self.app.processEvents()
-        self.assertTrue(self.isar_context.chk_isar_aperture.isVisible())
-        self.assertTrue(self.isar_context.spin_isar_ap_center.isVisible())
-        self.assertFalse(self.isar_context.combo_isar_recon.isVisible())
-        self.assertFalse(self._label(popup, "Plot X Min").isVisible())
-        self.assertFalse(popup.no_matches_label.isVisible())
-        self.assertEqual(self.isar_context.spin_isar_ap_width.value(), original_width)
-        self.assertEqual(changed_values, [])
-        self.assertEqual(changed_scales, [])
-
-        popup.filter_edit.clear()
-        self.app.processEvents()
-        self.assertTrue(self.isar_context.combo_isar_recon.isVisible())
-        self.assertFalse(self._label(popup, "Plot X Min").isVisible())
-        self.assertEqual(self.isar_context.spin_isar_ap_width.value(), original_width)
-        self.assertEqual(changed_values, [])
-        self.assertEqual(changed_scales, [])
-
-        # Combo-box choices participate in search without changing selection.
-        popup.filter_edit.setText("image linear")
-        self.app.processEvents()
-        self.assertTrue(self.isar_context.combo_plot_scale.isVisible())
-        self.assertFalse(self.isar_context.combo_isar_recon.isVisible())
-        self.assertEqual(changed_scales, [])
-
-        popup.filter_edit.setText("setting-that-does-not-exist")
-        self.app.processEvents()
-        self.assertTrue(popup.no_matches_label.isVisible())
-        self.assertFalse(
-            popup.content_widget.findChild(QWidget, "isarSettingsSection").isVisible()
-        )
-
-    def test_plotting_search_never_reveals_isar_and_tab_state_stays_independent(self) -> None:
+    def test_tab_switch_preserves_independent_settings_and_closes_previous_popup(self) -> None:
         plot_popup = self.plot_context.settings_frame
         isar_popup = self.isar_context.settings_frame
         plot_section = plot_popup.content_widget.findChild(
@@ -165,16 +117,12 @@ class PlotSettingsUiTest(unittest.TestCase):
         )
 
         plot_popup.show()
-        plot_popup.filter_edit.setText("reconstruction")
         self.app.processEvents()
-        self.assertTrue(plot_popup.no_matches_label.isVisible())
         self.assertFalse(plot_section.isVisible())
-        plot_popup.filter_edit.clear()
         self.assertTrue(plot_section.isHidden())
 
         self.plot_context.spin_plot_xmin.setValue(-12.0)
         self.isar_context.spin_plot_xmin.setValue(-34.0)
-        isar_popup.filter_edit.setText("aperture")
         self.plot_context.btn_settings.setChecked(True)
 
         self.window._plot_contexts = {
@@ -196,8 +144,6 @@ class PlotSettingsUiTest(unittest.TestCase):
         self.assertIs(self.window.combo_isar_recon, self.isar_context.combo_isar_recon)
         self.assertEqual(self.plot_context.spin_plot_xmin.value(), -12.0)
         self.assertEqual(self.window.spin_plot_xmin.value(), -34.0)
-        self.assertEqual(plot_popup.filter_edit.text(), "")
-        self.assertEqual(isar_popup.filter_edit.text(), "aperture")
 
 
 if __name__ == "__main__":

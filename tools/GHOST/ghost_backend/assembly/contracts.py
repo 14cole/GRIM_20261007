@@ -213,6 +213,23 @@ def _apply_feature_library_contracts(
                         float(np.max(point_frequencies)),
                     )
             manifest = manifests[dataset_id]
+            if feature_kind == "line" and manifest is not None:
+                calibration = manifest.get("line_phase_calibration", {})
+                actual = record.get("response_settings", {})
+                declared = {"psi_tm_deg": calibration.get("tm_deg"),
+                            "psi_te_deg": calibration.get("te_deg"),
+                            "grazing_taper_deg": calibration.get("grazing_taper_deg")}
+                if actual and any(actual.get(key) != value for key, value in declared.items()):
+                    message = (
+                        f"Line response {dataset_id!r}: selected phase correction/taper "
+                        "differs from its library validation settings; the selected "
+                        "values will be used and saved with the result."
+                    )
+                    if message not in warnings:
+                        warnings.append(message)
+                    record["response_settings_match_library_validation"] = False
+                elif actual:
+                    record["response_settings_match_library_validation"] = True
             if feature_kind == "point":
                 point_support = _validate_point_requested_support(
                     placement, directions, frequencies, dataset_id=dataset_id

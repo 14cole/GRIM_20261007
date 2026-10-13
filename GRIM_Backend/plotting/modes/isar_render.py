@@ -361,13 +361,18 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
             br["isar_display"] = intensity
 
     n_bands = len(band_results)
+    square_widget = getattr(self, "chk_isar_square", None)
+    square_aspect = bool(square_widget.isChecked()) if square_widget is not None else True
 
     self._remove_colorbar()
     release_native = getattr(self, "_release_native_plot_samples", None)
     if callable(release_native):
         release_native()
     self.plot_figure.clear()
-    self.plot_figure.set_layout_engine('constrained')
+    # Keep fixed-aspect panels and their colorbars together in the center.
+    # Ordinary constrained layout reserves a full-width cell; the colorbar's
+    # right-side anchor then pushes a smaller square image to that cell's edge.
+    self.plot_figure.set_layout_engine('compressed' if square_aspect else 'constrained')
     self.plot_figure._grim_isar_layout = True
     if n_bands == 1:
         self.plot_ax = self.plot_figure.add_subplot(111)
@@ -398,9 +403,6 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
     plot_vmax = zmax if use_clamp else (
         shared_limits[1] if shared_limits is not None else None
     )
-
-    square_widget = getattr(self, "chk_isar_square", None)
-    square_aspect = bool(square_widget.isChecked()) if square_widget is not None else True
 
     last_mesh = None
     self._isar_meshes = []

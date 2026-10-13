@@ -499,7 +499,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         ))
         _ops_pad("Calibration, Geometry & Quality", (
             ("Range Cal", "btn_range_cal"),
-            ("Support Ref -", "btn_support_reference"),
             ("Audit…", "btn_audit"),
             ("Compatibility…", "btn_compatibility"),
             ("Provenance…", "btn_provenance"),
@@ -532,13 +531,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             "Complex substitution calibration using loaded measured-cal and "
             "exact-reference datasets plus a signed one-way physical "
             "displacement; GRIM applies the monostatic two-way phase."
-        )
-        self.btn_support_reference.setToolTip(
-            "Guided exact complex target+support minus support-only workflow. "
-            "Requires identical grids and coherent conventions, records input "
-            "content hashes and subtraction QA, and creates a new unsaved "
-            "support-referenced difference. It does not reconstruct a free-space "
-            "target or remove target/support interaction terms."
         )
         self.btn_axis_units.setToolTip(
             "Convert stored angle and frequency coordinates between equivalent "
@@ -1040,9 +1032,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_round.clicked.connect(self._round_selected)
         self.btn_offset.clicked.connect(self._offset_selected)
         self.btn_range_cal.clicked.connect(self._range_cal_selected)
-        self.btn_support_reference.clicked.connect(
-            self._support_reference_difference_selected
-        )
         self.btn_audit.clicked.connect(self._audit_selected_datasets)
         self.btn_compatibility.clicked.connect(
             self._compatibility_selected_datasets
@@ -1787,7 +1776,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         settings_layout.addWidget(btn_plot_grid, row, 2)
         settings_layout.addWidget(btn_plot_text, row, 3)
 
-        common_filter_exclusions = [isar_settings_section]
         if tab_key == "isar":
             # X/Y limits are managed by the ISAR Fit/Zoom/Pan tools and polar-
             # zero direction does not participate in ISAR formation.  Keep
@@ -1803,18 +1791,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                         continue
                     seen.add(id(widget))
                     widget.setVisible(False)
-                    common_filter_exclusions.append(widget)
-
-        settings_frame.register_filter_grid(
-            settings_layout,
-            excluded_widgets=tuple(common_filter_exclusions),
-        )
-        if tab_key == "isar":
-            settings_frame.register_filter_grid(
-                isar_settings_layout,
-                search_prefix="ISAR",
-                section=isar_settings_section,
-            )
 
         plot_frame = QFrame()
         plot_frame.setFrameShape(QFrame.StyledPanel)
@@ -1884,7 +1860,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         if image_analysis_controls is not None:
             plot_layout.addWidget(image_analysis_controls.cut_bar)
         spatial_overlays = SpatialOverlayPanel(self, plot_canvas)
-        plot_layout.addWidget(spatial_overlays)
         plot_layout.addWidget(plot_canvas, 1)
         plot_slider = None
         if tab_key == "plotting":
@@ -2153,14 +2128,15 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             if tab_key != self._active_plot_tab:
                 if previous.inline_analysis is not None:
                     previous.inline_analysis.stop_region_selection()
+                previous.spatial_overlays.hide()
                 previous.spatial_overlays.stop_interaction()
             for field in PlotContext.__dataclass_fields__:
                 if hasattr(self, field):
                     setattr(previous, field, getattr(self, field))
             if tab_key != self._active_plot_tab and previous.settings_frame.isVisible():
                 # A settings frame is a top-level popup.  Close the old tab's
-                # popup during a Plotting/ISAR switch so two independently
-                # filtered settings windows never overlap or imply that one
+                # popup during a Plotting/ISAR switch so the two tabs'
+                # settings windows never overlap or imply that one
                 # tab controls the other.
                 previous.settings_frame.close()
 
@@ -2215,8 +2191,11 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         tab_key = self._tab_key_for_index.get(index)
         if tab_key is None:
             active = self._plot_contexts.get(self._active_plot_tab)
-            if active is not None and active.inline_analysis is not None:
-                active.inline_analysis.stop_region_selection()
+            if active is not None:
+                if active.inline_analysis is not None:
+                    active.inline_analysis.stop_region_selection()
+                active.spatial_overlays.hide()
+                active.spatial_overlays.stop_interaction()
             if active is not None and active.settings_frame.isVisible():
                 active.settings_frame.close()
             if self.main_tabs.widget(index) is self.ppt_workspace:

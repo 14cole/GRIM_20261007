@@ -237,7 +237,6 @@ def _build_base_qss(palette: Mapping[str, object]) -> str:
         border-radius: 6px; padding: 6px 8px;
     }}
     QWidget#plotSettingsContent {{ background: {palette['panel_bg']}; }}
-    QLabel#settingsNoMatches {{ color: {palette['muted']}; padding: 4px 2px; }}
     QWidget#dockBody {{ background: {palette['win_bg']}; }}
     QToolButton#sectionHeader {{
         background: {palette['head_bg']}; color: {palette['text']};

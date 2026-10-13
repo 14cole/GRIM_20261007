@@ -180,6 +180,10 @@ class FeatureAssemblyRequest:
     study_azimuths_deg: 'Optional[tuple[float, ...]]' = None
     study_elevations_deg: 'Optional[tuple[float, ...]]' = None
 
+    # Per-response controls; omitted settings preserve existing recipe results.
+    line_response_settings: 'Mapping[str, Mapping[str, Any]]' = field(default_factory=dict)
+    point_response_settings: 'Mapping[str, Mapping[str, Any]]' = field(default_factory=dict)
+
 
 @dataclass(frozen=True)
 class FeatureDatasetRequirements:
@@ -453,6 +457,8 @@ def feature_assembly_plan_sha256(plan: 'FeatureAssemblyPlan') -> 'str':
         }), sort_keys=True, separators=(",", ":")).encode("utf-8"))
     unique_patterns: 'dict[int, int]' = {}
     for index, placement in enumerate(plan.point_placements):
+        digest.update(json.dumps({"one_sided": placement.get("one_sided", True)},
+                                 sort_keys=True).encode("utf-8"))
         for key in (
             "location", "aperture_normal", "roll_ref", "shadow_location"
         ):
@@ -2762,20 +2768,10 @@ def validate_feature_library_manifest(
                 "line_phase_calibration.grazing_taper_deg",
             )
         )
-        if not math.isclose(calibrated_tm, PSI_HH_DEG, abs_tol=1.0e-12) or not (
-            math.isclose(calibrated_te, PSI_VV_DEG, abs_tol=1.0e-12)
-        ):
+        if calibrated_taper < 0.0:
             raise ValueError(
-                "line_phase_calibration does not match the phase mapping "
-                f"executed by Assembly (TM={PSI_HH_DEG:g} deg, "
-                f"TE={PSI_VV_DEG:g} deg)."
-            )
-        if not math.isclose(
-            calibrated_taper, GRAZING_TAPER_DEG, abs_tol=1.0e-12
-        ):
-            raise ValueError(
-                "line_phase_calibration.grazing_taper_deg does not match the "
-                f"Assembly line model ({GRAZING_TAPER_DEG:g} deg)."
+                "line_phase_calibration.grazing_taper_deg must be nonnegative "
+                "(0 disables the taper)."
             )
         calibration_cases = calibration.get("case_ids")
         if not isinstance(calibration_cases, list) or not calibration_cases or any(
@@ -2866,9 +2862,9 @@ def validate_feature_library_manifest(
         ] = conical_max
         normalized["line_phase_calibration"] = {
             "schema": LINE_PHASE_CALIBRATION_SCHEMA,
-            "tm_deg": float(PSI_HH_DEG),
-            "te_deg": float(PSI_VV_DEG),
-            "grazing_taper_deg": float(GRAZING_TAPER_DEG),
+            "tm_deg": calibrated_tm,
+            "te_deg": calibrated_te,
+            "grazing_taper_deg": calibrated_taper,
             "case_ids": [value.strip() for value in calibration_cases],
         }
     normalized["validation"] = dict(validation)
@@ -3456,7 +3452,8 @@ def _validate_point_requested_support(
     queried_elevation = np.degrees(np.arcsin(np.clip(
         local_directions[:, 2], -1.0, 1.0
     )))
-    lit = radar_directions @ normal > 0.0
+    lit = (radar_directions @ normal > 0.0 if placement.get("one_sided", True)
+           else np.ones(len(radar_directions), dtype=bool))
     outside = lit & (
         (queried_elevation < elevations[0] - 1.0e-9)
         | (queried_elevation > elevations[-1] + 1.0e-9)
@@ -3467,7 +3464,7 @@ def _validate_point_requested_support(
             f"point dataset {dataset_id!r} elevation support is "
             f"[{elevations[0]:g}, {elevations[-1]:g}] deg, but this placement "
             f"needs {float(np.min(queried)):g}..{float(np.max(queried)):g} deg "
-            "over lit requested looks."
+            "over requested looks included by the point-sidedness setting."
         )
     return {
         "requested_look_count": int(len(radar_directions)),
@@ -3806,6 +3803,62 @@ from ghost_backend.assembly.preparation import (
 )
 
 
+def _normalized_response_settings(settings, *, kind):
+    """Validate numeric controls without requiring a particular solver preset."""
+    if not isinstance(settings, Mapping):
+        raise TypeError(f"{kind}_response_settings must map dataset IDs to settings.")
+    defaults = (dict(psi_tm_deg=float(PSI_HH_DEG), psi_te_deg=float(PSI_VV_DEG),
+                     grazing_taper_deg=float(GRAZING_TAPER_DEG))
+                if kind == "line" else dict(one_sided=True))
+    result = {}
+    for dataset_id, values in settings.items():
+        if not isinstance(dataset_id, str) or not isinstance(values, Mapping):
+            raise TypeError(f"{kind} response settings need string dataset IDs and setting objects.")
+        unknown = set(values) - set(defaults)
+        if unknown:
+            raise ValueError(f"Unknown {kind} response settings for {dataset_id!r}: {sorted(unknown)}")
+        clean = dict(defaults)
+        clean.update(values)
+        if kind == "line":
+            for key, value in clean.items():
+                if isinstance(value, (bool, np.bool_)):
+                    raise ValueError(f"{dataset_id!r} {key} must be finite degrees.")
+                try:
+                    number = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{dataset_id!r} {key} must be finite degrees.") from exc
+                if not math.isfinite(number):
+                    raise ValueError(f"{dataset_id!r} {key} must be finite degrees.")
+                clean[key] = number
+            if clean["grazing_taper_deg"] < 0.0:
+                raise ValueError("Line grazing taper must be nonnegative (0 disables it).")
+        else:
+            if not isinstance(clean["one_sided"], (bool, np.bool_)):
+                raise ValueError(f"{dataset_id!r} one_sided must be True or False.")
+            clean["one_sided"] = bool(clean["one_sided"])
+        result[dataset_id] = clean
+    return result
+
+
+def _apply_response_settings(request, placements):
+    """Bind effective controls to every calculation and its provenance record."""
+    effective = {"line": {}, "point": {}}
+    for kind, items, records, configured, defaults in (
+        ("line", placements.lines, placements.line_records, request.line_response_settings,
+         dict(psi_tm_deg=float(PSI_HH_DEG), psi_te_deg=float(PSI_VV_DEG),
+              grazing_taper_deg=float(GRAZING_TAPER_DEG))),
+        ("point", placements.points, placements.point_records, request.point_response_settings,
+         dict(one_sided=True)),
+    ):
+        for placement, record in zip(items, records):
+            dataset_id = str(record["dataset_id"])
+            controls = dict(defaults, **configured.get(dataset_id, {}))
+            placement.update(controls)
+            record["response_settings"] = dict(controls)
+            effective[kind][dataset_id] = controls
+    return effective
+
+
 def prepare_feature_assembly(
     request: 'FeatureAssemblyRequest',
     *,
@@ -3814,6 +3867,9 @@ def prepare_feature_assembly(
 ) -> 'FeatureAssemblyPlan':
     """Resolve, validate, and prepare one feature-assembly request."""
 
+    request = replace(request,
+        line_response_settings=_normalized_response_settings(request.line_response_settings, kind="line"),
+        point_response_settings=_normalized_response_settings(request.point_response_settings, kind="point"))
     sources = capture_assembly_sources(request, cancel_check=cancel_check, progress_callback=progress_callback)
 
 
@@ -3914,6 +3970,7 @@ def prepare_feature_assembly(
         pre_validation_warnings=pre_validation_warnings, surface_geometry_contract=surface_geometry_contract,
         cancel_check=cancel_check, progress_callback=progress_callback,
     )
+    response_settings = _apply_response_settings(request, placements)
 
     if embedded_grid is None and (placements.lines or placements.points):
         surface_digest = sources.prepared_source_sha256[str(sources.surface_path)]
@@ -4191,11 +4248,21 @@ def prepare_feature_assembly(
             ],
             "line_ids": [str(record["line_id"]) for record in placements.line_records],
         },
-        "line_phase_mapping_deg": {
-            "TM": float(PSI_HH_DEG),
-            "TE": float(PSI_VV_DEG),
-        },
-        "line_grazing_taper_deg": float(GRAZING_TAPER_DEG),
+        "line_response_settings": response_settings["line"],
+        "point_response_settings": response_settings["point"],
+        "line_phase_mapping_deg": (
+            dict(TM=next(iter(response_settings["line"].values()))["psi_tm_deg"],
+                 TE=next(iter(response_settings["line"].values()))["psi_te_deg"])
+            if response_settings["line"] and len({(s["psi_tm_deg"], s["psi_te_deg"])
+                for s in response_settings["line"].values()}) == 1
+            else (None if response_settings["line"] else dict(TM=float(PSI_HH_DEG), TE=float(PSI_VV_DEG)))
+        ),
+        "line_grazing_taper_deg": (
+            next(iter(response_settings["line"].values()))["grazing_taper_deg"]
+            if response_settings["line"] and len({s["grazing_taper_deg"]
+                for s in response_settings["line"].values()}) == 1
+            else (None if response_settings["line"] else float(GRAZING_TAPER_DEG))
+        ),
         "assembly_workload_preflight": assembly_workload.as_dict(),
         "base_grid_contract": base_grid_contract,
         "legacy_base_metadata_allowed": bool(
@@ -4220,7 +4287,7 @@ def prepare_feature_assembly(
         "model_scope": {
             "body_feature_mutual_coupling": False,
             "multiple_scattering": False,
-            "line_mapping_validation_scope": "circumferential PEC groove",
+            "line_mapping_validation_scope": "per-response engineer selection; legacy preset derived from circumferential PEC groove",
             "point_pattern_semantics": (
                 "installed-feature-minus-clean-skin local complex Jones field"
             ),
@@ -4393,6 +4460,8 @@ def _execution_plan_snapshot(plan: 'FeatureAssemblyPlan') -> 'FeatureAssemblyPla
         plan.request,
         point_datasets=dict(plan.request.point_datasets),
         line_datasets=dict(plan.request.line_datasets),
+        line_response_settings=copy.deepcopy(plan.request.line_response_settings),
+        point_response_settings=copy.deepcopy(plan.request.point_response_settings),
     )
     occluder = (
         None

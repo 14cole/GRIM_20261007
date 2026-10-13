@@ -304,6 +304,72 @@ class SpatialOverlayTests(_WindowCase):
                     send('scroll_event', .25, .25, button='up', step=1)
                     self.assertLess(np.ptp(ax.get_xlim()), np.ptp(views[-1][0]))
 
+    def test_isar_image_and_colorbar_stay_centered_after_azimuth_range(self):
+        window = self.window
+        self.make_axes()
+        self.select_rows(0, freqs=tuple(range(len(self.datasets[0].frequencies))))
+        window.list_elev.clearSelection()
+        window.list_elev.item(0).setSelected(True)
+        window.resize(1600, 850)
+        params = dict(dataset=self.datasets[0], unit_name='in', az_target_deg=None,
+                      elevation_deg=0., pol_idx=0, recon='accurate')
+
+        def draw():
+            self.app.processEvents()
+            window.plot_canvas.draw()
+
+        def azimuth_range():
+            window._plot_az_vs_range()
+            self.assertIn('Az vs Down-Range updated', window.status.currentMessage())
+            draw()
+            self.assertEqual(window.plot_ax.get_aspect(), 'auto')
+            np.testing.assert_allclose(window.plot_ax.get_position().bounds,
+                                       window.plot_ax.get_position(original=True).bounds)
+            self.assertFalse(getattr(window.plot_figure, '_grim_isar_layout', False))
+
+        for count, colorbar, shared in ((1, True, True), (1, False, True),
+                                        (2, True, True), (2, True, False)):
+            with self.subTest(panels=count, colorbar=colorbar, shared=shared):
+                for widget, value in ((window.chk_colorbar, colorbar),
+                                      (window.chk_colorbar_shared, shared)):
+                    widget.blockSignals(True)
+                    widget.setChecked(value)
+                    widget.blockSignals(False)
+                azimuth_range()
+                # A completed worker enters this renderer after setting the
+                # active mode. Exercise the same Az/DR -> ISAR transition.
+                window.last_plot_mode = 'isar_image'
+                window._start_plot_render()
+                bands = [dict(magnitude=np.ones((65, 65), np.float32),
+                              x_range=np.linspace(-10, 10, 65),
+                              y_range=np.linspace(-10, 10, 65),
+                              az_values=np.linspace(i*30-10, i*30+10, 33),
+                              resolved_reconstruction='accurate') for i in range(count)]
+                isar_render.display_results(window, params, bands, .01)
+                for _ in range(3):
+                    draw()
+                axes = window.plot_axes or [window.plot_ax]
+                positions = [a.get_position().bounds for a in axes]
+                group = axes + [cb.ax for cb in window.plot_colorbars]
+                left = min(a.get_position().x0 for a in group)
+                right = max(a.get_position().x1 for a in group)
+                self.assertAlmostEqual((left+right)/2, .5, delta=.07)
+                for cb in window.plot_colorbars:
+                    # Centering the image alone would leave its colorbar at
+                    # the far right, with a large empty gap between them.
+                    bar = cb.ax.get_position()
+                    nearest_right = max(a.get_position().x1 for a in axes
+                                        if a.get_position().x1 < bar.x0)
+                    self.assertLess(bar.x0-nearest_right, .08)
+                for _ in range(3):
+                    draw()
+                for a, expected in zip(axes, positions):
+                    np.testing.assert_allclose(a.get_position().bounds, expected, rtol=0, atol=1e-6)
+                    np.testing.assert_allclose(a.get_xlim(), [-10.15625, 10.15625])
+                    np.testing.assert_allclose(a.get_ylim(), [-10.15625, 10.15625])
+                # Switching back must release the compact square-image layout.
+                azimuth_range()
+
     def test_panel_binding_and_tab_isolation(self):
         panel, axes = self.make_axes(multiple=True)
         self.assertEqual(len(panel.axes), 2)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QFrame, QLabel,
     QScrollArea, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -32,12 +32,12 @@ class ClickableLabel(QLabel):
 
 
 class PlotSettingsPopup(QFrame):
-    """Scrollable, searchable top-level popup for one plot context.
+    """Scrollable top-level popup for one plot context.
 
     Closing the window via its title bar untoggles the bound button so the
     button state mirrors visibility.  ``content_widget`` deliberately remains
     a plain widget: callers can keep using their existing grid layout while
-    the popup owns the search bar and scroll-area plumbing.
+    the popup owns the scroll-area plumbing.
     """
 
     def __init__(
@@ -48,7 +48,6 @@ class PlotSettingsPopup(QFrame):
     ) -> None:
         super().__init__(parent)
         self._toggle_button: QToolButton | None = None
-        self._filter_rows: list[tuple[str, tuple[QWidget, ...], QWidget | None]] = []
         self.setWindowFlag(Qt.Window, True)
         self.setWindowTitle(title)
         # Keep the popup useful on a compact display.  Larger contents scroll
@@ -60,24 +59,6 @@ class PlotSettingsPopup(QFrame):
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(8)
 
-        filter_row = QHBoxLayout()
-        filter_label = QLabel("Find setting")
-        self.filter_edit = QLineEdit(self)
-        self.filter_edit.setObjectName("plotSettingsFilter")
-        self.filter_edit.setPlaceholderText("Search settings…")
-        self.filter_edit.setClearButtonEnabled(True)
-        self.filter_edit.setToolTip(
-            "Filter settings by label, control name, option, or help text."
-        )
-        filter_row.addWidget(filter_label)
-        filter_row.addWidget(self.filter_edit, 1)
-        outer.addLayout(filter_row)
-
-        self.no_matches_label = QLabel("No settings match this search.")
-        self.no_matches_label.setObjectName("settingsNoMatches")
-        self.no_matches_label.setVisible(False)
-        outer.addWidget(self.no_matches_label)
-
         self.scroll_area = QScrollArea(self)
         self.scroll_area.setObjectName("plotSettingsScroll")
         self.scroll_area.setWidgetResizable(True)
@@ -88,70 +69,6 @@ class PlotSettingsPopup(QFrame):
         self.content_widget.setObjectName("plotSettingsContent")
         self.scroll_area.setWidget(self.content_widget)
         outer.addWidget(self.scroll_area, 1)
-
-        self.filter_edit.textChanged.connect(self._apply_filter)
-
-    @staticmethod
-    def _searchable_widget_text(widget: QWidget) -> str:
-        parts: list[str] = []
-        for accessor in ("text", "toolTip", "placeholderText", "windowTitle"):
-            method = getattr(widget, accessor, None)
-            if callable(method):
-                value = method()
-                if value:
-                    parts.append(str(value))
-        if isinstance(widget, QComboBox):
-            parts.extend(widget.itemText(index) for index in range(widget.count()))
-        return " ".join(parts)
-
-    def register_filter_grid(
-        self,
-        grid: QGridLayout,
-        *,
-        search_prefix: str = "",
-        section: QWidget | None = None,
-        excluded_widgets: tuple[QWidget, ...] = (),
-    ) -> None:
-        """Register each grid row as one searchable unit.
-
-        A matching row keeps all of its labels and controls together.  When a
-        nested ``section`` is supplied, the section itself disappears if none
-        of its rows match, avoiding an empty ISAR block during filtering.
-        """
-
-        excluded_ids = {id(widget) for widget in excluded_widgets}
-        for row in range(grid.rowCount()):
-            widgets: list[QWidget] = []
-            seen: set[int] = set()
-            for column in range(grid.columnCount()):
-                item = grid.itemAtPosition(row, column)
-                widget = item.widget() if item is not None else None
-                if widget is None or id(widget) in excluded_ids or id(widget) in seen:
-                    continue
-                seen.add(id(widget))
-                widgets.append(widget)
-            if not widgets:
-                continue
-            haystack = " ".join(
-                [search_prefix]
-                + [self._searchable_widget_text(widget) for widget in widgets]
-            ).casefold()
-            self._filter_rows.append((haystack, tuple(widgets), section))
-
-    def _apply_filter(self, text: str) -> None:
-        tokens = tuple(part.casefold() for part in text.split() if part)
-        section_matches: dict[QWidget, bool] = {}
-        any_match = False
-        for haystack, widgets, section in self._filter_rows:
-            matches = all(token in haystack for token in tokens)
-            any_match = any_match or matches
-            for widget in widgets:
-                widget.setVisible(matches)
-            if section is not None:
-                section_matches[section] = section_matches.get(section, False) or matches
-        for section, matches in section_matches.items():
-            section.setVisible(matches)
-        self.no_matches_label.setVisible(bool(tokens) and not any_match)
 
     def set_toggle_button(self, button: QToolButton) -> None:
         self._toggle_button = button

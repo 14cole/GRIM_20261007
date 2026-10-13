@@ -153,7 +153,7 @@ class PioFormatMixin:
             - Y axis (yname=frequency)        -> frequency in GHz, converted
               exactly from yunits in {Hz, kHz, MHz, GHz}
             - elevation is restored from the optional Elevation field and
-              ElevationUnits (defaulting to the X angular unit for legacy files)
+              ElevationUnits (defaulting to degrees for legacy files)
             - polarization is taken from the `polarity` header/footer field, or
               inferred from HH/VV/VH/HV in the filename.
 
@@ -161,6 +161,10 @@ class PioFormatMixin:
         repeated closing row is removed based on one-period equivalence to the
         opening angle, so the seam may occur at any measured angle rather than
         only at 0/360 or -180/+180.  The opening measurement is retained.
+
+        Explicit XVals/YVals define the sample coordinates when present.
+        Conflicting or invalid redundant Start/Stop/Step summaries are noted
+        in history without overriding the explicit coordinates.
         """
         from GRIM_Backend.datasets.constants import _ANGLE_UNITS, _FREQUENCY_UNITS
         from GRIM_Backend.io.pioneer import _pio_remove_closed_azimuth_endpoint
@@ -334,6 +338,8 @@ class PioFormatMixin:
                 raise ValueError(f"PIO header {key} contains a nonfinite axis value")
             return result
 
+        axis_summary_notes: list[str] = []
+
         def _build_axis(prefix: str, size: int) -> np.ndarray:
             vals = _parse_axis_values(f"{prefix}vals", size)
             start = header.get(f"{prefix}start")
@@ -377,10 +383,24 @@ class PioFormatMixin:
                 try:
                     numeric = float(raw_value)
                 except ValueError as exc:
+                    if vals is not None:
+                        axis_summary_notes.append(
+                            f"ignored nonnumeric {field_name}={raw_value!r}; "
+                            f"used explicit {prefix.upper()}Vals"
+                        )
+                        parsed[field_name] = None
+                        continue
                     raise ValueError(
                         f"PIO header {field_name} must be numeric; got {raw_value!r}"
                     ) from exc
                 if not np.isfinite(numeric):
+                    if vals is not None:
+                        axis_summary_notes.append(
+                            f"ignored nonfinite {field_name}={raw_value!r}; "
+                            f"used explicit {prefix.upper()}Vals"
+                        )
+                        parsed[field_name] = None
+                        continue
                     raise ValueError(
                         f"PIO header {field_name} must be finite; got {raw_value!r}"
                     )
@@ -402,11 +422,9 @@ class PioFormatMixin:
                         raw_declared, declared, actual
                     )
                     if abs(declared - actual) > tolerance:
-                        raise ValueError(
-                            f"PIO {label}={declared:.17g} conflicts with explicit "
-                            f"{prefix.upper()}Vals endpoint {actual:.17g}; "
-                            f"difference {abs(declared - actual):.6g} exceeds "
-                            f"the summary precision tolerance {tolerance:.6g}"
+                        axis_summary_notes.append(
+                            f"ignored {label}={declared:.17g}; used explicit "
+                            f"{prefix.upper()}Vals endpoint {actual:.17g}"
                         )
                 if step_f is not None:
                     summary_step = (
@@ -418,12 +436,10 @@ class PioFormatMixin:
                         step, step_f, summary_step
                     )
                     if abs(step_f - summary_step) > tolerance:
-                        raise ValueError(
-                            f"PIO {prefix.upper()}Step={step_f:.17g} conflicts "
-                            f"with explicit {prefix.upper()}Vals summary step "
-                            f"{summary_step:.17g}; difference "
-                            f"{abs(step_f - summary_step):.6g} exceeds the "
-                            f"summary precision tolerance {tolerance:.6g}"
+                        axis_summary_notes.append(
+                            f"ignored {prefix.upper()}Step={step_f:.17g}; used "
+                            f"explicit {prefix.upper()}Vals with summary step "
+                            f"{summary_step:.17g}"
                         )
                 return vals
             if start_f is not None and step_f is not None:
@@ -556,15 +572,10 @@ class PioFormatMixin:
             or footer.get("elevationunits")
             or footer.get("elevation_units")
         )
-        if elevation_raw is not None and (
-            elevation_unit_raw is None or not str(elevation_unit_raw).strip()
-        ):
-            raise ValueError(
-                "PIO contains Elevation but no ElevationUnits; the angle cannot "
-                "be safely interpreted"
-            )
+        if elevation_unit_raw is None or not str(elevation_unit_raw).strip():
+            elevation_unit_raw = "deg"
         elevation_unit = cls._canonical_unit(
-            elevation_unit_raw, _ANGLE_UNITS, xunit
+            elevation_unit_raw, _ANGLE_UNITS, "deg"
         )
         if elevation_unit not in {"deg", "rad"}:
             raise ValueError(
@@ -601,6 +612,7 @@ class PioFormatMixin:
 
         prior_log = header.get("log") or footer.get("log") or ""
         history_parts = [f"Loaded Pioneer file: {path}"]
+        history_parts.extend(axis_summary_notes)
         if dropped_closing_azimuth:
             history_parts.append(
                 "removed repeated closing azimuth "

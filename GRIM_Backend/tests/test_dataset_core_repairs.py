@@ -1013,14 +1013,14 @@ class PioStreamingTests(unittest.TestCase):
             f"XSize={xsize}",
             "XName=azimuth",
             *([] if xunits is None else [f"XUnits={xunits}"]),
-            f"XVals={xvals}",
+            *([] if xvals is None else [f"XVals={xvals}"]),
             f"YStart={default_ystart if ystart is None else ystart}",
             f"YStop={default_ystop if ystop is None else ystop}",
             f"YStep={default_ystep if ystep is None else ystep}",
             f"YSize={ysize}",
             "YName=frequency",
             *([] if yunits is None else [f"YUnits={yunits}"]),
-            f"YVals={yvals}",
+            *([] if yvals is None else [f"YVals={yvals}"]),
             *([] if elevation is None else [f"Elevation={elevation}"]),
             *(
                 []
@@ -1189,16 +1189,53 @@ class PioStreamingTests(unittest.TestCase):
             for index, (updates, message) in enumerate((
                 ({"xunits": None}, "missing XUnits"),
                 ({"yunits": None}, "missing YUnits"),
-                (
-                    {"elevation": "10", "elevationunits": None},
-                    "Elevation but no ElevationUnits",
-                ),
             )):
                 with self.subTest(updates=updates):
                     path = os.path.join(directory, f"missing-units-{index}.pio")
                     self._write_pio_fixture(path, **updates)
                     with self.assertRaisesRegex(ValueError, message):
                         RcsGrid.load_pio(path)
+
+    def test_pio_missing_elevation_units_defaults_to_degrees(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for xunits in ("deg", "rad"):
+                for elevationunits in (None, "", " "):
+                    for location in ("header", "footer"):
+                        with self.subTest(
+                            xunits=xunits, elevationunits=elevationunits,
+                            location=location,
+                        ):
+                            path = os.path.join(directory, "legacy-elevation.pio")
+                            payload = np.asarray([1.0, 2.0], dtype="<f4").tobytes()
+                            footer = b"\nElevation=10\n" if location == "footer" else b""
+                            if location == "footer" and elevationunits is not None:
+                                footer += f"ElevationUnits={elevationunits}\n".encode("ascii")
+                            self._write_pio_fixture(
+                                path,
+                                xunits=xunits,
+                                elevation="10" if location == "header" else None,
+                                elevationunits=(
+                                    elevationunits if location == "header" else None
+                                ),
+                                payload=payload + footer,
+                            )
+                            loaded = RcsGrid.load_pio(path)
+                            np.testing.assert_array_equal(loaded.elevations, [10.0])
+                            self.assertEqual(loaded.units["elevation"], "deg")
+                            np.testing.assert_allclose(
+                                loaded.rcs.ravel(), [1.0 + 2.0j], rtol=3.0e-7,
+                            )
+
+    def test_pio_explicit_elevation_units_override_degree_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for elevationunits, expected in (("deg", 0.5), ("rad", np.rad2deg(0.5))):
+                with self.subTest(elevationunits=elevationunits):
+                    path = os.path.join(directory, "explicit-elevation.pio")
+                    self._write_pio_fixture(
+                        path, elevation="0.5", elevationunits=elevationunits,
+                    )
+                    loaded = RcsGrid.load_pio(path)
+                    np.testing.assert_allclose(loaded.elevations, [expected])
 
     def test_pio_rejects_nonfinite_duplicate_and_nonmonotonic_axes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1232,7 +1269,7 @@ class PioStreamingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "strictly monotonic"):
                 RcsGrid.load_pio(path)
 
-    def test_pio_rejects_conflicting_explicit_and_summary_axis_metadata(self):
+    def test_pio_explicit_axis_overrides_conflicting_summary_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "conflicting-axis.pio")
             self._write_pio_fixture(
@@ -1244,10 +1281,112 @@ class PioStreamingTests(unittest.TestCase):
                     [1.0, 0.0, 2.0, 0.0], dtype="<f4"
                 ).tobytes(),
             )
-            with self.assertRaisesRegex(
-                ValueError, "XStop=2 conflicts with explicit XVals endpoint 1"
+            loaded = RcsGrid.load_pio(path)
+            np.testing.assert_array_equal(loaded.azimuths, [0.0, 1.0])
+            np.testing.assert_allclose(loaded.rcs.real.ravel(), [1.0, 2.0])
+            self.assertIn("ignored XStop=2; used explicit XVals endpoint 1", loaded.history)
+
+    def test_pio_explicit_axis_overrides_reported_step_disagreement(self):
+        coordinates = np.arange(192, dtype=float) * 0.10025912565445026
+        samples = np.arange(192, dtype=np.float64) + 1j * np.arange(192, 384)
+        payload = np.empty(samples.size * 2, dtype="<f8")
+        payload[0::2] = samples.real
+        payload[1::2] = samples.imag
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "measured-step.pio")
+            self._write_pio_fixture(
+                path,
+                xsize=str(coordinates.size),
+                xvals=":".join(format(value, ".17g") for value in coordinates),
+                xstep="0.100271",
+                precision="Double",
+                payload=payload.tobytes(),
+            )
+            loaded = RcsGrid.load_pio(path)
+        np.testing.assert_array_equal(loaded.azimuths, coordinates)
+        np.testing.assert_allclose(loaded.rcs[:, 0, 0, 0], samples, rtol=1.0e-14)
+        self.assertIn("ignored XStep=", loaded.history)
+        self.assertIn("explicit XVals with summary step", loaded.history)
+
+    def test_pio_explicit_nonuniform_descending_axes_keep_sample_alignment(self):
+        # Both axes descend with nonuniform spacing and contradict every summary.
+        # A distinct complex value identifies each physical coordinate pair.
+        samples = np.asarray([
+            [1 + 11j, 2 + 12j, 3 + 13j],
+            [4 + 14j, 5 + 15j, 6 + 16j],
+            [7 + 17j, 8 + 18j, 9 + 19j],
+        ])
+        flattened = samples.ravel(order="F")
+        payload = np.empty(flattened.size * 2, dtype="<f8")
+        payload[0::2] = flattened.real
+        payload[1::2] = flattened.imag
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "measured-descending.pio")
+            self._write_pio_fixture(
+                path, xsize="3", ysize="3", xvals="2:0.5:0", yvals="12:9:8",
+                xstart="0", xstop="100", xstep="0.100271",
+                ystart="0", ystop="0", ystep="1",
+                precision="Double", payload=payload.tobytes(),
+            )
+            loaded = RcsGrid.load_pio(path)
+        np.testing.assert_array_equal(loaded.azimuths, [0.0, 0.5, 2.0])
+        np.testing.assert_array_equal(loaded.frequencies, [8.0, 9.0, 12.0])
+        np.testing.assert_allclose(loaded.rcs[:, 0, :, 0], samples[::-1, ::-1], rtol=1.0e-14)
+        for field in ("XStart", "XStop", "XStep", "YStart", "YStop", "YStep"):
+            self.assertIn(f"ignored {field}=", loaded.history)
+
+    def test_pio_explicit_axis_does_not_require_numeric_redundant_summaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "stale-summaries.pio")
+            self._write_pio_fixture(
+                path, xstart="unused", xstop="nan", xstep="",
+                ystart="inf", ystop="N/A", ystep="-inf",
+            )
+            loaded = RcsGrid.load_pio(path)
+        np.testing.assert_array_equal(loaded.azimuths, [0.0])
+        np.testing.assert_array_equal(loaded.frequencies, [1.0])
+        np.testing.assert_allclose(loaded.rcs.ravel(), [1.0 + 2.0j], rtol=3.0e-7)
+
+    def test_pio_malformed_explicit_values_never_fall_back_to_summaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for xvals, message in (
+                ("0", "contains 1 values; expected 2"),
+                ("0:bad", "non-numeric axis value"),
+                ("0:inf", "nonfinite axis value"),
+                ("1:1", "strictly monotonic"),
             ):
-                RcsGrid.load_pio(path)
+                with self.subTest(xvals=xvals):
+                    path = os.path.join(directory, "malformed-explicit.pio")
+                    self._write_pio_fixture(
+                        path, xsize="2", xvals=xvals,
+                        xstart="0", xstop="1", xstep="1",
+                        payload=np.asarray([1, 0, 2, 0], dtype="<f4").tobytes(),
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        RcsGrid.load_pio(path)
+
+    def test_pio_summary_only_axes_still_require_valid_reconstruction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "summary-only.pio")
+            self._write_pio_fixture(
+                path, xsize="2", xvals=None, xstart="0", xstop="1", xstep="1",
+                payload=np.asarray([1, 0, 2, 0], dtype="<f4").tobytes(),
+            )
+            loaded = RcsGrid.load_pio(path)
+            np.testing.assert_array_equal(loaded.azimuths, [0.0, 1.0])
+            for updates, message in (
+                ({"xstart": "bad", "xstop": "1", "xstep": "1"}, "must be numeric"),
+                ({"xstart": "0", "xstop": "1", "xstep": "nan"}, "must be finite"),
+                ({"xstart": "0", "xstop": "2", "xstep": "1"}, "inconsistent with 2 samples"),
+            ):
+                with self.subTest(updates=updates):
+                    self._write_pio_fixture(
+                        path, xsize="2", xvals=None,
+                        payload=np.asarray([1, 0, 2, 0], dtype="<f4").tobytes(),
+                        **updates,
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        RcsGrid.load_pio(path)
 
     def test_pio_accepts_rounded_axis_summaries_when_xvals_are_explicit(self):
         with tempfile.TemporaryDirectory() as directory:

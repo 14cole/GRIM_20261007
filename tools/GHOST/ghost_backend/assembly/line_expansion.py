@@ -646,6 +646,8 @@ def expand_perimeter(segments: 'np.ndarray',
                     (== PSI_HH_DEG, since phi-pol/HH is driven by TM). Applied
                     to the COEFFICIENT so cross-pol is consistent too.
     ``psi_te_deg``  same for the 2D TE coefficient (== PSI_VV_DEG).
+    ``grazing_taper_deg`` raised-cosine transition above the surface; zero
+                    disables the taper while retaining front illumination.
 
     Pass 0/0 when comparing against an independent reference to determine
     whether any phase mapping is required. Do not treat the configured defaults as
@@ -781,8 +783,17 @@ def expand_perimeter(segments: 'np.ndarray',
          "F_vh": np.zeros(len(dirs), dtype=complex)}
     pref = 1.0 / (4.0 * math.pi)
     taper = float(grazing_taper_deg)
-    if not math.isfinite(taper) or taper <= 0.0:
-        raise ValueError("grazing_taper_deg must be positive and finite.")
+    if not math.isfinite(taper) or taper < 0.0:
+        raise ValueError("grazing_taper_deg must be nonnegative and finite.")
+
+    def illumination_weight(normal_projection, lit):
+        if taper == 0.0:
+            return lit.astype(float)
+        fraction = np.clip(
+            np.degrees(np.arcsin(np.clip(normal_projection, -1.0, 1.0))) / taper,
+            0.0, 1.0,
+        )
+        return np.where(lit, 0.5 - 0.5 * np.cos(math.pi * fraction), 0.0)
 
     if _look_batch_size is None:
         automatic_batch_size = min(
@@ -830,8 +841,7 @@ def expand_perimeter(segments: 'np.ndarray',
         a_tm = a_tm * cal_tm
         a_te = a_te * cal_te
 
-        w_lit = np.clip(np.degrees(np.arcsin(np.clip(d_n, -1.0, 1.0))) / taper, 0.0, 1.0)
-        w_lit = np.where(lit, 0.5 - 0.5 * np.cos(math.pi * w_lit), 0.0)
+        w_lit = illumination_weight(d_n, lit)
 
         if packed_shadow is not None:
             w_lit = w_lit * packed_shadow.column(i).astype(float)
@@ -916,14 +926,7 @@ def expand_perimeter(segments: 'np.ndarray',
         a_tm *= cal_tm
         a_te *= cal_te
 
-        w_lit = np.clip(
-            np.degrees(np.arcsin(np.clip(d_n, -1.0, 1.0))) / taper,
-            0.0,
-            1.0,
-        )
-        w_lit = np.where(
-            lit, 0.5 - 0.5 * np.cos(math.pi * w_lit), 0.0
-        )
+        w_lit = illumination_weight(d_n, lit)
         if packed_shadow is not None:
             visible = np.empty(lit.shape, dtype=bool)
             for local_index, direction_index in enumerate(

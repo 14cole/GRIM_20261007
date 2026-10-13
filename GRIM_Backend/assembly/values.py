@@ -3,6 +3,44 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import math
+from typing import Any, Mapping
+
+
+LINE_RESPONSE_DEFAULTS = {
+    "psi_tm_deg": 166.9,
+    "psi_te_deg": -9.2,
+    "grazing_taper_deg": 10.0,
+}
+
+
+def normalize_response_settings(value: Any, kind: str) -> dict[str, dict[str, Any]]:
+    """Validate user-entered settings without constraining the source convention."""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{kind.capitalize()} response settings must be an object.")
+    result = {}
+    for dataset_id, settings in value.items():
+        if not isinstance(dataset_id, str) or not dataset_id.strip() or not isinstance(settings, Mapping):
+            raise ValueError(f"{kind.capitalize()} response settings require a dataset ID and settings object.")
+        if kind == "point":
+            one_sided = settings.get("one_sided", True)
+            if not isinstance(one_sided, bool):
+                raise ValueError(f"Point response {dataset_id}: one_sided must be true or false.")
+            result[dataset_id] = {"one_sided": one_sided}
+        else:
+            normalized = {}
+            for key, default in LINE_RESPONSE_DEFAULTS.items():
+                try:
+                    number = float(settings.get(key, default))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Line response {dataset_id}: {key} must be a finite number.") from exc
+                if not math.isfinite(number):
+                    raise ValueError(f"Line response {dataset_id}: {key} must be a finite number.")
+                if key == "grazing_taper_deg" and number < 0:
+                    raise ValueError(f"Line response {dataset_id}: grazing taper must be nonnegative.")
+                normalized[key] = number
+            result[dataset_id] = normalized
+    return result
 
 
 @dataclass
@@ -33,6 +71,8 @@ class FeatureAssemblyValues:
     base_dir: str | None = None
     point_datasets: dict[str, str] = field(default_factory=dict)
     line_datasets: dict[str, str] = field(default_factory=dict)
+    point_response_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    line_response_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Spatial feature-definition state. These stable CSV IDs are independent
     # from both preview visibility and whole-response dataset arithmetic.
     excluded_point_placement_ids: set[str] = field(default_factory=set)

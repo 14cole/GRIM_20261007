@@ -137,6 +137,47 @@ def project_points(points, plane: str, ax, length_unit: str) -> np.ndarray:
     return xy
 
 
+def transform_points(points, *, angle_deg=0.0, offset=(0.0, 0.0),
+                     pivot=(0.0, 0.0), mirror_x=False, mirror_y=False) -> np.ndarray:
+    """Mirror, then rotate about a pivot, then translate in stored coordinates.
+
+    X/Y mirroring negates that coordinate relative to the pivot. Positive
+    angles rotate toward +Y from +X. NaN separator rows are retained verbatim.
+    Callers must convert displayed lengths to meters before calling this.
+    """
+    points = np.asarray(points, dtype=float)
+    offset, pivot = np.asarray(offset, dtype=float), np.asarray(pivot, dtype=float)
+    if (points.ndim != 2 or points.shape[1] != 2
+            or offset.shape != (2,) or pivot.shape != (2,)):
+        raise ValueError("Use XY points, an XY pivot, and an XY translation.")
+    valid = np.all(np.isfinite(points), axis=1)
+    if not np.all(valid | np.all(np.isnan(points), axis=1)):
+        raise ValueError("Overlay coordinates must be finite; blank rows may separate paths.")
+    if not np.all(np.isfinite([angle_deg, *offset, *pivot])):
+        raise ValueError("Rotation, translation, and pivot must be finite numbers.")
+    result = points.copy()
+    angle = float(angle_deg) % 360.0
+    with np.errstate(over="ignore", invalid="ignore"):
+        xy = points[valid].copy()
+        if angle:
+            xy -= pivot
+            xy *= [-1.0 if mirror_x else 1.0, -1.0 if mirror_y else 1.0]
+            radians = np.deg2rad(angle)
+            c, s = np.cos(radians), np.sin(radians)
+            xy = xy @ np.array([[c, s], [-s, c]])
+            xy += pivot
+        else:
+            for column, mirror in enumerate((mirror_x, mirror_y)):
+                if mirror:
+                    xy[:, column] = pivot[column] - (xy[:, column] - pivot[column])
+        if np.any(offset):
+            xy += offset
+    if not np.all(np.isfinite(xy)):
+        raise ValueError("The transformed coordinates are too large. Reduce the values.")
+    result[valid] = xy
+    return result
+
+
 @dataclass(eq=False)
 class OverlayPath:
     name: str

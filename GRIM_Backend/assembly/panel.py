@@ -127,6 +127,7 @@ from GRIM_Backend.assembly.model import (
 )
 from GRIM_Backend.assembly.vehicle_builder import VehicleBuilderMixin
 from GRIM_Backend.assembly.vehicle_ui import VehicleAssemblyUiMixin
+from GRIM_Backend.assembly.values import LINE_RESPONSE_DEFAULTS, normalize_response_settings
 
 
 _GUI_IMPORT_ERROR: Exception | None = None
@@ -518,24 +519,102 @@ if GUI_AVAILABLE:
 
     from GRIM_Backend.assembly.workflow import MappingWorkflowMixin, AssemblyWorkflowMixin
 
+    class _ResponseModelDialog(QDialog):
+        """Edit the physical assumptions applied to one supplied response."""
+
+        def __init__(self, kind: str, dataset_id: str, settings: Mapping[str, Any], parent=None):
+            super().__init__(parent)
+            self.kind = kind
+            self.setWindowTitle(f"Response model · {dataset_id}")
+            self.resize(460, 310 if kind == "line" else 220)
+            layout = QVBoxLayout(self)
+            form = QFormLayout()
+            layout.addLayout(form)
+            self.fields = {}
+            if kind == "point":
+                self.sidedness = QComboBox(self)
+                self.sidedness.addItem("Front only (flush aperture)", True)
+                self.sidedness.addItem("Full supplied pattern", False)
+                self.sidedness.setCurrentIndex(0 if settings.get("one_sided", True) else 1)
+                form.addRow("Pattern coverage:", self.sidedness)
+                help_text = (
+                    "Front only discards directions behind the feature's outward normal. "
+                    "Full supplied pattern uses backside data when available; it does not "
+                    "invent missing angular coverage. Body shadowing is a separate setting "
+                    "and can still block either pattern."
+                )
+            else:
+                self.preset = QComboBox(self)
+                self.preset.setMinimumHeight(26)
+                self.preset.addItems(["Legacy solver correction", "No phase correction", "Custom"])
+                form.addRow("Phase preset:", self.preset)
+                for key, label in (("psi_tm_deg", "TM phase (deg):"), ("psi_te_deg", "TE phase (deg):"), ("grazing_taper_deg", "Grazing taper (deg; 0 = off):")):
+                    field = QLineEdit(str(settings.get(key, LINE_RESPONSE_DEFAULTS[key])), self)
+                    field.setMinimumHeight(26)
+                    self.fields[key] = field
+                    form.addRow(label, field)
+                    if key != "grazing_taper_deg":
+                        field.textEdited.connect(lambda _text: self.preset.setCurrentIndex(2))
+                phase = tuple(float(self.fields[key].text()) for key in ("psi_tm_deg", "psi_te_deg"))
+                self.preset.setCurrentIndex(0 if phase == (166.9, -9.2) else 1 if phase == (0, 0) else 2)
+                self.preset.currentIndexChanged.connect(self._apply_preset)
+                help_text = (
+                    "Phase offsets rotate each supplied TM/TE field before coherent summation. "
+                    "Use no correction when the response already shares the body's phase convention. "
+                    "The taper adds attenuation near grazing; set 0 to keep the supplied angular response."
+                )
+            help_label = QLabel(help_text, self)
+            help_label.setWordWrap(True)
+            layout.addWidget(help_label)
+            self.error_label = QLabel(self)
+            self.error_label.setWordWrap(True)
+            layout.addWidget(self.error_label)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+            buttons.accepted.connect(self._accept_settings)
+            buttons.rejected.connect(self.reject)
+            layout.addWidget(buttons)
+
+        def _apply_preset(self, index):
+            if index in (0, 1):
+                for key in ("psi_tm_deg", "psi_te_deg"):
+                    self.fields[key].setText(str(LINE_RESPONSE_DEFAULTS[key] if index == 0 else 0.0))
+
+        def settings(self):
+            raw = ({"one_sided": bool(self.sidedness.currentData())} if self.kind == "point"
+                   else {key: field.text() for key, field in self.fields.items()})
+            return normalize_response_settings({"response": raw}, self.kind)["response"]
+
+        def _accept_settings(self):
+            try:
+                self.settings()
+            except ValueError as exc:
+                self.error_label.setText(str(exc))
+                return
+            self.accept()
+
     class _DatasetMappingEditor(MappingWorkflowMixin, QWidget):
         mapping_changed = Signal()
+        response_settings_changed = Signal()
         catalog_notice = Signal(str)
 
-        def __init__(self, empty_text: str, parent: QWidget | None = None) -> None:
+        def __init__(self, empty_text: str, parent: QWidget | None = None, *, kind: str = "point") -> None:
             super().__init__(parent)
+            self.kind = kind
+            self._response_settings = {}
+            self._model_buttons = {}
             self._empty_text = empty_text
             self._ids: tuple[str, ...] = ()
             self._required_ids: tuple[str, ...] = ()
             self._catalog: tuple[LoadedDatasetEntry, ...] = ()
             self._loaded_buttons: dict[str, _LoadedDatasetButton] = {}
-            self.table = QTableWidget(0, 4, self)
+            self.table = QTableWidget(0, 5, self)
             self.table.setHorizontalHeaderLabels(
                 [
                     "Dataset ID",
                     "Response (.grim)",
                     "",
                     "",
+                    "Model",
                 ]
             )
             self.table.horizontalHeaderItem(0).setToolTip("dataset_id from the placement CSV")
@@ -554,6 +633,7 @@ if GUI_AVAILABLE:
             header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
             header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
             header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
             self.empty_label = QLabel(empty_text, self)
             self.empty_label.setWordWrap(True)
             self.completeness_label = QLabel(self)
@@ -591,6 +671,36 @@ if GUI_AVAILABLE:
                 result[dataset_id] = "" if item is None else item.text().strip()
             return result
 
+        def response_settings(self) -> dict[str, dict[str, Any]]:
+            return {key: dict(value) for key, value in self._response_settings.items() if key in self._ids}
+
+        def set_response_settings(self, dataset_id: str, settings: Mapping[str, Any]) -> None:
+            if dataset_id not in self._ids:
+                raise KeyError(f"Unknown dataset_id {dataset_id!r}.")
+            self._response_settings[dataset_id] = normalize_response_settings({dataset_id: settings}, self.kind)[dataset_id]
+            self._update_model_button(dataset_id)
+            self.response_settings_changed.emit()
+
+        def _update_model_button(self, dataset_id: str) -> None:
+            settings = self._response_settings.get(dataset_id, {})
+            if self.kind == "point":
+                summary = "Front only" if settings.get("one_sided", True) else "Full pattern"
+                tooltip = "Feature pattern coverage, independent of body shadowing."
+            else:
+                values = {**LINE_RESPONSE_DEFAULTS, **settings}
+                phase = (values["psi_tm_deg"], values["psi_te_deg"])
+                summary = "Legacy" if phase == (166.9, -9.2) else "No phase offset" if phase == (0, 0) else "Custom phase"
+                taper = values["grazing_taper_deg"]
+                summary += " / taper off" if taper == 0 else f" / {taper:g}°"
+                tooltip = f"TM {phase[0]:g}°, TE {phase[1]:g}°. Grazing taper {taper:g}° (0 = off)."
+            self._model_buttons[dataset_id].setText(summary + "…")
+            self._model_buttons[dataset_id].setToolTip(tooltip)
+
+        def _edit_response_settings(self, dataset_id: str) -> None:
+            dialog = _ResponseModelDialog(self.kind, dataset_id, self._response_settings.get(dataset_id, {}), self)
+            if dialog.exec() == QDialog.Accepted:
+                self.set_response_settings(dataset_id, dialog.settings())
+
         def missing_ids(self) -> tuple[str, ...]:
             current = self.mapping()
             return tuple(
@@ -624,11 +734,16 @@ if GUI_AVAILABLE:
             self,
             dataset_ids: tuple[str, ...] | list[str],
             mapping: Mapping[str, str] | None = None,
+            response_settings: Mapping[str, Mapping[str, Any]] | None = None,
         ) -> None:
             existing = self.mapping() if self._ids else {}
             if mapping is not None:
                 existing.update({str(key): _clean_path(value) for key, value in mapping.items()})
             self._ids = tuple(str(value) for value in dataset_ids)
+            if response_settings is not None:
+                self._response_settings = normalize_response_settings(response_settings, self.kind)
+            self._response_settings = {key: value for key, value in self._response_settings.items() if key in self._ids}
+            self._model_buttons = {}
             self._required_ids = self._ids
             self._loaded_buttons = {}
             self.table.blockSignals(True)
@@ -655,6 +770,11 @@ if GUI_AVAILABLE:
                     lambda _checked=False, key=dataset_id: self._browse(key)
                 )
                 self.table.setCellWidget(row, 3, button)
+                model_button = QPushButton(self.table)
+                model_button.clicked.connect(lambda _checked=False, key=dataset_id: self._edit_response_settings(key))
+                self._model_buttons[dataset_id] = model_button
+                self.table.setCellWidget(row, 4, model_button)
+                self._update_model_button(dataset_id)
             self.table.blockSignals(False)
             has_rows = bool(self._ids)
             self.suggest_folder_button.setEnabled(has_rows)
@@ -1518,6 +1638,7 @@ if GUI_AVAILABLE:
             self.line_mapping = _DatasetMappingEditor(
                 "Choose a line CSV; one response row will appear per dataset_id.",
                 line_page,
+                kind="line",
             )
             line_layout.addWidget(self.line_mapping)
             line_layout.addStretch(1)
@@ -2158,6 +2279,8 @@ if GUI_AVAILABLE:
             )
             self.point_mapping.mapping_changed.connect(self._mapping_changed)
             self.line_mapping.mapping_changed.connect(self._mapping_changed)
+            self.point_mapping.response_settings_changed.connect(self._response_settings_changed)
+            self.line_mapping.response_settings_changed.connect(self._response_settings_changed)
             self.spatial_feature_tree.selection_changed.connect(
                 self._spatial_selection_changed
             )
@@ -2533,10 +2656,12 @@ if GUI_AVAILABLE:
                 self.point_mapping.set_dataset_ids(
                     tuple(values.point_datasets),
                     values.point_datasets,
+                    values.point_response_settings,
                 )
                 self.line_mapping.set_dataset_ids(
                     tuple(values.line_datasets),
                     values.line_datasets,
+                    values.line_response_settings,
                 )
                 self.spatial_feature_filter.clear()
                 self.recipe_name_edit.setText(loaded.name)
@@ -3673,6 +3798,11 @@ if GUI_AVAILABLE:
             self.model.clear_feature_selection(kind)
             self._placement_csv_changed(kind)
 
+        def _response_settings_changed(self) -> None:
+            self.model.values.point_response_settings = self.point_mapping.response_settings()
+            self.model.values.line_response_settings = self.line_mapping.response_settings()
+            self._mark_preview_stale()
+
         def _mapping_changed(self) -> None:
             self.model.values.point_datasets = self.point_mapping.mapping()
             self.model.values.line_datasets = self.line_mapping.mapping()
@@ -3937,6 +4067,8 @@ if GUI_AVAILABLE:
             values.line_locations_csv = self.line_csv_picker.path()
             values.point_datasets = self.point_mapping.mapping()
             values.line_datasets = self.line_mapping.mapping()
+            values.point_response_settings = self.point_mapping.response_settings()
+            values.line_response_settings = self.line_mapping.response_settings()
             values.skin_tol_m = self.skin_tol.value() * UNIT_SCALE_M["inches"]
             values.skin_phase_tol_deg = self.phase_tol.value()
             values.normal_tol_deg = self.normal_tol.value()
@@ -3993,10 +4125,12 @@ if GUI_AVAILABLE:
             self.point_mapping.set_dataset_ids(
                 self.model.point_dataset_ids,
                 self.model.values.point_datasets,
+                self.model.values.point_response_settings,
             )
             self.line_mapping.set_dataset_ids(
                 self.model.line_dataset_ids,
                 self.model.values.line_datasets,
+                self.model.values.line_response_settings,
             )
             self._refresh_spatial_feature_tree()
 
