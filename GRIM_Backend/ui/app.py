@@ -124,7 +124,9 @@ PLOT_OPS_SPECS = {
             ("Overlays", "overlays"),
         ),
         (
-            ("Engineering Analysis…", "engineering_analysis"),
+            ("Measure", "measure"),
+            ("Phase Analysis", "phase_analysis"),
+            ("Polarization", "polarization"),
             ("Images A/B…", "image_compare"),
         ),
     ),
@@ -145,7 +147,9 @@ PLOT_OPS_SPECS = {
             ("Auto Scale", "auto_scale"),
         ),
         (
-            ("Engineering Analysis…", "engineering_analysis"),
+            ("Measure", "measure"),
+            ("Phase Analysis", "phase_analysis"),
+            ("Polarization", "polarization"),
             ("Images A/B…", "image_compare"),
         ),
     ),
@@ -156,11 +160,12 @@ PLOT_OPS_SPECS = {
 PLOTTING_CONTROL_GROUPS = (
     ("Plots", (
         ("azimuth_rect", "azimuth_polar", "frequency", "elevation_sweep", "waterfall", "cdf"),
-        ("compare", "delta_map", "sector_stats", "range_freq", "pbp", "image_compare"),
+        ("compare", "delta_map", "sector_stats", "range_freq", "pbp", "phase"),
+        ("phase_analysis", "polarization", "image_compare"),
     )),
     ("Plot Manipulation", (
-        ("fit_x", "fit_y", "fit_both", "zoom_box", "pan", "auto_plot", "phase"),
-        ("markers", "slider", "overlays", "engineering_analysis"),
+        ("fit_x", "fit_y", "fit_both", "zoom_box", "pan"),
+        ("markers", "slider", "overlays", "measure"),
     )),
 )
 
@@ -928,10 +933,11 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.lbl_az.doubleClicked.connect(lambda: self.list_az.selectAll())
 
         for tab_key, controls in self._plot_controls_by_tab.items():
-            if "engineering_analysis" in controls:
-                controls["engineering_analysis"].clicked.connect(
-                    lambda _checked=False: self._show_engineering_tool()
-                )
+            for role, analysis in (("measure", "measure"), ("phase_analysis", "phase"), ("polarization", "polarization")):
+                if role in controls:
+                    controls[role].clicked.connect(
+                        lambda _checked=False, key=analysis: self._show_engineering_tool(key)
+                    )
             if "image_compare" in controls:
                 controls["image_compare"].clicked.connect(self._show_image_comparison)
             if "azimuth_rect" in controls:
@@ -1332,9 +1338,17 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         finally:
             dialog.deleteLater()
 
-    def _show_engineering_tool(self, tab=None) -> None:
-        from GRIM_Backend.ui.engineering_analysis import show_engineering_analysis
-        show_engineering_analysis(self, tab=tab)
+    def _show_engineering_tool(self, tab=None):
+        from GRIM_Backend.ui.inline_engineering_analysis import InlineEngineeringAnalysis
+        panel = self.inline_analysis
+        if panel is None:
+            panel = InlineEngineeringAnalysis(self)
+            layout = self.plot_canvas.parentWidget().layout()
+            layout.insertWidget(layout.indexOf(self.plot_canvas), panel)
+            self.inline_analysis = panel
+            self._plot_contexts[self._active_plot_tab].inline_analysis = panel
+        panel.open_tool(tab or "measure")
+        return panel
 
     def _show_image_comparison(self, _checked=False) -> None:
         from GRIM_Backend.ui.image_comparison import open_image_comparison
@@ -1921,12 +1935,14 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 "frequency": "Frequency response by elevation/polarization. Choose individual angular cuts, linear-power mean, median, percentile, or maximum in Plot Settings.",
                 "elevation_sweep": "Elevation response by frequency/polarization. Choose individual angular cuts or an explicit aggregation in Plot Settings; coverage is reported.",
                 "waterfall": "Waterfall view over any pair of azimuth, elevation, and frequency, with linked horizontal and vertical cuts. Choose axes in Plot Settings.",
-                "engineering_analysis": "Open Measurements, Phase, and Polarization analysis in one window. Find numerical features, investigate phase differences, and compare polarization channels.",
+                "measure": "Measure an existing trace on this canvas: peaks, minimum, crossings, bandwidth, and region statistics.",
+                "phase_analysis": "Plot magnitude/phase, I/Q, phase residual, or phase-slope diagnostics on this canvas.",
+                "polarization": "Plot channel strengths, co-/cross-channel ratios, reciprocity, and channel phase differences on this canvas.",
                 "image_compare": "Compare captured images with locked coordinates and scales, linked cursors, blink/swipe, signed differences, and region statistics.",
                 "sector_stats": (
                     "Mean, median, max, min, or a percentile of linear power inside "
                     "each azimuth sector, drawn over the sector. Right-click this "
-                    "button to edit sectors and percentiles. Right-click the plot "
+                    "button to edit sectors and percentiles, or save/load sector CSV files. Right-click the plot "
                     "to copy the results table."
                 ),
                 "range_freq": (
@@ -1987,7 +2003,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             common_layout.setContentsMargins(8, 0, 0, 0)
             common_layout.setSpacing(4)
             common_layout.addWidget(chk_plot_legend)
-            for role in ("auto_scale", "hold", "clear"):
+            for role in ("auto_plot", "auto_scale", "hold", "clear"):
                 common_layout.addWidget(plot_controls[role])
             groups.setCornerWidget(common_controls, Qt.TopRightCorner)
             for title, rows in PLOTTING_CONTROL_GROUPS:
@@ -2129,6 +2145,8 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         previous = self._plot_contexts.get(self._active_plot_tab)
         if previous is not None:
             if tab_key != self._active_plot_tab:
+                if previous.inline_analysis is not None:
+                    previous.inline_analysis.stop_region_selection()
                 previous.spatial_overlays.stop_interaction()
             for field in PlotContext.__dataclass_fields__:
                 if hasattr(self, field):
@@ -2163,7 +2181,9 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_slider = controls.get("slider")
         self.btn_cdf = controls.get("cdf")
         self.btn_sector_stats = controls.get("sector_stats")
-        self.btn_engineering_analysis = controls.get("engineering_analysis")
+        self.btn_measure = controls.get("measure")
+        self.btn_phase_analysis = controls.get("phase_analysis")
+        self.btn_polarization = controls.get("polarization")
         self.btn_image_compare = controls.get("image_compare")
 
         context = self._plot_contexts[tab_key]
@@ -2172,6 +2192,11 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             sync_frequency_controls(context, getattr(self, "active_dataset", None))
         for field in PlotContext.__dataclass_fields__:
             setattr(self, field, getattr(context, field))
+
+        if self.inline_analysis is not None:
+            resume = getattr(self.inline_analysis, "resume_interaction", None)
+            if callable(resume):
+                resume()
 
         # Keep the shared Dataset Operations panel + this tab's toggle in sync.
         self._dataset_ops_panel.setVisible(self._dataset_ops_visible)
@@ -2184,6 +2209,8 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         tab_key = self._tab_key_for_index.get(index)
         if tab_key is None:
             active = self._plot_contexts.get(self._active_plot_tab)
+            if active is not None and active.inline_analysis is not None:
+                active.inline_analysis.stop_region_selection()
             if active is not None and active.settings_frame.isVisible():
                 active.settings_frame.close()
             if self.main_tabs.widget(index) is self.ppt_workspace:

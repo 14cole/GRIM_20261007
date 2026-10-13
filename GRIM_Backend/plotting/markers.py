@@ -290,6 +290,9 @@ class PlotMarkersMixin:
     # --- mouse and keyboard ----------------------------------------------
 
     def _on_markers_toggled(self, checked: bool) -> None:
+        panel = getattr(self, "inline_analysis", None)
+        if checked and panel is not None:
+            panel.stop_region_selection()
         if checked and getattr(self, "spatial_overlays", None) is not None:
             self.spatial_overlays.stop_interaction()
         self._marker_drag = None

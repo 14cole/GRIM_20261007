@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import math
 
 import numpy as np
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -54,6 +56,22 @@ class SectorStatisticsDialog(QDialog):
         mode_row = QFormLayout()
         mode_row.addRow("Sector layout", self.combo_mode)
         layout.addLayout(mode_row)
+
+        file_row = QHBoxLayout()
+        self.btn_load = QPushButton("Load sectors…")
+        self.btn_save = QPushButton("Save sectors…")
+        self.btn_load.setToolTip(
+            "Load CSV start,stop columns in degrees into the custom table. Apply or OK uses the loaded sectors."
+        )
+        self.btn_save.setToolTip(
+            "Save the current sector bounds as CSV start,stop columns in degrees, without applying changes."
+        )
+        file_row.addWidget(self.btn_load)
+        file_row.addWidget(self.btn_save)
+        file_row.addStretch()
+        file_row.addWidget(QLabel("CSV angles use degrees."))
+        layout.addLayout(file_row)
+        self._csv_path = "sectors.csv"
 
         self.btn_uniform_setup = QPushButton("Fill from uniform sectors…")
         self.btn_uniform_setup.setCheckable(True)
@@ -147,6 +165,8 @@ class SectorStatisticsDialog(QDialog):
         self.btn_add.clicked.connect(self._add_row)
         self.btn_remove.clicked.connect(self._remove_rows)
         self.btn_fill.clicked.connect(self._fill_table)
+        self.btn_load.clicked.connect(self._load_csv)
+        self.btn_save.clicked.connect(self._save_csv)
         self.button_box.button(QDialogButtonBox.Apply).clicked.connect(self.apply_settings)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
@@ -287,6 +307,91 @@ class SectorStatisticsDialog(QDialog):
         for sector in sectors:
             self._append_row(_number_text(sector.start), _number_text(sector.start + sector.width))
         self.combo_mode.setCurrentIndex(self.combo_mode.findData("custom"))
+        self._clear_error()
+
+    @classmethod
+    def _read_csv(cls, path):
+        rows = []
+        first_row = True
+        with open(path, encoding="utf-8-sig", newline="") as source:
+            reader = csv.reader(source, strict=True)
+            for fields in reader:
+                fields = [field.strip() for field in fields]
+                if not any(fields):
+                    continue
+                if first_row and [field.lower() for field in fields] == ["start", "stop"]:
+                    first_row = False
+                    continue
+                first_row = False
+                line = reader.line_num
+                if len(fields) != 2:
+                    raise ValueError(f"CSV line {line}: expected two columns, start and stop.")
+                start = cls._finite_number(fields[0], f"CSV line {line} start")
+                stop = cls._finite_number(fields[1], f"CSV line {line} stop")
+                if start == stop:
+                    raise ValueError(f"CSV line {line}: start and stop must differ.")
+                rows.append((start, stop))
+        if not rows:
+            raise ValueError("The CSV contains no sectors. Add start and stop values in degrees.")
+        return rows
+
+    @staticmethod
+    def _convert_bounds(rows, from_unit, to_unit):
+        with np.errstate(over="ignore", invalid="ignore"):
+            values = common.convert_axis_values(rows, "azimuth", from_unit, to_unit)
+        if not np.isfinite(values).all():
+            raise ValueError(f"Sector bounds must remain finite when converted to {to_unit}.")
+        return values
+
+    def _load_csv(self):
+        self._finish_editing()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load sectors (degrees)", self._csv_path, "CSV files (*.csv);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            rows = self._convert_bounds(self._read_csv(path), "deg", self.unit)
+        except (OSError, UnicodeError, csv.Error, ValueError, OverflowError) as exc:
+            self._show_error(f"Could not load sectors: {exc}")
+            return
+        # Replace the draft only after the whole file has been validated.
+        self.table.setRowCount(0)
+        for start, stop in rows:
+            self._append_row(_number_text(start), _number_text(stop))
+        self.combo_mode.setCurrentIndex(self.combo_mode.findData("custom"))
+        self.btn_uniform_setup.setChecked(False)
+        self._csv_path = path
+        self._clear_error()
+
+    def _save_csv(self):
+        self._finish_editing()
+        try:
+            if self.combo_mode.currentData() == "custom":
+                rows = [tuple(map(float, bounds.split(":"))) for bounds in self._custom_text().split(",")]
+            else:
+                sectors = common.parse_sectors(self._uniform_text(), self.azimuths, period=self.period)
+                rows = [(sector.start, sector.start + sector.width) for sector in sectors]
+                if not rows:
+                    raise ValueError("Add at least one sector.")
+            rows = self._convert_bounds(rows, self.unit, "deg")
+        except (ValueError, OverflowError) as exc:
+            self._show_error(str(exc))
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save sectors (degrees)", self._csv_path, "CSV files (*.csv);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as destination:
+                writer = csv.writer(destination)
+                writer.writerow(("start", "stop"))
+                writer.writerows((_number_text(start), _number_text(stop)) for start, stop in rows)
+        except (OSError, UnicodeError, csv.Error) as exc:
+            self._show_error(f"Could not save sectors: {exc}")
+            return
+        self._csv_path = path
         self._clear_error()
 
     def apply_settings(self) -> bool:

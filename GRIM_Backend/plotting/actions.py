@@ -271,6 +271,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self._render_plot_mode(self.last_plot_mode)
 
     def _render_plot_mode(self, mode: str | None) -> None:
+        if mode in ("engineering_phase", "engineering_polarization", "engineering_measure"):
+            panel = getattr(self, "inline_analysis", None)
+            if panel is not None:
+                panel.render_plot_mode(mode.removeprefix("engineering_"))
+            return
         renderer = {
             "azimuth_rect": self._plot_azimuth_rect,
             "azimuth_polar": self._plot_azimuth_polar,
@@ -816,6 +821,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self._style_plot_axes()
 
     def _clear_plot(self) -> None:
+        panel = getattr(self, "inline_analysis", None)
+        if panel is not None:
+            panel.deactivate()
+        self.plot_figure._grim_independent_y = False
+        self.plot_figure._grim_engineering_signature = None
         self._release_native_plot_samples()
         overlays = getattr(self, "spatial_overlays", None)
         if overlays is not None:
@@ -1020,6 +1030,14 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     # --- renderer preflight, unit conversion, and display bounding ----------
 
     def _start_plot_render(self) -> None:
+        panel = getattr(self, "inline_analysis", None)
+        if panel is not None and not panel._rendering:
+            panel.deactivate()
+        if not str(self.last_plot_mode).startswith("engineering_"):
+            self.plot_figure._grim_independent_y = False
+            self.plot_figure._grim_engineering_signature = None
+        else:
+            self._set_compare_sector_controls_visible(False)
         image_controls = getattr(self, "image_analysis_controls", None)
         if image_controls is not None and self.last_plot_mode != "waterfall":
             bar = getattr(image_controls, "cut_bar", None)
@@ -1088,6 +1106,10 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _dispose_native_plot_snapshots(self):
         """Release both tabs' temporary resources after an accepted close."""
+        for context in getattr(self, "_plot_contexts", {}).values():
+            panel = getattr(context, "inline_analysis", None)
+            if panel is not None:
+                panel.deactivate()
         figures = {context.plot_figure for context in getattr(self, "_plot_contexts", {}).values()}
         figures.add(self.plot_figure)
         self._clear_plot_markers(redraw=False)
@@ -1431,6 +1453,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     ) -> None:
         if ax is None:
             return
+        if getattr(self.plot_figure, "_grim_independent_y", False):
+            self.plot_figure._grim_limit_axes = ax
 
         if sync_x:
             if ax.name == "polar":
@@ -1497,6 +1521,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             btn.blockSignals(False)
 
     def _on_zoom_box_toggled(self, checked: bool) -> None:
+        panel = getattr(self, "inline_analysis", None)
+        if checked and panel is not None:
+            panel.stop_region_selection()
         if checked and getattr(self, "spatial_overlays", None) is not None:
             self.spatial_overlays.stop_interaction()
         if not checked:
@@ -1512,6 +1539,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self.status.showMessage("Box zoom enabled. Drag left mouse on the plot to zoom.")
 
     def _on_pan_toggled(self, checked: bool) -> None:
+        panel = getattr(self, "inline_analysis", None)
+        if checked and panel is not None:
+            panel.stop_region_selection()
         if checked and getattr(self, "spatial_overlays", None) is not None:
             self.spatial_overlays.stop_interaction()
         if not checked:
@@ -1816,6 +1846,10 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                             (self.spin_plot_ymin, ymin), (self.spin_plot_ymax, ymax)):
             plot_common.set_spin_value(spin, value)
         axes = self.plot_axes or [self.plot_ax]
+        independent_y = getattr(self.plot_figure, "_grim_independent_y", False)
+        y_axis = getattr(self.plot_figure, "_grim_limit_axes", self.plot_ax)
+        if y_axis not in axes:
+            y_axis = self.plot_ax
         for ax in axes:
             ax.set_autoscale_on(False)
             if ax.name == "polar":
@@ -1854,6 +1888,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                             "increase the X tick step."
                         )
                     ax.set_xticks(ticks)
+            if independent_y and ax is not y_axis:
+                continue
             ax.set_ylim(ymin, ymax)
             if ystep > 0.0:
                 ticks = plot_common.bounded_ticks(ymin, ymax, ystep)
@@ -2285,6 +2321,17 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self._apply_plot_limits()
 
     def _fit_y(self) -> None:
+        if getattr(self.plot_figure, "_grim_independent_y", False):
+            for ax in self.plot_axes or [self.plot_ax]:
+                ax.set_autoscaley_on(True)
+                ax.relim()
+                ax.autoscale_view(scalex=False, scaley=True)
+                ax.set_autoscaley_on(False)
+            self.spin_plot_ystep.blockSignals(True)
+            self.spin_plot_ystep.setValue(0.0)
+            self.spin_plot_ystep.blockSignals(False)
+            self._sync_plot_limit_spins_from_axes(self.plot_ax, sync_x=False, sync_y=True)
+            return
         if self.plot_ax.name == "polar":
             ymin, ymax = self._fit_polar_y_range()
             self.spin_plot_ymin.blockSignals(True)

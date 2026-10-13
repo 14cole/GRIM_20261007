@@ -87,3 +87,4 @@ class PlotContext:
     image_analysis_controls: Any = None
     plot_slider: Any = None
     spatial_overlays: Any = None
+    inline_analysis: Any = None

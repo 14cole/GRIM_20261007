@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -28,6 +31,8 @@ class SectorStatisticsDialogTests(unittest.TestCase):
         self.changes = []
         self.controls.changed.connect(self.changes.append)
         self.dialogs = []
+        self.files = tempfile.TemporaryDirectory()
+        self.addCleanup(self.files.cleanup)
 
     def tearDown(self):
         for dialog in self.dialogs:
@@ -52,6 +57,22 @@ class SectorStatisticsDialogTests(unittest.TestCase):
     def state(self):
         return (self.controls.sector_text(), self.controls.sector_statistic(),
                 self.controls.sector_percentile())
+
+    def csv_file(self, text=None):
+        path = Path(self.files.name) / "sectors.csv"
+        if text is not None:
+            path.write_text(text, encoding="utf-8")
+        return path
+
+    def load_csv(self, dialog, path):
+        with mock.patch("GRIM_Backend.ui.sector_statistics_dialog.QFileDialog.getOpenFileName",
+                        return_value=(str(path), "CSV files (*.csv)")):
+            dialog.btn_load.click()
+
+    def save_csv(self, dialog, path):
+        with mock.patch("GRIM_Backend.ui.sector_statistics_dialog.QFileDialog.getSaveFileName",
+                        return_value=(str(path), "CSV files (*.csv)")):
+            dialog.btn_save.click()
 
     def test_custom_nonuniform_wrapped_sectors_and_percentile_apply_together(self):
         dialog = self.dialog()
@@ -206,6 +227,143 @@ class SectorStatisticsDialogTests(unittest.TestCase):
         self.assertEqual(len(sectors), 1)
         self.assertAlmostEqual(sectors[0].width, 2 * np.pi)
         self.assertTrue(sectors[0].contains(radians).all())
+
+    def test_csv_round_trip_preserves_wrapped_overlapping_and_gapped_rows_without_applying(self):
+        dialog = self.dialog()
+        rows = [(170, -170), (-45.25, 45.5), (-20, 10), (90, 125), (10, 370)]
+        self.set_rows(dialog, rows)
+        path = self.csv_file()
+        self.save_csv(dialog, path)
+        self.assertEqual(path.read_text(),
+                         "start,stop\n170,-170\n-45.25,45.5\n-20,10\n90,125\n10,370\n")
+        self.assertEqual(self.state(), ("30", "mean", 90.0))
+        self.assertEqual(self.changes, [])
+
+        reopened = self.dialog(azimuths=[])
+        self.load_csv(reopened, path)
+        self.assertEqual(reopened.combo_mode.currentData(), "custom")
+        np.testing.assert_allclose(np.asarray(reopened._rows(), dtype=float), rows)
+        self.assertEqual(self.state(), ("30", "mean", 90.0))
+        self.assertEqual(self.changes, [])
+        self.assertTrue(reopened.apply_settings())
+        self.assertEqual(self.changes, ["sector"])
+        self.assertTrue(reopened.apply_settings())
+        self.assertEqual(self.changes, ["sector"])
+
+    def test_csv_degrees_convert_to_and_from_radian_dialog(self):
+        rows = [(170, -170), (-30, 60), (10, 370)]
+        path = self.csv_file("start,stop\n170,-170\n-30,60\n10,370\n")
+        dialog = self.dialog(unit="rad", azimuths=np.deg2rad(self.azimuths))
+        self.load_csv(dialog, path)
+        np.testing.assert_allclose(np.asarray(dialog._rows(), dtype=float), np.deg2rad(rows))
+        self.save_csv(dialog, path)
+        np.testing.assert_allclose(dialog._read_csv(path), rows)
+        self.assertEqual(self.changes, [])
+        self.assertTrue(dialog.apply_settings())
+        sectors = parse_sectors(self.controls.sector_text("deg"), self.azimuths)
+        np.testing.assert_allclose([sector.width for sector in sectors], [20, 90, 360])
+
+    def test_csv_load_accepts_headerless_or_bom_header_and_blank_lines(self):
+        for content in ("\n170,-170\n\n0,45\n", "\ufeff\n START , Stop \n170,-170\n , \n0,45\n"):
+            with self.subTest(content=content):
+                dialog = self.dialog()
+                self.load_csv(dialog, self.csv_file(content))
+                self.assertEqual(dialog._rows(), (("170", "-170"), ("0", "45")))
+                self.assertFalse(dialog.error_label.text())
+                self.assertEqual(self.changes, [])
+
+    def test_csv_invalid_file_keeps_draft_rows_and_settings(self):
+        invalid_files = ("", "start,stop\n", "0,10\n10\n", "0,10\n20,30,40\n",
+                         "0,10\nwrong,30\n", "0,10\nnan,30\n", "0,10\n20,inf\n",
+                         "0,10\n20,20\n", '0,10\n"20,30\n', "start,end\n0,30\n")
+        for content in invalid_files:
+            with self.subTest(content=content):
+                dialog = self.dialog()
+                self.set_rows(dialog, [(170, -170), (40, 90)])
+                dialog.combo_statistic.setCurrentIndex(dialog.combo_statistic.findData("max"))
+                before = (dialog._rows(), dialog._sector_signature(), self.state())
+                self.load_csv(dialog, self.csv_file(content))
+                self.assertEqual((dialog._rows(), dialog._sector_signature(), self.state()), before)
+                self.assertEqual(dialog.combo_statistic.currentData(), "max")
+                self.assertIn("Could not load sectors", dialog.error_label.text())
+                self.assertEqual(self.changes, [])
+
+    def test_csv_cancel_keeps_draft_and_does_not_apply(self):
+        dialog = self.dialog()
+        self.set_rows(dialog, [(170, -170)])
+        before = (dialog._rows(), self.state())
+        self.load_csv(dialog, "")
+        self.save_csv(dialog, "")
+        self.assertEqual((dialog._rows(), self.state()), before)
+        self.assertEqual(self.changes, [])
+        self.assertFalse(dialog.error_label.text())
+
+    def test_csv_io_errors_keep_draft_and_show_inline_error(self):
+        dialog = self.dialog()
+        self.set_rows(dialog, [(170, -170)])
+        before = (dialog._rows(), self.state())
+        self.load_csv(dialog, self.csv_file())
+        self.assertIn("Could not load sectors", dialog.error_label.text())
+        self.save_csv(dialog, Path(self.files.name))
+        self.assertIn("Could not save sectors", dialog.error_label.text())
+        self.assertEqual((dialog._rows(), self.state()), before)
+        self.assertEqual(self.changes, [])
+
+    def test_csv_save_expands_selected_and_explicit_uniform_bounds(self):
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                dialog = self.dialog()
+                dialog.edit_width.setText("100")
+                dialog.check_selected_range.setChecked(not explicit)
+                dialog.edit_start.setText("-40")
+                dialog.edit_stop.setText("190")
+                signature = dialog._sector_signature()
+                path = self.csv_file()
+                self.save_csv(dialog, path)
+                expected = [(-40, 60), (60, 160), (160, 190)] if explicit else [
+                    (-180, -80), (-80, 20), (20, 120), (120, 180)]
+                np.testing.assert_allclose(dialog._read_csv(path), expected)
+                self.assertEqual(dialog._sector_signature(), signature)
+                self.assertEqual(self.changes, [])
+
+    def test_csv_save_invalid_draft_does_not_overwrite_existing_file(self):
+        dialog = self.dialog()
+        path = self.csv_file("start,stop\n0,45\n")
+        self.set_rows(dialog, [(0, 10), (10, "bad")])
+        self.save_csv(dialog, path)
+        self.assertEqual(path.read_text(), "start,stop\n0,45\n")
+        self.assertIn("Row 2 stop", dialog.error_label.text())
+        self.assertEqual(self.changes, [])
+
+    def test_csv_save_and_cancelled_load_finish_active_cell_without_applying(self):
+        dialog = self.dialog()
+        self.set_rows(dialog, [(0, 30)])
+        dialog.show()
+        dialog.activateWindow()
+        self.app.processEvents()
+        for column, text in ((0, "-20"), (1, "55")):
+            dialog.table.setCurrentCell(0, column)
+            dialog.table.editItem(dialog.table.item(0, column))
+            self.app.processEvents()
+            editor = self.app.focusWidget()
+            self.assertIsInstance(editor, QLineEdit)
+            editor.setText(text)
+            if column == 0:
+                path = self.csv_file()
+                self.save_csv(dialog, path)
+                self.assertEqual(dialog._read_csv(path), [(-20, 30)])
+            else:
+                self.load_csv(dialog, "")
+            self.assertEqual(dialog.table.item(0, column).text(), text)
+        self.assertEqual(self.state(), ("30", "mean", 90.0))
+        self.assertEqual(self.changes, [])
+
+    def test_reject_after_csv_load_does_not_apply(self):
+        dialog = self.dialog()
+        self.load_csv(dialog, self.csv_file("0,45\n"))
+        dialog.reject()
+        self.assertEqual(self.state(), ("30", "mean", 90.0))
+        self.assertEqual(self.changes, [])
 
 
 if __name__ == "__main__":

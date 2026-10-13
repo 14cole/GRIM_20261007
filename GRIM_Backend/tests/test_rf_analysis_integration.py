@@ -36,13 +36,16 @@ class RfAnalysisIntegrationTests(unittest.TestCase):
         return grid
 
     def test_analysis_actions_launch_from_both_tabs(self):
-        with mock.patch("GRIM_Backend.ui.engineering_analysis.show_engineering_analysis") as launch, \
+        with mock.patch.object(self.window, "_show_engineering_tool") as launch, \
                 mock.patch("GRIM_Backend.ui.image_comparison.open_image_comparison") as images:
             for key in ("plotting", "isar"):
                 self.window._activate_plot_tab(key)
                 controls = self.window._plot_controls_by_tab[key]
-                controls["engineering_analysis"].click()
-                launch.assert_called_with(self.window, tab=None)
+                self.assertNotIn("engineering_analysis", controls)
+                for role, tool in (("measure", "measure"), ("phase_analysis", "phase"),
+                                   ("polarization", "polarization")):
+                    controls[role].click()
+                    launch.assert_called_with(tool)
                 controls["image_compare"].click()
                 images.assert_called_with(self.window)
         self.assertEqual(self.window._plot_controls_by_tab["plotting"]["waterfall"].text(), "Waterfall")
