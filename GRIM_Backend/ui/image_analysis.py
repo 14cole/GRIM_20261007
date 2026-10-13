@@ -8,6 +8,7 @@ from matplotlib.ticker import MaxNLocator
 
 from GRIM_Backend.plotting.image_analysis import AXES, cuts
 from GRIM_Backend.plotting.modes.common import decimate_line
+from GRIM_Backend.plotting.image_grid import line_with_gaps
 
 
 class SampleCoordinateSpinBox(QDoubleSpinBox):
@@ -203,23 +204,31 @@ class LinkedImageCuts:
         self.on_selected = self.on_disconnect = None
         self.position = None
         self.artists = []
+        units_by_axes = {}
+        for _image, cut_axes, record in panels:
+            for ax in cut_axes:
+                if ax is not None:
+                    units_by_axes.setdefault(ax, set()).add(record.value_unit)
         for index,(image_ax, (horizontal, vertical), record) in enumerate(panels,1):
             hline = vline = hcursor = vcursor = None
             if horizontal is not None:
-                hline, = horizontal.plot([], [], linewidth=1,label=str(index))
+                label = f"{index} ({record.value_unit})" if len(units_by_axes[horizontal]) > 1 else str(index)
+                hline, = horizontal.plot([], [], linewidth=1,label=label)
                 hcursor = image_ax.axhline(record.y[len(record.y)//2], color="white", linewidth=.7)
-                horizontal.set_ylabel(record.value_unit, fontsize=8)
+                unit = " / ".join(sorted(units_by_axes[horizontal]))
+                horizontal.set_ylabel(unit, fontsize=8)
                 horizontal.yaxis.set_major_locator(MaxNLocator(3))
             if vertical is not None:
-                vline, = vertical.plot([], [], linewidth=1,label=str(index))
+                label = f"{index} ({record.value_unit})" if len(units_by_axes[vertical]) > 1 else str(index)
+                vline, = vertical.plot([], [], linewidth=1,label=label)
                 vcursor = image_ax.axvline(record.x[len(record.x)//2], color="white", linewidth=.7)
-                vertical.set_xlabel(record.value_unit, fontsize=8)
+                unit = " / ".join(sorted(units_by_axes[vertical]))
+                vertical.set_xlabel(unit, fontsize=8)
                 vertical.yaxis.set_major_locator(MaxNLocator(3))
                 vertical.xaxis.set_major_locator(MaxNLocator(3))
             self.artists.append((hline, vline, hcursor, vcursor))
         if len(panels)>1:
-            legend_ax = next((ax for ax in panels[0][1] if ax is not None), None)
-            if legend_ax is not None:
+            for legend_ax in (ax for ax in panels[0][1] if ax is not None):
                 legend = legend_ax.legend(ncol=min(4,len(panels)),fontsize=7,loc="upper right")
                 for text in legend.get_texts():
                     text.set_color(legend_ax.xaxis.label.get_color())
@@ -274,11 +283,11 @@ class LinkedImageCuts:
             selected_y.append(py)
             hline, vline, hcursor, vcursor = artists
             if hline is not None:
-                hx,hy,_ = decimate_line(xs,row)
+                hx,hy,_ = decimate_line(*line_with_gaps(xs,row,breaks=record.metadata.get("x_cut_breaks")))
                 hline.set_data(hx, hy)
                 hcursor.set_ydata([py,py])
             if vline is not None:
-                vy,vx,_ = decimate_line(ys,column)
+                vy,vx,_ = decimate_line(*line_with_gaps(ys,column,breaks=record.metadata.get("y_cut_breaks")))
                 vline.set_data(vx, vy)
                 vcursor.set_xdata([px,px])
         horizontal, vertical = self.panels[0][1]

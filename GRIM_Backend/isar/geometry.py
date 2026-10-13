@@ -39,10 +39,11 @@ def angular_bands(indices, degrees, *, gap_factor=2.5):
 
 
 def angular_sublooks(indices, degrees, *, maximum_span=10.0, overlap=0.0):
-    """Partition in physical angle, with bounded optional overlap and no loss.
+    """Cover each sector with evenly positioned, bounded physical-angle looks.
 
-    A final singleton may share the previous sample. An isolated sample that
-    cannot form a look inside the angular bound is an explicit error.
+    Distribute leftover angular support across overlapping full-width looks,
+    rather than making a narrow final look with a much broader point response.
+    Requested overlap is a minimum; endpoints remain covered without padding.
     """
     if not np.isfinite(maximum_span) or maximum_span <= 0:
         raise ValueError("Sublook width must be finite and positive")
@@ -52,27 +53,53 @@ def angular_sublooks(indices, degrees, *, maximum_span=10.0, overlap=0.0):
     looks = []
     for sector in angular_bands(indices, angles):
         values = angles[sector]
-        start = 0
-        while start < len(sector):
+        span = float(values[-1] - values[0])
+        travel = max(0.0, span - maximum_span)
+        count = min(len(sector), 1 + int(np.ceil(
+            max(0.0, travel - 1e-10) / (maximum_span * (1.0 - overlap)))))
+        starts = np.linspace(values[0], values[0] + travel, count)
+        covered = np.zeros(len(sector), dtype=bool)
+        sector_looks = []
+        for angle in starts:
+            start = int(np.searchsorted(values, angle - 1e-10, side="left"))
+            stop = int(np.searchsorted(values, angle + maximum_span + 1e-10, side="right"))
+            if stop - start >= 2:
+                chunk = sector[start:stop]
+                if not sector_looks or chunk != sector_looks[-1]:
+                    sector_looks.append(chunk)
+                covered[start:stop] = True
+        # Sparse/nonuniform sectors can place a lone sample between window
+        # endpoints. Include its widest available bounded look without losing
+        # data or rejecting a selection that the previous partition accepted.
+        for index in np.flatnonzero(~covered):
+            if covered[index]:
+                continue
+            start = int(np.searchsorted(values, values[index] - maximum_span - 1e-10))
             stop = int(np.searchsorted(values, values[start] + maximum_span + 1e-10, side="right"))
             if stop - start < 2:
-                if start > 0 and values[start] - values[start - 1] <= maximum_span + 1e-10:
-                    looks.append(sector[start - 1:stop])
-                    start = stop
-                    continue
                 raise ValueError(
-                    f"Azimuth {values[start]:g}° has no second sample within the "
+                    f"Azimuth {values[index]:g}° has no second sample within the "
                     f"{maximum_span:g}° sublook bound; select a denser angular sector"
                 )
-            looks.append(sector[start:stop])
-            if stop == len(sector):
-                break
-            if overlap:
-                next_angle = values[start] + maximum_span * (1.0 - overlap)
-                start = max(start + 1, min(stop, int(np.searchsorted(values, next_angle))))
-            else:
-                start = stop
+            sector_looks.append(sector[start:stop])
+            covered[start:stop] = True
+        looks.extend(sorted(sector_looks, key=lambda chunk: angles[chunk[0]]))
     return looks
+
+
+def image_axis_labels(band, unit_name, elevation_degrees=0.0, *, explicit_frame=False):
+    """Label this panel's frame independently of other selected apertures."""
+    if band.get("composite"):
+        return f"Cross-Range at 0° ({unit_name})", f"Down-Range at 0° ({unit_name})"
+    frame = ""
+    if explicit_frame:
+        center = band.get("image_contract", {}).get("look_center_degrees")
+        if center is None:
+            center = float(np.mean(band["az_values"]))
+        frame = f" at {float(center):g}°"
+    if abs(float(elevation_degrees)) > 1.0e-9:
+        return f"Horizontal Cross-Range{frame} ({unit_name})", f"Horizontal Range{frame} ({unit_name})"
+    return f"Cross-Range{frame} ({unit_name})", f"Range{frame} ({unit_name})"
 
 
 def axis_edges(axis):

@@ -1558,7 +1558,7 @@ def _has_sheet(infos: 'List[PanelCoupledInfo]') -> 'bool':
     """True if any element is a TYPE 1 free-floating resistive/reactive sheet.
 
     Sheets carry their impedance via q_plus_gamma = 1/Z_s, and correctly
-    modelling them requires a formulation that uses that term.  The
+    modeling them requires a formulation that uses that term.  The
     dielectric-indirect and multi-region-indirect solvers do not -- and
     neither does the current coupled trace formulation, which also has
     pre-existing sign/normalization issues in the sheet case that produce
@@ -2165,7 +2165,7 @@ def solve_monostatic_rcs_2d_single_polarization(
 
     def check_abort() -> 'None':
         if abort_event is not None and abort_event.is_set():
-            raise InterruptedError("Solve cancelled by user.")
+            raise InterruptedError("Solve canceled by user.")
 
     check_abort()
     emit_progress("Initializing solver")
@@ -3361,7 +3361,7 @@ def solve_bistatic_rcs_2d_single_polarization(
 
     def check_abort() -> 'None':
         if abort_event is not None and abort_event.is_set():
-            raise InterruptedError("Solve cancelled by user.")
+            raise InterruptedError("Solve canceled by user.")
 
     def emit_progress(msg: 'str') -> 'None':
         if progress_callback is not None:

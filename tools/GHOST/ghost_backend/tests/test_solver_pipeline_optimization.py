@@ -157,7 +157,7 @@ class ForecastReuseTests(unittest.TestCase):
                 selection.select_backend(dict(self.arguments(), abort_event=event), options)
             with self.assertRaises(InterruptedError):
                 selection.select_backend(self.arguments(), options,
-                    checkpoint=mock.Mock(side_effect=InterruptedError('cancelled')))
+                    checkpoint=mock.Mock(side_effect=InterruptedError('canceled')))
 
     def test_setup_forecasts_frequency_units_reused_by_execution_requests(self):
         from ghost_backend.runs.setup import RunSetupMixin, two_d_request

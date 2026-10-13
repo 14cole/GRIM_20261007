@@ -59,8 +59,8 @@ def test_corrupt_retention_discards_partial_restoration_and_removes_file(tmp_pat
 
 def test_cancelled_retention_does_not_destroy_source_operator(tmp_path):
     a,operator,_=fixture()
-    with mock.patch.object(operator,'checkpoint',side_effect=RuntimeError('cancelled')):
-        with pytest.raises(RuntimeError,match='cancelled'):
+    with mock.patch.object(operator,'checkpoint',side_effect=RuntimeError('canceled')):
+        with pytest.raises(RuntimeError,match='canceled'):
             RetainedOperatorSpool(operator,tmp_path)
     np.testing.assert_allclose(operator.matmul(np.eye(len(a))),a,atol=2e-13,rtol=2e-13)
     assert not list(tmp_path.iterdir())
@@ -69,7 +69,7 @@ def test_cancelled_retention_does_not_destroy_source_operator(tmp_path):
 def test_projection_cancellation_closes_destination_spool(tmp_path):
     _,operator,p=fixture()
     with execution_scope(validate_options(dict(assembly_threads=4,blas_threads=1))), \
-            mock.patch.object(operator,'project_sparse',side_effect=RuntimeError('cancelled')):
-        with pytest.raises(RuntimeError,match='cancelled'):
+            mock.patch.object(operator,'project_sparse',side_effect=RuntimeError('canceled')):
+        with pytest.raises(RuntimeError,match='canceled'):
             project_operator(operator,p,np.arange(160)[:,None],2**27,tile=64,spool_directory=tmp_path)
     assert not list(tmp_path.iterdir())

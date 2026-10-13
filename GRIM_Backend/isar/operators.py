@@ -43,7 +43,7 @@ class PolarPointOperator:
             stop = min(start + rows, self.shape[0])
             for first in range(0, self.shape[1], columns):
                 if self.cancel_check is not None and self.cancel_check():
-                    raise InterruptedError("Native polar operation cancelled")
+                    raise InterruptedError("Native polar operation canceled")
                 last = min(first + columns, self.shape[1])
                 phase = self.kx[start:stop, None] * self.points[None, first:last, 0]
                 phase += self.ky[start:stop, None] * self.points[None, first:last, 1]

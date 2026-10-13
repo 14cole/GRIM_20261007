@@ -170,7 +170,7 @@ def seam_coefficients_from_2d(featured_snapshot: 'Dict',
 
     Both snapshots MUST share a mesh everywhere except at the feature (same
     primitive endpoints outside the disturbed region) or the difference is
-    dominated by discretisation noise rather than by the joint.
+    dominated by discretization noise rather than by the joint.
     """
     from ghost_backend.twod.solver import solve_monostatic_rcs_2d_certified
 
@@ -301,7 +301,7 @@ def perimeter_surface_deviation(segments: 'np.ndarray',
                                 samples_per_segment: 'int' = 33) -> 'float':
     """Max sampled distance from a perimeter chord to the revolved surface.
 
-    A polygonised outline of a curved door cuts chords inside the skin; this
+    A polygonized outline of a curved door cuts chords inside the skin; this
     is the preflight number to compare against lambda/50 before trusting the
     placement phase.  Sampling only endpoints misses the chord sag entirely,
     because those endpoints are normally the points deliberately placed on the
@@ -814,7 +814,7 @@ def expand_perimeter(segments: 'np.ndarray',
     scalar_looks = enumerate(dirs) if use_scalar_looks else ()
     for i, d in scalar_looks:
         if cancel_check is not None and cancel_check():
-            raise InterruptedError("Feature assembly cancelled.")
+            raise InterruptedError("Feature assembly canceled.")
         d_n = n_hat @ d
         d_b = b_hat @ d
         d_path = path_t_hat @ d
@@ -886,7 +886,7 @@ def expand_perimeter(segments: 'np.ndarray',
 
 
         if cancel_check is not None and cancel_check():
-            raise InterruptedError("Feature assembly cancelled.")
+            raise InterruptedError("Feature assembly canceled.")
 
         batch_dirs = dirs[batch_start:batch_stop]
         d_n = n_hat @ batch_dirs.T
@@ -903,7 +903,7 @@ def expand_perimeter(segments: 'np.ndarray',
                     and cancel_check is not None
                     and cancel_check()
                 ):
-                    raise InterruptedError("Feature assembly cancelled.")
+                    raise InterruptedError("Feature assembly canceled.")
                 if progress_callback is not None:
                     progress_callback(direction_index + 1, total_directions)
             continue
@@ -978,7 +978,7 @@ def expand_perimeter(segments: 'np.ndarray',
                 and cancel_check is not None
                 and cancel_check()
             ):
-                raise InterruptedError("Feature assembly cancelled.")
+                raise InterruptedError("Feature assembly canceled.")
             for key in F:
                 F[key][direction_index] = batch_values[key][local_index]
             if progress_callback is not None:

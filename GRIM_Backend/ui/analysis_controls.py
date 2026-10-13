@@ -117,7 +117,7 @@ class PlotAnalysisControls(QObject):
         self._pbp_band_changed(emit=False)
 
     def add_rows(self, grid, row: int) -> int:
-        """Add labelled rows to the Plot Settings grid; returns the next row."""
+        """Add labeled rows to the Plot Settings grid; returns the next row."""
         rows = (
             (("Sweep statistic", self.combo_sweep_aggregation), ("Sweep percentile", self.spin_sweep_percentile)),
             (("PbP Band", self.combo_pbp_band), ("Lower", self.spin_pbp_low),

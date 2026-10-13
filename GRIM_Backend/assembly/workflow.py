@@ -12,10 +12,10 @@ def suggest_response_mapping(dataset_ids, folder, existing=None, *, cancel_check
     scanned = 0
     for root, _dirs, files in os.walk(folder, followlinks=False):
         if cancel_check():
-            raise InterruptedError("Library search cancelled.")
+            raise InterruptedError("Library search canceled.")
         for filename in files:
             if cancel_check():
-                raise InterruptedError("Library search cancelled.")
+                raise InterruptedError("Library search canceled.")
             path = Path(root) / filename
             scanned += 1
             if progress_callback is not None and scanned % 128 == 0:

@@ -6,7 +6,7 @@ import numpy as np
 
 EPS = 1e-12
 
-# The peak-normalised complex-field change is the primary convergence metric:
+# The peak-normalized complex-field change is the primary convergence metric:
 # it is defined everywhere, including at physical nulls.  dB and phase changes
 # are pointwise-relative quantities that are undefined at a null, where a
 # converged pattern still moves by several dB and many degrees for a complex

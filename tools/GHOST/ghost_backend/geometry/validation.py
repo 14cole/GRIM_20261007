@@ -234,7 +234,7 @@ class GeometryAudit:
                 message = (
                     f"Rows {row_labels}: material-side mismatch at "
                     f"({first[4]:.6g}, {first[5]:.6g}); the same junction sector "
-                    f"is labelled {medium_name(first[2])} and "
+                    f"is labeled {medium_name(first[2])} and "
                     f"{medium_name(second[3])}. Check TYPE, pos_mat/neg_mat, "
                     "and segment direction, or add the missing interface."
                 )

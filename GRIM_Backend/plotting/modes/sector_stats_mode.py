@@ -57,7 +57,7 @@ def render(self) -> None:
         return
     if self._button_checked(self.btn_phase):
         self.status.showMessage(
-            "Sector statistics summarise magnitude levels. Turn off Phase to plot them."
+            "Sector statistics summarize magnitude levels. Turn off Phase to plot them."
         )
         return
 

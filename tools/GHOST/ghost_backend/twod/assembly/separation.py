@@ -3,7 +3,7 @@ import numpy as np
 
 # A separated pair takes the fixed 16-point tensor rule unless one of these
 # holds, in which case the adaptive rule (1e-9 target) integrates it:
-#   centre distance < ADAPTIVE_CENTRE * scale, or
+#   center distance < ADAPTIVE_CENTRE * scale, or
 #   segment distance < ADAPTIVE_GAP * scale, or
 #   an endpoint of one panel projects strictly inside the other panel at a
 #   distance below ADAPTIVE_PROJECTION * scale.
@@ -68,7 +68,7 @@ def requires_adaptive(obs, src):
     if distance < ADAPTIVE_CENTRE*scale:
         return True
     # The triangle inequality excludes distant pairs without projections: an
-    # endpoint within d of the other panel keeps the centres within
+    # endpoint within d of the other panel keeps the centers within
     # (L_obs+L_src)/2 + d.
     if distance >= .5*(obs.length+src.length)+ADAPTIVE_PROJECTION*scale:
         return False
@@ -103,7 +103,7 @@ def adaptive_pairs(p0, p1, q0, q1, center_distance, scale, lengths_p, lengths_q)
 
 
 def close_pairs(p0, p1, q0, q1, center_distance, scale):
-    """Tile mask of pairs needing the adaptive rule beyond the centre test.
+    """Tile mask of pairs needing the adaptive rule beyond the center test.
 
     ``p0``/``p1`` hold the rows' segments and ``q0``/``q1`` the columns'.
     """

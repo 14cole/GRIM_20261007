@@ -67,7 +67,7 @@ _POINT_SCATTER_LOOK_BATCH = 32768
 def _check_cancel(cancel_check: 'Optional[Callable[[], bool]]') -> None:
     """Raise the one cooperative-cancellation exception used by Assembly."""
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Feature assembly cancelled; existing output kept.")
+        raise InterruptedError("Feature assembly canceled; existing output kept.")
 
 
 def _report_progress(
@@ -345,7 +345,7 @@ def _load_grim_sample(path, frequency, azimuth, elevation, cancel_check=lambda: 
 
     def check_cancelled():
         if cancel_check():
-            raise InterruptedError("Inspection cancelled.")
+            raise InterruptedError("Inspection canceled.")
 
     check_cancelled()
     with np.load(path, allow_pickle=False) as data:
@@ -2291,7 +2291,7 @@ def corner_amplitude(fold, n_wing, n_body, face_width: 'float',
         eps = asin(n_wing . n_body) and delta = |eps| is the deviation from
         square.  Two reflections rotate a ray by 2 alpha, so the double bounce
         leaves the corner deflected 2 delta off the incidence reversal instead of
-        retroreflecting; the lobe centre is therefore rotated by 2 eps about the
+        retroreflecting; the lobe center is therefore rotated by 2 eps about the
         fold axis.  BOTH bounce senses exist (body->wing and wing->body deflect
         oppositely, +2 eps and -2 eps about n_wing x n_body), so the lobe is a
         symmetric PAIR and the perpendicular-plane response is the cos^2
@@ -2323,7 +2323,7 @@ def corner_amplitude(fold, n_wing, n_body, face_width: 'float',
     ``n_body``     outward body face normal at the root (3,).
     ``face_width`` effective face width a (m): how far the double bounce reaches
                    up the wing / along the body -- e.g. min(wing height, body
-                   extent).  The single biggest modelling knob.
+                   extent).  The single biggest modeling knob.
     Returns {"F_vv","F_hh","F_vh"} complex over directions (sigma = 4pi|F|^2).
     """
     fold = np.asarray(fold, dtype=float)
@@ -2747,7 +2747,7 @@ def point_scatterer_amplitude(pattern, location, aperture_normal, directions,
                          360-degree azimuth period (a unique-look grid such as
                          0..359 is closed internally), and support every
                          requested lit elevation.
-    ``location``         r_c (3,), the cavity phase centre on the body (place it
+    ``location``         r_c (3,), the cavity phase center on the body (place it
                          where the external solver put ITS phase origin).
     ``aperture_normal``  cavity aperture outward normal (3,) in the body frame.
     ``roll_ref``         optional (3,) fixing the cavity-frame azimuth zero
@@ -2757,7 +2757,7 @@ def point_scatterer_amplitude(pattern, location, aperture_normal, directions,
 
     Returns {"F_vv","F_hh","F_vh"}.  Contributes only where the aperture faces
     the radar (d.normal > 0).  The remaining approximation is single-bounce:
-    body<->cavity mutual coupling is not modelled.
+    body<->cavity mutual coupling is not modeled.
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -3026,7 +3026,7 @@ def _bor_amp_interp(bor_result: 'Dict[str, Any]', key: 'str',
     q_shape = q_raw.shape
     q = np.atleast_1d(q_raw).ravel()
     # th is sorted and strictly increasing above, so the nearest stored node is
-    # one of the two searchsorted neighbours; the scan this replaces cost one
+    # one of the two searchsorted neighbors; the scan this replaces cost one
     # full pass over the aspect axis for every requested look.
     upper = np.searchsorted(th, q)
     right = np.clip(upper, 0, len(th) - 1)
@@ -3052,7 +3052,7 @@ def _pick_body(bor_result, freq_ghz):
     """Resolve the BoR body for one frequency.  ``bor_result`` may be a single
     result (reused at every frequency) or a dict {freq_ghz: result} for a proper
     multi-frequency vehicle signature (the body IS frequency-dependent).  A
-    single result is itself a dict, so it is recognised by its solver keys."""
+    single result is itself a dict, so it is recognized by its solver keys."""
     if bor_result is None:
         return None
     if isinstance(bor_result, dict) and "theta_deg" not in bor_result \

@@ -13,7 +13,7 @@ from ghost_backend.twod.samples import sample_column
 
 
 class ResultRows(Sequence):
-    """Channel-labelled view over original rows; no retained row dictionaries."""
+    """Channel-labeled view over original rows; no retained row dictionaries."""
     def __init__(self, result):
         self.blocks, self.ends = [], []
         channels = result.get('co_solved_samples')

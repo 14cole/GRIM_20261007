@@ -242,6 +242,59 @@ def native_axis_selection(reference, dataset, axis: str, requested):
     return indices if indices.size else None
 
 
+
+def selection_breaks(reference, dataset, axis, indices, requested):
+    """Positions where selected runs must not be joined by a rendered line."""
+    attribute = {"azimuth": "azimuths", "elevation": "elevations", "frequency": "frequencies"}[axis]
+    native = np.asarray(getattr(dataset, attribute), dtype=float)
+    indices = np.asarray(indices, dtype=int)
+    if indices.size < 2:
+        return np.empty(0, dtype=int)
+    ranks = np.empty(native.size, dtype=int)
+    ranks[np.argsort(native, kind="stable")] = np.arange(native.size)
+    breaks = list(np.flatnonzero(np.diff(ranks[indices]) != 1) + 1)
+    reference_values = np.sort(np.asarray(getattr(reference, attribute), dtype=float))
+    selected = unique_axis_selection(reference_values, requested,
+                                     axis_matching_tolerance(reference, axis))
+    if selected is not None and len(selected) > 1:
+        selected = np.sort(selected)
+        ends = np.flatnonzero(np.diff(selected) > 1)
+        boundaries = (reference_values[selected[ends]] + reference_values[selected[ends + 1]]) / 2.
+        display = values_for_display(reference, dataset, axis, native[indices])
+        breaks.extend(np.searchsorted(display, boundaries).tolist())
+    return np.asarray(sorted({int(i) for i in breaks if 0 < i < indices.size}), dtype=int)
+
+
+def insert_plot_breaks(breaks, *arrays):
+    """Insert separators without removing the measured endpoints of any run."""
+    breaks = np.asarray(breaks, dtype=int)
+    if not breaks.size:
+        return tuple(np.asarray(values) for values in arrays)
+    return tuple(np.insert(np.asarray(values, dtype=float), breaks, np.nan) for values in arrays)
+
+
+def singleton_line_markers(x, y):
+    """Show isolated measured samples that have no neighboring line segment."""
+    valid = np.isfinite(x) & np.isfinite(y)
+    isolated = valid & ~np.r_[False, valid[:-1]] & ~np.r_[valid[1:], False]
+    indices = np.flatnonzero(isolated).tolist()
+    return {"marker": ".", "markersize": 5., "markevery": indices} if indices else {}
+
+
+def continuous_phase_envelope(lower, upper):
+    """Choose a common circular branch along each finite band segment."""
+    lower, upper = np.asarray(lower, dtype=float).copy(), np.asarray(upper, dtype=float).copy()
+    valid = np.isfinite(lower) & np.isfinite(upper)
+    changes = np.diff(np.r_[False, valid, False].astype(int))
+    for start, stop in zip(np.flatnonzero(changes == 1), np.flatnonzero(changes == -1)):
+        center = (lower[start:stop] + upper[start:stop]) / 2.
+        continuous = np.rad2deg(np.unwrap(np.deg2rad(center)))
+        shift = np.rint((continuous - center) / 360.) * 360.
+        lower[start:stop] += shift
+        upper[start:stop] += shift
+    return lower, upper
+
+
 def finite_axis_limits(low, high):
     """Return explicit nonsingular limits; preserve intentional inversion."""
     low, high = float(low), float(high)
@@ -550,6 +603,7 @@ class StreamingEnvelope:
     """
 
     phase_degrees: bool = False
+    include_negative_infinity: bool = False
     percentiles: tuple[float, float] | None = None
     lower: np.ndarray | None = None
     upper: np.ndarray | None = None
@@ -571,6 +625,8 @@ class StreamingEnvelope:
     def update(self, values) -> None:
         values = np.asarray(values, dtype=float)
         finite = np.isfinite(values)
+        if self.include_negative_infinity and not self.phase_degrees:
+            finite |= np.isneginf(values)
         if self.lower is None:
             self.lower = np.full(values.shape, np.nan, dtype=float)
             self.upper = np.full(values.shape, np.nan, dtype=float)
@@ -614,7 +670,25 @@ class StreamingEnvelope:
                     with warnings.catch_warnings():
                         # All-missing columns stay NaN.
                         warnings.simplefilter("ignore", category=RuntimeWarning)
-                        low, high = np.nanpercentile(block, self.percentiles, axis=0)
+                        if self.include_negative_infinity and np.any(np.isneginf(block)):
+                            # Extended-real interpolation: an interior quantile
+                            # between zero (−inf dB) and a finite return is −inf;
+                            # an exact finite rank remains finite. Missing is NaN.
+                            block.sort(axis=0)
+                            count = self.count.flat[start:stop]
+                            positions = np.asarray(self.percentiles)[:, None] / 100. * np.maximum(count - 1, 0)
+                            lo = np.floor(positions).astype(int)
+                            hi = np.ceil(positions).astype(int)
+                            columns = np.arange(stop - start)
+                            a, b = block[lo, columns], block[hi, columns]
+                            fraction = positions - lo
+                            with np.errstate(invalid="ignore"):
+                                reduced = a + fraction * (b - a)
+                            reduced = np.where(lo == hi, a, reduced)
+                            reduced = np.where((lo != hi) & np.isneginf(a), -np.inf, reduced)
+                            low, high = np.where(count > 0, reduced, np.nan)
+                        else:
+                            low, high = np.nanpercentile(block, self.percentiles, axis=0)
                     self.lower.flat[start:stop] = low
                     self.upper.flat[start:stop] = high
             finally:
@@ -718,16 +792,31 @@ def _bucket_extrema_indices(values, edges):
     return tuple(np.concatenate(parts) for parts in (minima, maxima, gaps))
 
 
-def decimate_line(x_values, y_values, max_points: int | None = None):
-    """Bound a display line while preserving extrema, endpoints, and gaps.
+def _preserve_decimation_breaks(selected, arrays):
+    """Keep a missing sample between every pair of retained source samples.
 
-    A NaN is a semantic break in a measured cut, not merely a value to ignore.
-    Keeping one missing sample from every mixed bucket prevents Matplotlib from
-    drawing a continuous line across unavailable data after display decimation.
+    Several missing runs can occur in one extrema bucket. Scan the source in
+    bounded blocks and preserve breaks relative to the *final* candidates,
+    rather than keeping only the first missing sample of each bucket.
     """
+    selected = np.asarray(selected, dtype=int)
+    size = len(arrays[0])
+    gaps = np.full(max(0, selected.size - 1), size, dtype=int)
+    for start in range(0, size, REDUCTION_BLOCK_CELLS):
+        stop = min(size, start + REDUCTION_BLOCK_CELLS)
+        valid = np.ones(stop - start, dtype=bool)
+        for values in arrays:
+            valid &= np.isfinite(values[start:stop])
+        missing = np.flatnonzero(~valid) + start
+        intervals = np.searchsorted(selected, missing, side="right") - 1
+        inside = (intervals >= 0) & (intervals < gaps.size)
+        np.minimum.at(gaps, intervals[inside], missing[inside])
+    return np.unique(np.r_[selected, gaps[gaps < size]])
 
-    x_values = np.asarray(x_values)
-    y_values = np.asarray(y_values)
+
+def decimate_line(x_values, y_values, max_points: int | None = None):
+    """Bound a display line while preserving extrema, endpoints, and breaks."""
+    x_values, y_values = np.asarray(x_values), np.asarray(y_values)
     max_points = MAX_LINE_POINTS if max_points is None else int(max_points)
     if max_points < 4:
         raise ValueError("max_points must be at least 4")
@@ -736,35 +825,27 @@ def decimate_line(x_values, y_values, max_points: int | None = None):
     n = x_values.size
     if n <= max_points:
         return x_values, y_values, False
-
-    # Min/max envelope decimation retains narrow peaks that simple striding can
-    # erase. Allocate room for min, max, and one missing-data marker per
-    # interior bucket, plus exact endpoints.
+    # Keep the original extrema budget when it fits. Only densely fragmented
+    # data need extra room reserved for semantic separators.
     bucket_count = max(1, (max_points - 2) // 3)
     edges = np.linspace(1, n - 1, bucket_count + 1, dtype=int)
     lo, hi, gaps = _bucket_extrema_indices(y_values, edges)
-    selected = np.unique(np.r_[0, lo[lo < n], hi[hi < n], gaps[gaps < n], n - 1])
-    if len(selected) > max_points:
-        selected = _bounded_decimation_indices(selected, gaps[gaps < n], n, max_points)
+    selected = _bounded_decimation_indices(
+        np.r_[0, lo[lo < n], hi[hi < n], gaps[gaps < n], n - 1], [], n, max_points)
+    preserved = _preserve_decimation_breaks(selected, (x_values, y_values))
+    if preserved.size > max_points:
+        selected = _bounded_decimation_indices(selected, [], n, (max_points + 1) // 2)
+        preserved = _preserve_decimation_breaks(selected, (x_values, y_values))
+    selected = preserved
     return x_values[selected], y_values[selected], True
 
 
-def decimate_envelope(
-    x_values,
-    lower,
-    upper,
-    count=None,
-    max_points: int | None = None,
-):
-    """Bound a filled envelope using extrema from both of its boundaries."""
-
+def decimate_envelope(x_values, lower, upper, count=None, max_points: int | None = None):
+    """Bound both band edges, retaining every break between sampled points."""
     max_points = MAX_LINE_POINTS if max_points is None else int(max_points)
     if max_points < 4:
         raise ValueError("max_points must be at least 4")
-
-    x_values = np.asarray(x_values)
-    lower = np.asarray(lower)
-    upper = np.asarray(upper)
+    x_values, lower, upper = map(np.asarray, (x_values, lower, upper))
     count_values = None if count is None else np.asarray(count)
     if x_values.shape != lower.shape or x_values.shape != upper.shape or x_values.ndim != 1:
         raise ValueError("envelope arrays must be matching one-dimensional arrays")
@@ -773,38 +854,20 @@ def decimate_envelope(
     n = x_values.size
     if n <= max_points:
         return x_values, lower, upper, count_values, False
-
-    # Four extrema plus one missing-data marker per bucket, then exact ends.
     bucket_count = max(1, (max_points - 2) // 5)
     edges = np.linspace(1, n - 1, bucket_count + 1, dtype=int)
-    selected = [0]
-    gap_markers: list[int] = []
-    for start, stop in zip(edges[:-1], edges[1:]):
-        if stop <= start:
-            continue
-        valid_pair = np.isfinite(lower[start:stop]) & np.isfinite(upper[start:stop])
-        if np.any(~valid_pair):
-            gap_index = start + int(np.flatnonzero(~valid_pair)[0])
-            selected.append(gap_index)
-            gap_markers.append(gap_index)
-        for values in (lower, upper):
-            segment = values[start:stop]
-            finite = np.isfinite(segment)
-            if not np.any(finite):
-                continue
-            finite_indices = np.flatnonzero(finite)
-            selected.append(start + finite_indices[int(np.argmin(segment[finite]))])
-            selected.append(start + finite_indices[int(np.argmax(segment[finite]))])
-    selected.append(n - 1)
-    selected = _bounded_decimation_indices(selected, gap_markers, n, max_points)
+    selected = [0, n - 1]
+    for values in (lower, upper):
+        lo, hi, gaps = _bucket_extrema_indices(values, edges)
+        selected.extend(lo[lo < n]); selected.extend(hi[hi < n]); selected.extend(gaps[gaps < n])
+    selected = _bounded_decimation_indices(selected, [], n, max_points)
+    preserved = _preserve_decimation_breaks(selected, (x_values, lower, upper))
+    if preserved.size > max_points:
+        selected = _bounded_decimation_indices(selected, [], n, (max_points + 1) // 2)
+        preserved = _preserve_decimation_breaks(selected, (x_values, lower, upper))
+    selected = preserved
     count_display = None if count_values is None else count_values[selected]
-    return (
-        x_values[selected],
-        lower[selected],
-        upper[selected],
-        count_display,
-        True,
-    )
+    return x_values[selected], lower[selected], upper[selected], count_display, True
 
 
 def _bounded_decimation_indices(selected, gap_markers, size: int, max_points: int) -> np.ndarray:

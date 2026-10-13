@@ -7,7 +7,7 @@ Use **Overlays** in the Plotting or ISAR toolbar to load coordinates or draw con
 1. Open **Overlays**. If the figure has several panels, choose the target **Panel**.
 2. Click **Load overlay…** and choose an XY or XYZ text file.
 3. For XYZ, choose **XY**, **XZ**, or **YZ**. The first chosen column becomes the horizontal plot coordinate and the second the vertical coordinate. This selects a plane; it does not rotate geometry using the ISAR viewing angle.
-4. Select the **file length unit**: metres, centimetres, millimetres, inches, or feet. This describes the file values, which may differ from the plot units. On plots with an angle or frequency axis, that coordinate uses the units printed on its axis; the length-unit choice affects only distance coordinates.
+4. Select the **file length unit**: meters, centimeters, millimeters, inches, or feet. This describes the file values, which may differ from the plot units. On plots with an angle or frequency axis, that coordinate uses the units printed on its axis; the length-unit choice affects only distance coordinates.
 
 Accepted files include `.xy`, `.xyz`, `.csv`, `.txt`, `.dat`, and `.pts`. Use two or three numeric columns separated by commas, semicolons, spaces, or tabs. An optional `x,y` or `x,y,z` header is supported. Lines beginning with `#` are comments. Blank lines separate disconnected outlines. All coordinate values must be finite; malformed or inconsistent rows are reported with their line number. Files are limited to 32 MiB and 200,000 points.
 

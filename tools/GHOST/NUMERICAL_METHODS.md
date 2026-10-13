@@ -294,7 +294,7 @@ Only the conductor kind is graded: bare pieces of partial and banded coatings,
 material junctions and sheets are not. The BoR HPC driver was run end to end on
 a graded sphere (plan, then the headless worker): 32 elements, one graded
 junction, IBC-CFIE, and 24 with a zero-ohm law. Around the first cavity resonance
-(`ka = 2.70..2.80`, 60 elements) the EFIE departs from its neighbours by 1.5 dB
+(`ka = 2.70..2.80`, 60 elements) the EFIE departs from its neighbors by 1.5 dB
 (PEC half) and 16.3 dB (taper); the CFIE stays within 0.0012 dB. Explicit
 `formulation='efie'` remains a diagnostic option with no resonance guarantee.
 

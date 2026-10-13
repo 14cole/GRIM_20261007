@@ -107,6 +107,7 @@ def render(self) -> None:
     omitted = 0
     for plan in plans:
         name, dataset, freq_indices = plan[0], plan[1], plan[2]
+        line_breaks = common.selection_breaks(reference, dataset, "elevation", plan[4], elev_values)
         candidates = len(freq_indices) * (len(plan[3]) if individual else 1)
         if rendered >= common.MAX_LINE_SERIES:
             omitted += candidates
@@ -117,7 +118,8 @@ def render(self) -> None:
                 continue
             if rendered < common.MAX_LINE_SERIES:
                 self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
-                                        dataset=dataset, trace_key=trace_key)
+                                        dataset=dataset, trace_key=trace_key,
+                                        break_before=line_breaks)
                 rendered += 1
                 if rendered >= common.MAX_LINE_SERIES:
                     omitted += candidates - candidate_index - 1

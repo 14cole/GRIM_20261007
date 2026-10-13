@@ -184,13 +184,13 @@ class GeometryTab(GeometryInspectionMixin, QWidget):
         )
         self.chk_show_impedance = QCheckBox("Show Impedance")
         self.chk_show_impedance.setToolTip(
-            "Colour segments by IBC impedance. Tapered segments show a gradient; "
+            "Color segments by IBC impedance. Tapered segments show a gradient; "
             "start = green dot, end = red dot."
         )
         self.chk_fill_materials = QCheckBox("Fill Materials")
         self.chk_fill_materials.setToolTip(
-            "Fill enclosed regions with their material colour (grey = PEC, "
-            "coloured tints = dielectrics, background = air) as implied by each "
+            "Fill enclosed regions with their material color (gray = PEC, "
+            "colored tints = dielectrics, background = air) as implied by each "
             "segment's winding. A region whose boundary segments disagree "
             "about the enclosed material is hatched red."
         )
@@ -1781,7 +1781,7 @@ class GeometryTab(GeometryInspectionMixin, QWidget):
         )
 
     def _z_to_color(self, z: 'Optional[complex]', z_ref_mag: 'float') -> 'Tuple[float, float, float]':
-        """Map an impedance value to an RGB colour.
+        """Map an impedance value to an RGB color.
 
         * |Z| near zero  -> near-black (PEC-like)
         * |Z| near 377 ohm -> mid-blue (free-space-like)

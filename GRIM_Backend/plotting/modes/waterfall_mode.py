@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import common
+from GRIM_Backend.plotting.image_grid import axis_support, image_grid, native_sample_width
 
 
 def render(self) -> None:
@@ -77,6 +78,8 @@ def render(self) -> None:
         ny = np.asarray(getattr(dataset, AXIS_ATTRIBUTES[y_axis])[indices[y_axis]])
         x = self._plot_axis_values(reference, dataset, x_axis, nx)
         y = self._plot_axis_values(reference, dataset, y_axis, ny)
+        x_width = native_sample_width(reference, dataset, x_axis)
+        y_width = native_sample_width(reference, dataset, y_axis)
         for cut_index in ([None] if aggregate else indices[remaining]):
             native_ids = [indices[axis] for axis in AXES] + [pol_ids]
             display = heatmap_display_plane(dataset,native_ids,x_axis,y_axis,
@@ -86,6 +89,10 @@ def render(self) -> None:
                 continue
             bx, by, bd = self._bounded_plot_image(x, y, display)
             snapshot = self._native_image_snapshot(x, y, display, reduced=bd.shape != display.shape)
+            supported = image_grid(x, y, display.T, x_width=x_width, y_width=y_width,
+                target_shape=bd.T.shape, return_samples=snapshot is False)
+            x_edges, y_edges, drawn = supported[:3]
+            display_samples = supported[3] if snapshot is False else None
             remaining_values = getattr(dataset, AXIS_ATTRIBUTES[remaining])[indices[remaining]]
             unit = self._plot_axis_unit(reference, remaining)
             label = (f"{'Circular phase mean' if phase else 'Mean linear display quantity'} over {len(remaining_values)} {remaining} samples"
@@ -93,7 +100,9 @@ def render(self) -> None:
             title = f"{name} | Pol {dataset.polarizations[pol_ids[0]]} | {label} | {self._display_unit([(name,dataset)])}"
             short_label = f"Mean {remaining} (n={len(remaining_values)})" if aggregate else label
             panels.append(dict(name=title, short_title=f"{name[:20]} | {dataset.polarizations[pol_ids[0]]}\n{short_label} | {self._display_unit([(name,dataset)])}",dataset=dataset, x=bx, y=by, display=bd, snapshot=snapshot,
-                native_x=x, native_y=y,
+                native_x=x, native_y=y, native_display=display if snapshot is None else None, drawn=drawn,
+                x_edges=x_edges, y_edges=y_edges, x_width=x_width, y_width=y_width,
+                display_samples=display_samples,
                 metadata={"kind": "heatmap", "source_name":name, "polarization": str(dataset.polarizations[pol_ids[0]]),
                     "frequency_aggregation":bool(aggregate and remaining == "frequency"),
                     "remaining_selection": (remaining, "mean" if aggregate else float(getattr(dataset, AXIS_ATTRIBUTES[remaining])[cut_index]), common.axis_unit(dataset, remaining)),
@@ -146,18 +155,19 @@ def render(self) -> None:
     meshes, records = [], []
     for panel_index,(ax, panel) in enumerate(zip(axes, panels),1):
         self._style_axes(ax)
-        image = panel["display"]
-        mesh = ax.pcolormesh(panel["x"], panel["y"], image.T, shading="auto", cmap=self._effective_colormap(), vmin=vmin, vmax=vmax)
-        coords = mesh.get_coordinates()
-        mesh._grim_rectilinear_data = (coords[0,:,0], coords[:,0,1], mesh.get_array().reshape(image.T.shape))
+        image = panel["drawn"]
+        mesh = ax.pcolormesh(panel["x_edges"], panel["y_edges"], image, shading="flat", cmap=self._effective_colormap(), vmin=vmin, vmax=vmax)
+        mesh._grim_rectilinear_data = (panel["x_edges"], panel["y_edges"], mesh.get_array().reshape(image.shape))
         self._attach_native_image_snapshot(mesh, panel["snapshot"])
         record_values = getattr(mesh, "_grim_native_rectilinear_data", None)
         if record_values is not None:
             rx, ry, rv = panel["native_x"], panel["native_y"], record_values[2]
         elif panel["snapshot"] is False:
-            rx, ry, rv = panel["x"], panel["y"], mesh.get_array().reshape(image.T.shape)
+            samples = panel["display_samples"]
+            rx, ry, rv = samples["x"], samples["y"], samples["values"]
+            panel["metadata"].update({key: samples[key] for key in ("x_cut_breaks", "y_cut_breaks")})
         else:
-            rx, ry, rv = panel["native_x"], panel["native_y"], mesh.get_array().reshape(image.T.shape)
+            rx, ry, rv = panel["native_x"], panel["native_y"], panel["native_display"].T
         ds = panel["dataset"]
         record = ImageRecord(panel["name"], rx, ry, rv, x_axis, y_axis,
             self._plot_axis_unit(reference, x_axis), self._plot_axis_unit(reference, y_axis),
@@ -165,6 +175,19 @@ def render(self) -> None:
             logarithmic=not phase and not self._plot_scale_is_linear(), phase=phase,
             notes=("Display block maxima; native snapshot unavailable.",) if panel["snapshot"] is False else (), metadata=panel["metadata"])
         mesh._grim_image_record = record
+        if panel["snapshot"] is not False:
+            # Native probes use the same local sample support as the display;
+            # no midpoint cell may turn an unmeasured sector into a return.
+            xs = axis_support(rx, width=panel["x_width"])
+            ys = axis_support(ry, width=panel["y_width"])
+            def probe(x, y, artist=mesh, xs=xs, ys=ys):
+                current = getattr(artist, "_grim_image_record", None)
+                ix, iy = xs.index(x), ys.index(y)
+                if current is None or ix is None or iy is None:
+                    return None
+                value = current.values[iy, ix]
+                return float(value) if np.isfinite(value) else None
+            mesh._grim_native_probe = probe
         records.append(record)
         meshes.append(mesh)
         compact = show_cuts or len(panels)>1
@@ -192,10 +215,10 @@ def render(self) -> None:
         self.plot_figure._grim_linked_cuts = controller
         if callable(getattr(controls, "bind", None)):
             controls.bind(controller)
-    for spin, value in ((self.spin_plot_xmin, min(np.min(p['x']) for p in panels)),
-            (self.spin_plot_xmax, max(np.max(p['x']) for p in panels)),
-            (self.spin_plot_ymin, min(np.min(p['y']) for p in panels)),
-            (self.spin_plot_ymax, max(np.max(p['y']) for p in panels))):
+    for spin, value in ((self.spin_plot_xmin, min(p['x_edges'][0] for p in panels)),
+            (self.spin_plot_xmax, max(p['x_edges'][-1] for p in panels)),
+            (self.spin_plot_ymin, min(p['y_edges'][0] for p in panels)),
+            (self.spin_plot_ymax, max(p['y_edges'][-1] for p in panels))):
         blocked = spin.blockSignals(True)
         common.set_spin_value(spin, float(value))
         spin.blockSignals(blocked)

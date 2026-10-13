@@ -101,27 +101,22 @@ class NumericalAuditTests(unittest.TestCase):
                 finally:
                     envelope.close()
 
-    def test_line_vectorization_matches_independent_bucket_oracle(self):
+    def test_line_decimation_preserves_source_values_and_every_intervening_gap(self):
         rng = np.random.default_rng(8127)
         for n, budget, scratch in ((101, 8, 13), (3601, 2000, 262144), (10007, 17, 79)):
             y = rng.normal(size=n)
             y[::19] = np.nan
             y[20:30] = 7.
             x = np.arange(n)
-            selected = {0, n-1}
-            boundaries = np.linspace(1, n-1, (budget-2)//3+1, dtype=int)
-            for lo, hi in zip(boundaries[:-1], boundaries[1:]):
-                valid = [i for i in range(lo, hi) if np.isfinite(y[i])]
-                missing = [i for i in range(lo, hi) if not np.isfinite(y[i])]
-                if valid:
-                    selected.update((min(valid, key=lambda i: y[i]), max(valid, key=lambda i: y[i])))
-                if missing:
-                    selected.add(missing[0])
             with mock.patch.object(common, "REDUCTION_BLOCK_CELLS", scratch):
                 actual_x, actual_y, changed = common.decimate_line(x, y, budget)
             self.assertTrue(changed)
-            np.testing.assert_array_equal(actual_x, sorted(selected))
-            np.testing.assert_array_equal(actual_y, y[sorted(selected)])
+            self.assertLessEqual(len(actual_x), budget)
+            self.assertEqual((actual_x[0], actual_x[-1]), (0, n - 1))
+            np.testing.assert_array_equal(actual_y, y[actual_x])
+            for left, right in zip(actual_x[:-1], actual_x[1:]):
+                if np.isfinite(y[left]) and np.isfinite(y[right]):
+                    self.assertTrue(np.all(np.isfinite(y[left:right + 1])))
         with mock.patch.object(common, "MAX_LINE_POINTS", 7):
             self.assertLessEqual(len(common.decimate_line(x, y)[0]), 7)
             self.assertLessEqual(len(common.decimate_envelope(x, y, y)[0]), 7)
@@ -221,7 +216,7 @@ class RendererAuditTests(unittest.TestCase):
             if mode is frequency_mode:
                 self.assertEqual(h.plot_ax.get_xlim(), (8.e9, 11.e9))
             else:
-                self.assertEqual(h.plot_ax.get_ylim(), (8.e9, 11.e9))
+                self.assertEqual(h.plot_ax.get_ylim(), (7.5e9, 12.e9))
             h._fit_both()
             limits = h.plot_ax.get_xlim() if mode is frequency_mode else h.plot_ax.get_ylim()
             self.assertLessEqual(limits[0], 8.e9)
@@ -275,10 +270,11 @@ class RendererAuditTests(unittest.TestCase):
         h = harness(a)
         waterfall_mode.render(h)
         mesh = h.plot_ax.collections[0]
-        np.testing.assert_allclose(mesh.get_coordinates()[0, :, 0], [-.5, .5, 5.5, 14.5])
+        np.testing.assert_allclose(mesh.get_coordinates()[0, :, 0], [-.5, .5, 1.5, 9.5, 10.5])
         with mock.patch.object(mesh, "get_cursor_data", side_effect=AssertionError("slow path")):
             value = h._hover_z_from_axes(h.plot_ax, SimpleNamespace(xdata=1., ydata=9.))
             self.assertAlmostEqual(value, 10*np.log10(5.))
+            self.assertIsNone(h._hover_z_from_axes(h.plot_ax, SimpleNamespace(xdata=5., ydata=9.)))
             self.assertIsNone(h._hover_z_from_axes(h.plot_ax, SimpleNamespace(xdata=100., ydata=9.)))
         a.rcs_power[1, 0, 1, 0] = np.nan
         waterfall_mode.render(h)

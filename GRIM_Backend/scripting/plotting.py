@@ -35,7 +35,7 @@ def _indices(axis, selected, *, text=False, tolerance=1.0e-6) -> list[int]:
 def _display_values(dataset: RcsGrid, values, *, frequency, phase: bool, scale: str):
     if phase:
         phase_degrees = np.rad2deg(np.angle(values))
-        finite = np.isfinite(phase_degrees)
+        finite = np.isfinite(values) & (np.abs(values) > 0.)
         display = np.full(np.asarray(phase_degrees).shape, np.nan, dtype=float)
         phase_wrap = str(
             (dataset.units or {}).get("phase_wrap", "-180_180")
@@ -252,6 +252,7 @@ def plot_datasets(
         raise ValueError("azimuths, elevations, and frequencies cannot be empty")
     if mode_key == "waterfall":
         from GRIM_Backend.plotting.image_analysis import AXES, AXIS_ATTRIBUTES, heatmap_display_plane
+        from GRIM_Backend.plotting.image_grid import image_grid, line_with_gaps, native_sample_width
         from matplotlib.colors import Normalize
         options = dict(heatmap_options or {})
         heatmap_axes = options.get("axes", heatmap_axes)
@@ -290,7 +291,8 @@ def plot_datasets(
                     suffix = (f"{'Circular phase mean' if phase else 'Mean linear display quantity'} over {len(indices[AXES.index(remaining)])} {remaining} samples" if cut is None else
                               f"{remaining.capitalize()} {plot_common.values_for_display(reference, dataset, remaining, [getattr(dataset, AXIS_ATTRIBUTES[remaining])[cut]])[0]:g} {plot_common.axis_unit(reference, remaining)}")
                     response = _plot_response_label(dataset, phase=phase, scale=scale)
-                    panels.append((f"{name} | Pol {pol} | {suffix} | {response}", x[xo], y[yo], plane, response))
+                    widths = (native_sample_width(reference, dataset, x_axis), native_sample_width(reference, dataset, y_axis))
+                    panels.append((f"{name} | Pol {pol} | {suffix} | {response}", x[xo], y[yo], plane, response, widths))
         if not panels:
             raise ValueError("No compatible Waterfall coordinates")
         figure = Figure(figsize=(10., max(4., 4.*len(panels))), dpi=100, facecolor="white")
@@ -302,18 +304,19 @@ def plot_datasets(
             first_x, first_y = panels[0][1:3]
             cut_position = (first_x[len(first_x) // 2], first_y[len(first_y) // 2])
         norms = {}
-        for _title, _x, _y, data, response in panels:
+        for _title, _x, _y, data, response, _widths in panels:
             finite = data[np.isfinite(data)]
             if finite.size:
                 old = norms.get(response, (np.inf, -np.inf))
                 norms[response] = (min(old[0], float(np.min(finite))), max(old[1], float(np.max(finite))))
         callbacks, image_axes, meshes, cut_views = [], [], [], []
         global_limits = (min(v[0] for v in norms.values()), max(v[1] for v in norms.values())) if norms else None
-        for i, (title, x, y, data, response) in enumerate(panels):
+        for i, (title, x, y, data, response, widths) in enumerate(panels):
             ax = figure.add_subplot(spec[i, 0])
             limits = color_limits if color_limits is not None else global_limits if shared_colorbar else None
             norm = Normalize(*limits) if limits is not None else None
-            mesh = ax.pcolormesh(plot_common.coordinate_edges(x), plot_common.coordinate_edges(y), data.T,
+            xe, ye, display = image_grid(x, y, data.T, x_width=widths[0], y_width=widths[1])
+            mesh = ax.pcolormesh(xe, ye, display,
                                  shading="flat", cmap=colormap, norm=norm)
             ax.set(title=title, xlabel=plot_common.axis_label(reference, x_axis), ylabel=plot_common.axis_label(reference, y_axis))
             ax.grid(bool(show_grid))
@@ -328,14 +331,14 @@ def plot_datasets(
                 if horizontal_cuts:
                     horizontal = figure.add_subplot(spec[i, slot])
                     slot += 1
-                    row, = horizontal.plot(x, data[:, iy])
+                    row, = horizontal.plot(*line_with_gaps(x, data[:, iy]))
                     hline = ax.axhline(y[iy], color="white", linewidth=.8)
                     horizontal.set(xlabel=plot_common.axis_label(reference, x_axis), ylabel=response,
                                    title=f"{y_axis} = {y[iy]:g} {plot_common.axis_unit(reference, y_axis)}")
                     horizontal.grid(bool(show_grid))
                 if vertical_cuts:
                     vertical = figure.add_subplot(spec[i, slot])
-                    column, = vertical.plot(y, data[ix, :])
+                    column, = vertical.plot(*line_with_gaps(y, data[ix, :]))
                     vline = ax.axvline(x[ix], color="white", linewidth=.8)
                     vertical.set(xlabel=plot_common.axis_label(reference, y_axis), ylabel=response,
                                  title=f"{x_axis} = {x[ix]:g} {plot_common.axis_unit(reference, x_axis)}")
@@ -354,12 +357,12 @@ def plot_datasets(
                     ix = int(np.argmin(abs(x - event.xdata)))
                     iy = int(np.argmin(abs(y - event.ydata)))
                     if horizontal is not None:
-                        row.set_ydata(data[:, iy])
+                        row.set_data(*line_with_gaps(x, data[:, iy]))
                         hline.set_ydata([y[iy], y[iy]])
                         horizontal.set_title(f"{y_axis} = {y[iy]:g} {plot_common.axis_unit(reference, y_axis)}")
                         horizontal.relim(); horizontal.autoscale_view()
                     if vertical is not None:
-                        column.set_ydata(data[ix, :])
+                        column.set_data(*line_with_gaps(y, data[ix, :]))
                         vline.set_xdata([x[ix], x[ix]])
                         vertical.set_title(f"{x_axis} = {x[ix]:g} {plot_common.axis_unit(reference, x_axis)}")
                         vertical.relim(); vertical.autoscale_view()
@@ -471,6 +474,8 @@ def plot_datasets(
             )
             order = np.argsort(x)
             x = np.asarray(x)[order]
+            breaks = plot_common.selection_breaks(
+                reference, dataset, "azimuth", np.asarray(az_idx)[order], az_values)
             if mode_key == "azimuth_polar":
                 x = plot_common.convert_axis_values(
                     x,
@@ -493,9 +498,11 @@ def plot_datasets(
                         phase=phase,
                         scale=scale,
                     )[order]
+                    draw_x, draw_y = plot_common.insert_plot_breaks(breaks, x, y)
                     lines = axes.plot(
-                        x,
-                        y,
+                        draw_x,
+                        draw_y,
+                        **plot_common.singleton_line_markers(draw_x, draw_y),
                         linestyle="-",
                         label=(
                             f"{name} | {polarization}, "
@@ -529,7 +536,14 @@ def plot_datasets(
                 config=config, phase=phase, scale=scale,
             ):
                 order = np.argsort(x)
-                lines = axes.plot(np.asarray(x)[order], np.asarray(y)[order], linestyle="-", label=label)
+                sweep_indices = indices[2] if sweep_axis == "frequency" else indices[1]
+                requested = freq_values if sweep_axis == "frequency" else el_values
+                breaks = plot_common.selection_breaks(
+                    reference, dataset, sweep_axis, np.asarray(sweep_indices)[order], requested)
+                draw_x, draw_y = plot_common.insert_plot_breaks(
+                    breaks, np.asarray(x)[order], np.asarray(y)[order])
+                lines = axes.plot(draw_x, draw_y, linestyle="-", label=label,
+                                  **plot_common.singleton_line_markers(draw_x, draw_y))
                 for line in lines:
                     line._grim_trace_key = key
                 plotted_series.extend((line, dataset) for line in lines)
@@ -642,7 +656,7 @@ def plot_datasets(
 
     elif mode_key == "isar_image":
         from GRIM_Backend.plotting.modes.isar_mode import _length_unit, form_isar
-        from GRIM_Backend.isar.geometry import image_extent, draw_image
+        from GRIM_Backend.isar.geometry import image_extent, draw_image, image_axis_labels
         from GRIM_Backend.isar.quality import reconstruction_advisories
 
         dataset = selected[0][1]
@@ -741,9 +755,12 @@ def plot_datasets(
             (int(band.get("composite", 0)) for band in bands), default=0
         )
         if composite_sublooks:
-            reconstruction_label += (
-                f" | Wide-Aperture Composite ({composite_sublooks} looks)"
-            )
+            if all(band.get("composite") for band in bands):
+                reconstruction_label += (
+                    f" | Wide-Aperture Composite ({composite_sublooks} looks)"
+                )
+            else:
+                reconstruction_label += " | Coherent + Wide-Aperture Composite"
         title = (
             f"ISAR Image | {elevation_name} {elevation_deg:g} deg | "
             f"Pol {dataset.polarizations[pol_idx]} | {reconstruction_label}"
@@ -758,19 +775,12 @@ def plot_datasets(
         else:
             axes_values[0].set_title(title)
 
-        horizontal_projection = abs(elevation_deg) > 1.0e-9
-        if composite_sublooks:
-            x_label = f"Cross-Range at 0° ({unit_name})"
-            y_label = f"Down-Range at 0° ({unit_name})"
-        elif horizontal_projection:
-            x_label = f"Horizontal Cross-Range ({unit_name})"
-            y_label = f"Horizontal Range ({unit_name})"
-        else:
-            x_label = f"Cross-Range ({unit_name})"
-            y_label = f"Range ({unit_name})"
-        for axis in axes_values:
+        for axis, band in zip(axes_values, bands):
+            x_label, y_label = image_axis_labels(
+                band, unit_name, elevation_deg, explicit_frame=len(bands) > 1
+            )
             axis.set_xlabel(x_label)
-        axes_values[0].set_ylabel(y_label)
+            axis.set_ylabel(y_label)
 
         colorbars = []
         if bool(show_colorbar) and meshes:

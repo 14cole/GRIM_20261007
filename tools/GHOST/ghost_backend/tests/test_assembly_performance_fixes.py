@@ -1,6 +1,6 @@
 """Feature-assembly hot-path fixes: body lookup and the oriented pattern cache.
 
-These pin behaviour that the optimizations must not change: the body is still
+These pin behavior that the optimizations must not change: the body is still
 resolved only at explicitly solved aspects, and the oriented-pattern cache is a
 pure speed device whose presence or size never moves an amplitude.
 """

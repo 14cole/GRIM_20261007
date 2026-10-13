@@ -858,7 +858,7 @@ def predict_2d_resources_for_geometries(
     options (reapplied in the workers), so the records are identical whatever
     the worker count.  ``progress(done, total, path)`` is called in the calling
     process as each geometry completes.  A failing geometry is named on stdout
-    and its error re-raised after the other tasks are cancelled; a pool whose
+    and its error re-raised after the other tasks are canceled; a pool whose
     workers die (a launcher without an importable main module, a memory kill)
     is abandoned and the remaining geometries are planned in this process.
     """
@@ -1162,7 +1162,7 @@ def bor_unit_cost(
     A BoR solve builds its far blocks for every element pair and mode and
     factors one dense system per azimuthal mode.  Generatrix elements scale
     with arc length in wavelengths and the kept modes with the circumference
-    in wavelengths.  The far build dominates in practice, so cost is modelled
+    in wavelengths.  The far build dominates in practice, so cost is modeled
     as (elements^2) x (modes): the 120 x 5 in ogive took 5.7x longer at 10 GHz
     than at 4 GHz (2,160 against 960 elements, 27 against 19 modes), which
     this model puts at 7.2x and the former (elements^3) x (modes) at 16x.
@@ -2221,7 +2221,7 @@ def build_sbatch_script(
     Array tasks are interchangeable: every task runs the same worker, which
     pulls units from the shared claim directory.  That means the array size is
     a *parallelism* knob rather than a partitioning key -- oversubscribing or
-    cancelling part of an array cannot strand work, and a second submission on
+    canceling part of an array cannot strand work, and a second submission on
     a different partition can join the same run at any time.
     """
 

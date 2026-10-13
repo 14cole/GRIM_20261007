@@ -1421,7 +1421,7 @@ def solve_bpdn_components(
 
     for iteration in range(1, int(max_iterations) + 1):
         if cancel_check is not None and cancel_check():
-            stopping_reason = "cancelled"
+            stopping_reason = "canceled"
             iterations_used = iteration - 1
             break
         with np.errstate(over="ignore", invalid="ignore"):

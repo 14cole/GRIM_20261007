@@ -256,7 +256,7 @@ def map_checked(function, jobs, workers, checkpoint=None):
 
     Consumers can copy each result into its final destination immediately;
     completed results do not accumulate until every job has finished. Queued
-    jobs are cancelled on failure, cancellation, or explicit iterator close.
+    jobs are canceled on failure, cancellation, or explicit iterator close.
 
     Every job runs in a copy of the caller's context: the scoped values of the
     solve (the CPU kernel-table store, the moment cache, the execution

@@ -829,7 +829,7 @@ def check_orientation_consistency(
             elif not has_matching_parent:
                 # Otherwise the region just outside the contour is the inside
                 # of its innermost enclosing contour. A second coating layer
-                # (a TYPE 5 parent labelled pos_mat outside) or a filled cavity
+                # (a TYPE 5 parent labeled pos_mat outside) or a filled cavity
                 # in a PEC body has no matching TYPE 3/5 parent, and a reversed
                 # core there changed a two-layer cylinder by 17-31 dB unnoticed.
                 parents = _enclosing(rep, {idx}, (1, 2, 3, 4, 5))

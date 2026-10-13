@@ -669,9 +669,13 @@ class EngineeringAnalysisDialog(QDialog):
             values = np.rad2deg(report["phase_difference_rad"]) if view == "phase" else report["ratio_db"]
             self._display_line(bottom, report["x"], values, label=label)
             finite = values[np.isfinite(values)]
-            rows.extend(((label + " finite samples", str(len(finite)), "common physical coordinates"),
-                         (label + " median", _number(float(np.median(finite)) if len(finite) else None), "deg" if view == "phase" else "dB power ratio"),
-                         (label + " phase difference", _number(report["circular_mean_deg"]), "deg; circular mean"),
+            rows.append((label + " finite samples", str(len(finite)), "common physical coordinates"))
+            # Wrapped angles have no meaningful ordinary median: 179 and -179
+            # degrees would misleadingly summarize as zero. The circular mean
+            # below also leaves an undefined direction explicitly unavailable.
+            if view != "phase":
+                rows.append((label + " median", _number(float(np.median(finite)) if len(finite) else None), "dB power ratio"))
+            rows.extend(((label + " phase difference", _number(report["circular_mean_deg"]), "deg; circular mean"),
                          (label + " normalized complex mismatch", _number(report["normalized_complex_mismatch"]), "relative L2; requires shared phase conventions")))
             samples.append((label, report["x"], values, "deg" if view == "phase" else "dB"))
         example = next(iter(cuts.values()), self._cut())

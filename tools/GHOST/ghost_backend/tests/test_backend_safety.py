@@ -292,7 +292,7 @@ class IntersectionToleranceTests(unittest.TestCase):
                 self.assertEqual(report["primitive_count"], 2)
 
     def test_short_primitive_does_not_inflate_the_tolerance(self) -> None:
-        # A 50.9 um primitive whose neighbour ends 14 um away, inside its
+        # A 50.9 um primitive whose neighbor ends 14 um away, inside its
         # bounding box.  Dividing `tol` by that length turned 14 um of real
         # clearance into an apparent overlap.
         short = [((0.0, 0.0), (36.0e-6, 36.0e-6))]

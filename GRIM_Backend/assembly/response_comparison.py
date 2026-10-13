@@ -38,7 +38,7 @@ _CUT_CACHE_LIMIT = 16*1024**2
 def read_response_cut(path, *, frequency, elevation, polarization, cancel_check=lambda: False):
     """Bounded display cache. Publication still verifies full source hashes."""
     if cancel_check():
-        raise InterruptedError("Response comparison cancelled.")
+        raise InterruptedError("Response comparison canceled.")
     path = Path(path).resolve()
     def identity():
         st = path.stat()
@@ -83,14 +83,14 @@ def _read_response_cut(path, *, frequency, elevation, polarization, cancel_check
         values = np.empty(len(az), float)
         for ai in range(len(az)):
             if cancel_check():
-                raise InterruptedError("Response comparison cancelled.")
+                raise InterruptedError("Response comparison canceled.")
             index = int(np.ravel_multi_index((ai, ei, fi, pi), shape, order="F" if fortran else "C"))
             offset = data_start+index*dtype.itemsize
             # Explicit small reads avoid allocating the decompressed gap even
             # for long elevation/frequency axes in a C-order response cube.
             while stream.tell() < offset:
                 if cancel_check():
-                    raise InterruptedError("Response comparison cancelled.")
+                    raise InterruptedError("Response comparison canceled.")
                 remaining = offset-stream.tell()
                 if not stream.read(min(256*1024, remaining)):
                     raise ValueError("Truncated response power array.")

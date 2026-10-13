@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 import numpy as np
 from matplotlib import colormaps
 from matplotlib.colors import Normalize
 
 from . import common
+from GRIM_Backend.plotting.image_grid import axis_support, image_grid, native_sample_width
 
 
 AXES = ("azimuth", "elevation", "frequency")
@@ -32,10 +34,20 @@ class DeltaMap:
     source_unit: str
     axis_names: dict[str, str]
     axis_units: dict[str, str]
+    x_width: float = 1.
+    y_width: float = 1.
 
     @property
     def valid_count(self):
         return int(np.count_nonzero(np.isfinite(self.delta_db)))
+
+    @cached_property
+    def x_support(self):
+        return axis_support(self.x, width=self.x_width)
+
+    @cached_property
+    def y_support(self):
+        return axis_support(self.y, width=self.y_width)
 
 
 def _matches(reference, dataset, axis, requested):
@@ -119,7 +131,9 @@ def prepare(datasets, *, reference, selections, polarization,
                     tuple(str(name) for name, _ in datasets),
                     str(datasets[0][1].default_log_unit()),
                     {axis: "Frequency" if axis == "frequency" else common.angular_axis_name(reference, axis) for axis in AXES},
-                    {axis: common.axis_unit(reference, axis) for axis in AXES})
+                    {axis: common.axis_unit(reference, axis) for axis in AXES},
+                    native_sample_width(reference, reference, x_axis),
+                    native_sample_width(reference, reference, y_axis))
 
 
 def cell_edges(values):
@@ -134,10 +148,9 @@ def cell_edges(values):
 def cell_text(result, x, y):
     if x is None or y is None or not np.isfinite(x) or not np.isfinite(y):
         return None
-    xe, ye = cell_edges(result.x), cell_edges(result.y)
-    col = int(np.searchsorted(xe, x, side="right") - 1)
-    row = int(np.searchsorted(ye, y, side="right") - 1)
-    if not (0 <= col < result.x.size and 0 <= row < result.y.size):
+    col = result.x_support.index(x)
+    row = result.y_support.index(y)
+    if col is None or row is None:
         return None
     coordinates = {result.x_axis: result.x[col], result.y_axis: result.y[row],
                    result.fixed_axis: result.fixed_value}
@@ -172,9 +185,12 @@ def draw(figure, axes, result, *, limit=None, show_values=False, show_colorbar=T
     if not np.isfinite(limit) or limit <= 0:
         raise ValueError("Delta color limit must be finite and greater than zero")
     cmap = colormaps[colormap].with_extremes(bad="#888888")
-    mesh = axes.pcolormesh(cell_edges(result.x), cell_edges(result.y),
-                          np.ma.masked_invalid(result.delta_db), shading="flat",
+    xe, ye, display = image_grid(result.x, result.y, result.delta_db,
+                                x_width=result.x_width, y_width=result.y_width)
+    mesh = axes.pcolormesh(xe, ye,
+                          np.ma.masked_invalid(display), shading="flat",
                           cmap=cmap, norm=Normalize(-limit, limit), rasterized=True)
+    mesh._grim_rectilinear_data = (xe, ye, np.ma.masked_invalid(display))
     axes.grid(False)
     axes.set_xlabel(f"{result.axis_names[result.x_axis]} ({result.axis_units[result.x_axis]})")
     axes.set_ylabel(f"{result.axis_names[result.y_axis]} ({result.axis_units[result.y_axis]})")
@@ -266,10 +282,11 @@ def render(self):
     self.plot_figure.set_layout_engine("tight", rect=(0, 0.07, 1, 1))
     self.plot_figure._grim_delta_layout = True
     # Reset physical axis bounds on this new slice; later zoom/pan stays local.
-    for widget, value in ((self.spin_plot_xmin, cell_edges(result.x)[0]),
-                          (self.spin_plot_xmax, cell_edges(result.x)[-1]),
-                          (self.spin_plot_ymin, cell_edges(result.y)[0]),
-                          (self.spin_plot_ymax, cell_edges(result.y)[-1])):
+    xe, ye, _ = mesh._grim_rectilinear_data
+    for widget, value in ((self.spin_plot_xmin, xe[0]),
+                          (self.spin_plot_xmax, xe[-1]),
+                          (self.spin_plot_ymin, ye[0]),
+                          (self.spin_plot_ymax, ye[-1])):
         was_blocked = widget.blockSignals(True)
         # Native Hz coordinates can exceed the general plot controls' initial
         # range. Keep their editable bounds consistent with the drawn axes.

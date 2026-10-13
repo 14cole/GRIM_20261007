@@ -33,7 +33,7 @@ def geometric_near_pair_count(centers, lengths):
 def mesh_near_pair_count(mesh):
     """``geometric_near_pair_count`` of a mesh's elements, memoized on the mesh.
 
-    Element centres and lengths are fixed at construction (polynomial
+    Element centers and lengths are fixed at construction (polynomial
     enrichment only adds nodes), and the storage forecast asks for the same
     mesh once per polarization and, in the submit-time planner, once per
     basis degree; the count was 27% of a resource plan."""

@@ -132,7 +132,7 @@ class VaryingImpedanceBorTests(unittest.TestCase):
 
     def test_cfie_is_smooth_where_the_efie_resonates(self):
         # First PEC-cavity resonance region of the sphere (ka = 2.744): the tapered
-        # EFIE departs 16 dB from its neighbours, the CFIE stays on the trend.
+        # EFIE departs 16 dB from its neighbors, the CFIE stays on the trend.
         levels = {}
         for formulation in ('efie', 'cfie'):
             values = [self._solve('taper', 40, ka, formulation)[0] for ka in (2.7425, 2.7450, 2.7475)]

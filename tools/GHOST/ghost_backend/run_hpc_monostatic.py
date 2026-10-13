@@ -39,7 +39,7 @@ Scheduling notes -- what makes a big sweep finish sooner:
   tree over a shared filesystem.
 
 Restartable: a unit whose .grim already exists is skipped once its attestation
-verifies, so cancelling and resubmitting is always safe.
+verifies, so canceling and resubmitting is always safe.
 
 Internal worker invocation (called by SLURM, not by the user):
     python run_hpc_monostatic.py --worker <run_dir> <submission_index> <task_index>
@@ -143,7 +143,7 @@ OUTPUT_DIR = "ghost_backend/results/rcs_runs"
 #
 # Unlike the previous round-robin scheme these are pure throughput knobs. Array
 # tasks are interchangeable and pull work from a shared claim directory, so
-# nothing is stranded if a task never starts, is cancelled, or is preempted,
+# nothing is stranded if a task never starts, is canceled, or is preempted,
 # and raising N_NODES on a later submission simply adds capacity to a run that
 # is already going.
 N_NODES = 1

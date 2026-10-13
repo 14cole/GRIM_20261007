@@ -1288,7 +1288,7 @@ def _validate_bor_surface_agreement(
 
     for start in range(0, len(triangles), 1024):
         if cancel_check is not None and cancel_check():
-            raise InterruptedError("Feature placement validation cancelled.")
+            raise InterruptedError("Feature placement validation canceled.")
         chunk = triangles[start:start + 1024]
         samples = np.concatenate((
             chunk.reshape(-1, 3),
@@ -1316,7 +1316,7 @@ def _validate_bor_surface_agreement(
     centroids = np.asarray(surface.centroids, dtype=float)
     for start in range(0, len(centroids), 4096):
         if cancel_check is not None and cancel_check():
-            raise InterruptedError("Feature placement validation cancelled.")
+            raise InterruptedError("Feature placement validation canceled.")
         derived = analytic_normal(centroids[start:start + 4096])
         alignment = np.sum(
             derived * surface.face_normals[start:start + 4096], axis=1
@@ -1350,7 +1350,7 @@ def _validate_bor_surface_agreement(
         coverage_distances = []
         for start in range(0, len(coverage_points), 512):
             if cancel_check is not None and cancel_check():
-                raise InterruptedError("Feature placement validation cancelled.")
+                raise InterruptedError("Feature placement validation canceled.")
             distances, _points, _normals, _indices = surface.nearest(
                 coverage_points[start:start + 512]
             )
@@ -1575,7 +1575,7 @@ def prepare_line_placements(
     start = 0
     while start < len(rows):
         if cancel_check is not None and cancel_check():
-            raise InterruptedError("Feature placement validation cancelled.")
+            raise InterruptedError("Feature placement validation canceled.")
         line_id = str(rows[start]["line_id"])
         end = start + 1
         while end < len(rows) and rows[end]["line_id"] == line_id:
@@ -1968,7 +1968,7 @@ def prepare_point_placements(
     patterns: 'dict[str, Any]' = {}
     for row_index, row in enumerate(rows, 1):
         if cancel_check is not None and cancel_check():
-            raise InterruptedError("Feature placement validation cancelled.")
+            raise InterruptedError("Feature placement validation canceled.")
         csv_line = int(row["_csv_line"])
         dataset_id = str(row["dataset_id"])
         dataset = dataset_paths[dataset_id]
@@ -3194,7 +3194,7 @@ def _line_applicability_metrics(
             lit_any = np.zeros(len(looks), dtype=bool)
             for piece_start in range(0, len(sampled_normals), 256):
                 if cancel_check is not None and cancel_check():
-                    raise InterruptedError("Line applicability validation cancelled.")
+                    raise InterruptedError("Line applicability validation canceled.")
                 sl = slice(piece_start, piece_start+256)
                 normal_projection = looks @ sampled_normals[sl].T
                 lit = normal_projection > 0.0
@@ -3584,7 +3584,7 @@ def _line_self_footprint_overlap(
             if comparisons % 256 == 0 and (
                 cancel_check is not None and cancel_check()
             ):
-                raise InterruptedError("Feature placement validation cancelled.")
+                raise InterruptedError("Feature placement validation canceled.")
             adjacent = abs(index - prior) <= 1 or (
                 closed and {index, prior} == {0, len(values) - 1}
             )
@@ -3631,7 +3631,7 @@ def _footprint_candidate_pairs(
     bounded = []
     for index, component in enumerate(components):
         if cancel_check is not None and cancel_check():
-            raise InterruptedError("Feature placement validation cancelled.")
+            raise InterruptedError("Feature placement validation canceled.")
         if component["kind"] == "point":
             vertices = np.asarray(component["location"], dtype=float).reshape(1, 3)
         else:
@@ -3655,7 +3655,7 @@ def _footprint_candidate_pairs(
             if comparisons % 256 == 0 and (
                 cancel_check is not None and cancel_check()
             ):
-                raise InterruptedError("Feature placement validation cancelled.")
+                raise InterruptedError("Feature placement validation canceled.")
             if np.any(prior_upper[1:] + 1.0e-12 < lower[1:]) or np.any(
                 upper[1:] + 1.0e-12 < prior_lower[1:]
             ):
@@ -4250,7 +4250,7 @@ def prepare_feature_assembly(
 
     for source, expected in sources.prepared_source_sha256.items():
         if cancel_check is not None and cancel_check():
-            raise InterruptedError("Feature placement validation cancelled.")
+            raise InterruptedError("Feature placement validation canceled.")
         try:
             actual = sha256_file(source)
         except OSError as exc:
@@ -4422,7 +4422,7 @@ def retarget_feature_assembly(plan, output_grim, *, cancel_check=None):
     the guards of an unchanged destination, which could hide an output race.
     """
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Feature assembly cancelled.")
+        raise InterruptedError("Feature assembly canceled.")
     if not plan.prepared_plan_sha256 or feature_assembly_plan_sha256(plan) != plan.prepared_plan_sha256:
         raise ValueError("Prepared Assembly plan changed; validate it again.")
     output = _canonical_grim_output_path(output_grim, base_dir=plan.request.base_dir)
@@ -4460,7 +4460,7 @@ def execute_feature_assembly(
     if not isinstance(plan, FeatureAssemblyPlan):
         raise TypeError("plan must be a FeatureAssemblyPlan.")
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Feature assembly cancelled; existing output kept.")
+        raise InterruptedError("Feature assembly canceled; existing output kept.")
 
 
     _reject_output_aliases(

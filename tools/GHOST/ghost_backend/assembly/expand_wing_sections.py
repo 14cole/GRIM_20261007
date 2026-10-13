@@ -150,7 +150,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _EDGE_TAPER_DEG = 1.0e-6
 _SPLIT_PLANE_TILT = 1.0e-6
 
-# Largest two-way phase change, in radians, allowed between neighbouring
+# Largest two-way phase change, in radians, allowed between neighboring
 # samples of a section response (in angle, and in reduced frequency).
 _SAMPLE_PHASE_RAD = 0.5
 
@@ -345,7 +345,7 @@ def _half_space_tables(geometry_path, solve_ghz, look_ghz, angles,
                        geometry_units, solver_kwargs, cache):
     """(+normal side, -normal side) coefficient tables of one section solve.
 
-    The section is solved at ``solve_ghz``; the tables are labelled with
+    The section is solved at ``solve_ghz``; the tables are labeled with
     ``look_ghz``, the radar frequency they are expanded at. The two differ
     only for the oblique-incidence correction.
     """
@@ -545,7 +545,7 @@ def expand_wing_sections(
     in the same frame and units. ``body_grim`` is the base response described
     in the module docstring; with a base, its own radar grid is used.
 
-    Nothing is written until every station has been expanded; a cancelled or
+    Nothing is written until every station has been expanded; a canceled or
     failed run leaves an existing output untouched. Returns
     ``{"output", "stations", "warnings"}``.
     """
@@ -558,7 +558,7 @@ def expand_wing_sections(
 
     def check_cancel():
         if cancel_check is not None and cancel_check():
-            raise InterruptedError("Line expansion cancelled; existing output kept.")
+            raise InterruptedError("Line expansion canceled; existing output kept.")
 
     def resolve(value):
         path = Path(str(value).strip())

@@ -82,7 +82,7 @@ class MixedBoundaryTwoDTests(unittest.TestCase):
 
     def test_legacy_equation_still_shows_the_defect_this_guards(self):
         # Keeps the regression honest: with the former eligibility the same
-        # input is tens of dB off its neighbours while every gate passes.
+        # input is tens of dB off its neighbors while every gate passes.
         shape = _halves(104, 0, 1, [IBC_A])
         with patch.object(combined_regions, 'couplings', _uniform_only_couplings):
             values = [10*np.log10(_solve(shape, 'TE', MIXED_RESONANCE_KA+offset)[1]) for offset in (-1e-3, 0., 1e-3)]

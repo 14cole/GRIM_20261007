@@ -298,7 +298,7 @@ def render(self) -> None:
 
     magnitude = np.abs(range_image)
 
-    # Optional peak normalisation (re-uses ISAR toggle).
+    # Optional peak normalization (re-uses ISAR toggle).
     pn_widget = getattr(self, "chk_isar_peak_normalize", None)
     peak_norm = bool(pn_widget.isChecked()) if pn_widget else False
     if peak_norm:

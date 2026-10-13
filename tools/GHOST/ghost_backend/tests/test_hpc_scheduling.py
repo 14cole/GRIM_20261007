@@ -768,7 +768,7 @@ def test_survey_mode_cost():
     check(abs(survey - hpc_scheduler.unit_cost(2000, 19, 0.5)) < 1e-9,
           "any fine_factor <= 1 costs a single mesh")
     check(2.5 < certified / survey < 4.0,
-          f"certification is modelled as ~3x the work ({certified / survey:.2f}x)")
+          f"certification is modeled as ~3x the work ({certified / survey:.2f}x)")
     big_c = hpc_scheduler.unit_peak_gb(5000, 1.5)
     big_s = hpc_scheduler.unit_peak_gb(5000, 1.0)
     check(1.9 < big_c / big_s < 2.3,
@@ -848,7 +848,7 @@ def test_resource_detection():
         check(hpc_scheduler.detect_cores() == min(96, available_cores),
               "SLURM core count is bounded by this process's host and affinity")
         check(abs(hpc_scheduler.detect_memory_gb() - 750.0) < 1.0,
-              "SLURM node memory is honoured over /proc/meminfo")
+              "SLURM node memory is honored over /proc/meminfo")
         os.environ.pop("SLURM_MEM_PER_NODE")
         os.environ["SLURM_MEM_PER_CPU"] = "4096"
         check(abs(hpc_scheduler.detect_memory_gb() - 384.0) < 1.0,

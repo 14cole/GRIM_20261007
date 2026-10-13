@@ -1098,6 +1098,12 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 lambda _=False, which="text": self._choose_plot_color(which)
             )
             context.combo_polar_zero.currentIndexChanged.connect(self._on_polar_zero_changed)
+            # A color clamp and tick step belong to the selected display scale.
+            # Reset this tab's controls before any live redraw, including when
+            # switching scales on a line plot before opening another image.
+            context.combo_plot_scale.currentIndexChanged.connect(
+                lambda _=None, c=context: self._reset_plot_color_limits(c)
+            )
             # On the ISAR tab every settings-frame change re-runs the FFT
             # imaging, which is too slow for per-keystroke spinbox updates.
             # Defer everything through the Apply button instead — EXCEPT the
@@ -1948,7 +1954,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 "range_freq": (
                     "Down-range profiles over sliding sub-bands of the selected frequencies, averaged "
                     "over the selected azimuths and elevations. Point scatterers stay "
-                    "at one range; cavities and travelling waves drift. Needs complex "
+                    "at one range; cavities and traveling waves drift. Needs complex "
                     "data on uniformly spaced frequencies. The horizontal axis shows "
                     "sub-band centers; set the width in Plot Settings (100% gives "
                     "one profile using all selected frequencies)."
@@ -2302,7 +2308,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             self._notify_dataset_catalog_changed()
 
     def _on_assembly_branch_dropped(self, branch_name: str, leaf_data: list) -> None:
-        """Build the dragged subtree honouring per-node add modes.
+        """Build the dragged subtree honoring per-node add modes.
 
         We reach into the source AssemblyTree to recover the originating
         QTreeWidgetItem (the flat `leaf_data` list doesn't carry the
@@ -2451,7 +2457,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API name
         """Keep the unified app alive while background physics work runs."""
         if not self.assembly_workspace.response_comparison.can_close():
-            self.status.showMessage("Cancelling response comparison; close again after it stops.")
+            self.status.showMessage("Canceling response comparison; close again after it stops.")
             event.ignore()
             return
         if self._background_job_active() or bool(
@@ -2491,7 +2497,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             QMessageBox.warning(
                 self,
                 "ISAR Calculation Still Running",
-                "The current ISAR calculation was cancelled. Wait for its "
+                "The current ISAR calculation was canceled. Wait for its "
                 "worker to finish, then close GRIM again.",
             )
             self.main_tabs.setCurrentWidget(self.tab_isar)

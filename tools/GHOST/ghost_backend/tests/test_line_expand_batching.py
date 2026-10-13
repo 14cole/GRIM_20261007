@@ -159,7 +159,7 @@ class LineLookBatchingTests(unittest.TestCase):
             def visible(self, points, direction, cancel_check=None):
                 self.calls.append(np.asarray(direction).copy())
                 if cancel_check is not None and cancel_check():
-                    raise InterruptedError("Feature assembly cancelled.")
+                    raise InterruptedError("Feature assembly canceled.")
                 index = np.arange(len(points))
                 return ((index + int(direction[1] > 0.0)) % 4) != 0
 
@@ -193,7 +193,7 @@ class LineLookBatchingTests(unittest.TestCase):
             checks += 1
             return checks >= 3
 
-        with self.assertRaisesRegex(InterruptedError, "cancelled"):
+        with self.assertRaisesRegex(InterruptedError, "canceled"):
             expand_perimeter(
                 _look_batch_size=5,
                 cancel_check=cancel_on_third_direction,

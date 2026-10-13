@@ -259,7 +259,7 @@ amplitude, time-sign, and polarization conventions must be compatible; missing
 supported declarations are recorded as assumptions. Numerical units, fields,
 axes, and placement geometry are checked. Strict library metadata and certified-body profiles
 are optional. Only an explicitly selected strict profile or a large workload
-review requires a warning acknowledgement. The GUI uses the same placement,
+review requires a warning acknowledgment. The GUI uses the same placement,
 phase, expansion, and shadowing implementation.
 
 The integrated tab supports editable placements, point rows/circles/polyline

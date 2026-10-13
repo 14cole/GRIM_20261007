@@ -239,7 +239,7 @@ class TestGuiEntrypoint(unittest.TestCase):
             solver._pending_solve_context = {"uses_geometry_tab": True}
             solver._is_solving = True
             with mock.patch("ghost_backend.ui.solver.QMessageBox.critical") as critical:
-                solver._on_solver_canceled("Solve cancelled by user.")
+                solver._on_solver_canceled("Solve canceled by user.")
 
             critical.assert_not_called()
             self.assertFalse(solver._is_solving)

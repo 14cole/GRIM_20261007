@@ -8,7 +8,7 @@ script, a batch sweep or CI with the same validation the tab performs.
 
 The operator review gate is preserved rather than bypassed.  A plan that the
 tab would make an operator acknowledge is refused here too unless
-``acknowledge_warnings`` is set, and the acknowledgement is bound to that
+``acknowledge_warnings`` is set, and the acknowledgment is bound to that
 plan's sha256 exactly as the tab binds it.
 """
 
@@ -93,7 +93,7 @@ def prepare_recipe(
     )
     values = model.values
     # Mirror the tab's gate: manifest/certification policies and any workload
-    # threshold crossing require an explicit acknowledgement.
+    # threshold crossing require an explicit acknowledgment.
     review = bool(
         values.require_feature_manifests
         or values.require_body_mesh_certification
@@ -171,7 +171,7 @@ def _emit(prepared: PreparedRecipe, *, stream=sys.stdout) -> None:
             print(f"warning ({label}): {message}", file=stream)
     print(
         "review   : "
-        + ("acknowledgement required" if prepared.review_required else "not required"),
+        + ("acknowledgment required" if prepared.review_required else "not required"),
         file=stream,
     )
 
@@ -283,7 +283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"features : {dispatch.features_only_output_path}")
         return 0
     except InterruptedError as exc:
-        print(f"cancelled: {exc}", file=sys.stderr)
+        print(f"canceled: {exc}", file=sys.stderr)
         return 130
     except Exception as exc:  # actionable message, not a traceback
         _finish_progress(args.quiet)

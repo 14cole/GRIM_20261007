@@ -52,7 +52,7 @@ def validate_study(path, cancel_check=lambda: False):
     rows, seen = [], set()
     for case in cases:
         if cancel_check():
-            raise InterruptedError("Family study cancelled.")
+            raise InterruptedError("Family study canceled.")
         family, identity = str(case.get("family","")), str(case.get("id",""))
         if family not in FAMILIES or not identity or identity in seen:
             raise ValueError("Family cases need unique IDs and a supported family.")

@@ -608,7 +608,7 @@ class DatasetOpsMixin:
         if bool(payload.get("cancelled", False)):
             self.status.showMessage(
                 f"{self._background_worker_name or 'Dataset operation'} "
-                "cancelled; no unfinished result was published."
+                "canceled; no unfinished result was published."
             )
             return
         if not bool(payload.get("ok", False)):
@@ -679,7 +679,7 @@ class DatasetOpsMixin:
                     from GRIM_Backend.ui.table_import import create_table_import_dialog
                     dialog = create_table_import_dialog(self, path)
                     if dialog.exec() != QDialog.Accepted:
-                        self._import_cycle_results.append((f"Skipped {filename} (column labeling cancelled).", False))
+                        self._import_cycle_results.append((f"Skipped {filename} (column labeling canceled).", False))
                         continue
                     dataset = dialog.dataset
                     if not isinstance(dataset, RcsGrid):
@@ -2939,7 +2939,7 @@ class DatasetOpsMixin:
                 buttons.No,
             )
             if answer != buttons.Yes:
-                self.status.showMessage("Delete cancelled; unsaved datasets were kept.")
+                self.status.showMessage("Delete canceled; unsaved datasets were kept.")
                 return
         deleted_rows = []
         for row in sorted(rows):
@@ -3086,7 +3086,7 @@ class DatasetOpsMixin:
                 "filename sanitizing and case-folding. Rename them before saving:\n\n"
                 + details,
             )
-            self.status.showMessage("Save cancelled: duplicate output names.")
+            self.status.showMessage("Save canceled: duplicate output names.")
             return False
 
         directory_targets = [path for path in targets if os.path.isdir(path)]
@@ -3097,7 +3097,7 @@ class DatasetOpsMixin:
                 "A planned dataset output is an existing directory:\n\n"
                 + "\n".join(directory_targets),
             )
-            self.status.showMessage("Save cancelled: an output target is a directory.")
+            self.status.showMessage("Save canceled: an output target is a directory.")
             return False
 
         existing = [path for path in targets if os.path.lexists(path)]
@@ -3115,7 +3115,7 @@ class DatasetOpsMixin:
                 buttons.No,
             )
             if answer != buttons.Yes:
-                self.status.showMessage("Save cancelled; no files were changed.")
+                self.status.showMessage("Save canceled; no files were changed.")
                 return False
 
         save_entries: list[tuple[RcsGrid, str, str]] = []
@@ -3124,7 +3124,7 @@ class DatasetOpsMixin:
             name_item = self.table.item(row, 0)
             if name_item is None:
                 self.status.showMessage(
-                    "Save cancelled: a planned dataset row is no longer available."
+                    "Save canceled: a planned dataset row is no longer available."
                 )
                 return False
             dataset_id = str(name_item.data(DATASET_ID_ROLE) or "")
@@ -3331,7 +3331,7 @@ class DatasetOpsMixin:
         action_pbp_rcs = pbp_menu.addAction("Heatmap (RCS Value)")
         action_pbp_rcs.setCheckable(True)
         action_pbp_rcs.setChecked(self.pbp_fill_mode == "heatmap_rcs")
-        action_pbp_density = pbp_menu.addAction("Heatmap (Overlap Density)")
+        action_pbp_density = pbp_menu.addAction("Heatmap (Valid-Cut Coverage)")
         action_pbp_density.setCheckable(True)
         action_pbp_density.setChecked(self.pbp_fill_mode == "heatmap_density")
         controls = getattr(self, "analysis_controls", None)
@@ -3701,7 +3701,7 @@ class DatasetOpsMixin:
             )
             if answer != buttons.Yes:
                 self.status.showMessage(
-                    "Regrid cancelled: coarser point sampling was not confirmed."
+                    "Regrid canceled: coarser point sampling was not confirmed."
                 )
                 return
         downsampled_set = set(downsampled)
@@ -4392,7 +4392,7 @@ class DatasetOpsMixin:
         )
         if answer != buttons.Yes:
             self.status.showMessage(
-                "El→Az360 cancelled: the acquisition-specific relabel was not confirmed."
+                "El→Az360 canceled: the acquisition-specific relabel was not confirmed."
             )
             return
 
@@ -5626,13 +5626,13 @@ class DatasetOpsMixin:
         duplicate_groups = _duplicate_target_groups(targets)
         if duplicate_groups:
             self.status.showMessage(
-                "CSV export cancelled: multiple datasets resolve to the same filename."
+                "CSV export canceled: multiple datasets resolve to the same filename."
             )
             return
         invalid_targets = [path for path in targets if os.path.isdir(path)]
         if invalid_targets:
             self.status.showMessage(
-                "CSV export cancelled: an output target is an existing directory."
+                "CSV export canceled: an output target is an existing directory."
             )
             return
 
@@ -5651,7 +5651,7 @@ class DatasetOpsMixin:
                 buttons.No,
             )
             if answer != buttons.Yes:
-                self.status.showMessage("CSV export cancelled; no files were changed.")
+                self.status.showMessage("CSV export canceled; no files were changed.")
                 return
 
         row_counts = [math.prod(dataset.rcs_power.shape) for dataset, _ in entries]
@@ -5696,7 +5696,7 @@ class DatasetOpsMixin:
                 buttons.No,
             )
             if answer != buttons.Yes:
-                self.status.showMessage("Large CSV export cancelled.")
+                self.status.showMessage("Large CSV export canceled.")
                 return
 
         estimates_by_directory: dict[str, int] = {}

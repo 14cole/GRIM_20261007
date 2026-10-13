@@ -195,9 +195,9 @@ def test_waiting_process_tiles_respond_to_cancellation_and_close_workers():
     executor = FakeExecutor(waiting=True)
     def checkpoint():
         if executor.wait_attempts:
-            raise InterruptedError('cancelled')
+            raise InterruptedError('canceled')
     with mock.patch('concurrent.futures.ProcessPoolExecutor', return_value=executor):
-        with pytest.raises(InterruptedError, match='cancelled'):
+        with pytest.raises(InterruptedError, match='canceled'):
             list(tile_processes.compressed_tiles(FakeOracle(), [FakeOperator()], 2, b'', checkpoint))
     assert executor.closed
     assert executor.wait_attempts == 1

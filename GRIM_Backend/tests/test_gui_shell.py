@@ -1364,7 +1364,7 @@ class UnifiedGuiShellTest(unittest.TestCase):
 
             self.assertEqual(len(self.window._pending_import_batches), 1)
             self.assertEqual(self.window.table.rowCount(), 0)
-            self.window._on_isar_compute_done({}, "ISAR cancelled for test")
+            self.window._on_isar_compute_done({}, "ISAR canceled for test")
             self._wait_for_background()
 
             self.assertEqual(self.window._pending_import_batches, [])

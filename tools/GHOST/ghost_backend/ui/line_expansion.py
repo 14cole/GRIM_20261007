@@ -105,7 +105,7 @@ class _ExpansionWorker(QObject):
                 **self.arguments,
             )
         except InterruptedError as exc:
-            self.canceled.emit(str(exc) or "Line expansion cancelled.")
+            self.canceled.emit(str(exc) or "Line expansion canceled.")
         except Exception as exc:
             self.error.emit(str(exc) or type(exc).__name__)
         else:
@@ -583,7 +583,7 @@ class LineExpansionTab(QWidget):
             self._abort_event.set()
             self.cancel_button.setEnabled(False)
             self._set_status(
-                "Cancelling after the current section; no partial output "
+                "Canceling after the current section; no partial output "
                 "will be saved."
             )
 

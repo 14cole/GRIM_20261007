@@ -1938,7 +1938,7 @@ def solve_monostatic_rcs_bor(
 
     def check_abort():
         if abort_event is not None and abort_event.is_set():
-            raise InterruptedError("Solve cancelled by user.")
+            raise InterruptedError("Solve canceled by user.")
 
     from ghost_backend.bor.samples import channel_buffers, finish_channels, nonfinite_sample_count
     samples_by_pol = channel_buffers(len(frequencies), aspects, expand_to_360)

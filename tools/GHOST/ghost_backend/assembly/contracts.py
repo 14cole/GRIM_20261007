@@ -69,7 +69,7 @@ def _apply_feature_library_contracts(
         line_coefficients: 'dict[str, tuple[Any, ...]]' = {}
         for placement, record in zip(placements, records):
             if cancel_check is not None and cancel_check():
-                raise InterruptedError("Feature placement validation cancelled.")
+                raise InterruptedError("Feature placement validation canceled.")
             dataset_id = str(record["dataset_id"])
             dataset_value = record.get("dataset")
             dataset_digest = record.get("dataset_sha256")

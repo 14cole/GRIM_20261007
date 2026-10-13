@@ -40,7 +40,8 @@ def _series(self, reference, dataset, name, selection, polarization):
             else:
                 raw = dataset.rcs_power[az_indices, elev_idx, freq_idx, pol_indices[0]]
             display = self._display_from_values(
-                dataset, raw, frequency_value=native_frequency
+                dataset, raw, frequency_value=native_frequency,
+                preserve_zeros=self._button_checked(self.btn_pbp)
             )
             label = (
                 f"{name} | Pol {pol_value}, Freq {frequency:.12g} {freq_unit}, "
@@ -110,13 +111,14 @@ def render(self) -> None:
     omitted = 0
     bands = self._new_pbp_bands(datasets) if pbp_active else None
     for name, dataset, selection in plans:
+        line_breaks = common.selection_breaks(reference, dataset, "azimuth", selection[0], az_values) if bands is None else ()
         candidates = len(selection[1]) * len(selection[2])
         if bands is None and rendered >= common.MAX_LINE_SERIES:
             omitted += candidates
             continue
         series = _series(self, reference, dataset, name, selection, polarization)
         for candidate_index, (x_values, display, label, trace_key) in enumerate(series):
-            if not np.any(np.isfinite(display)):
+            if not np.any(np.isfinite(display) | ((bands is not None) & np.isneginf(display))):
                 continue
             if bands is not None:
                 bands.update(dataset, display, polarization=(
@@ -125,7 +127,8 @@ def render(self) -> None:
                 rendered += 1
             elif rendered < common.MAX_LINE_SERIES:
                 self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
-                                        dataset=dataset, trace_key=trace_key)
+                                        dataset=dataset, trace_key=trace_key,
+                                        break_before=line_breaks)
                 rendered += 1
                 if rendered >= common.MAX_LINE_SERIES:
                     omitted += candidates - candidate_index - 1
@@ -149,6 +152,8 @@ def render(self) -> None:
         bands.draw(
             az_values, f"{pol_label}Freq {freq_label}, {elev_name} {elev_label}",
             polar=False,
+            break_before=common.selection_breaks(reference, reference, "azimuth",
+                self._axis_selection_for_dataset(reference, reference, "azimuth", az_values), az_values),
         )
 
     if rendered == 0:

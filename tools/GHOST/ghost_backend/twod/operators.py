@@ -585,7 +585,7 @@ def _touching_geometry(obs_elem, src_elem, obs_interval, src_interval,
 
     Separations are formed as (corner offset) + x d_obs - y d_src, so points
     within 1e-10 element lengths of the corner keep their relative accuracy
-    instead of cancelling two absolute positions.
+    instead of canceling two absolute positions.
     """
     corner_o, d_o, base_o, step_o = _touching_frame(obs_elem, obs_interval, obs_start_is_shared)
     corner_s, d_s, base_s, step_s = _touching_frame(src_elem, src_interval, src_start_is_shared)
@@ -989,9 +989,9 @@ def _single_layer_self_block_composite(
     O(1) beyond 40). The element is split into m equal sub-intervals with
     |k| l / m <= 2 (at most 8 once m exceeds 256): the exact series integrates
     each sub-interval's own block, the graded corner rule each pair of
-    neighbours, and a 16-point tensor rule the separated pairs, all in the
+    neighbors, and a 16-point tensor rule the separated pairs, all in the
     parent element's linear basis. The element is straight, so the kernel of
-    every neighbour pair depends on x + y alone and that of every separated pair
+    every neighbor pair depends on x + y alone and that of every separated pair
     on the index offset alone: one kernel evaluation per offset serves all
     pairs. Separated pairs attenuated below exp(-45) by a lossy wavenumber are
     skipped.
@@ -1015,7 +1015,7 @@ def _single_layer_self_block_composite(
     def phi(x):
         return np.stack((1.0 - x, x), axis=-1)
 
-    # Neighbour sub-intervals meet at s = (i + 1) h; local distances from it.
+    # Neighbor sub-intervals meet at s = (i + 1) h; local distances from it.
     x, y, weights = _touching_rule(_TOUCHING_RADIAL_ORDER)
     green = _green_2d_array(k, ell * h * (x + y)) * weights
     shared = (np.arange(m - 1) + 1.0) * h
@@ -1190,7 +1190,7 @@ def _integrate_linear_pair_adaptive_sk(
     for its parent's error estimate is reused as its own coarse estimate.
 
     The error denominator is the sum of child-block norms, rather than the
-    norm of their possibly cancelling sum.  This prevents a physical null in
+    norm of their possibly canceling sum.  This prevents a physical null in
     one 2x2 block from making the convergence test spuriously permissive.
     Failure at ``max_depth`` is explicit: silently accepting an unresolved
     close-gap interaction can produce a small linear-system residual for the
@@ -1303,7 +1303,7 @@ def _hypersingular_block_from_s_block(
     """
     Compute the 2x2 hypersingular D block from the single-layer S block via Maue identity.
 
-    The Maue regularisation recasts the hypersingular kernel integral as:
+    The Maue regularization recasts the hypersingular kernel integral as:
         D_ij = -k^2 (n_obs . n_src) S_ij
              + (1/(L_obs*L_src)) * tangent_outer_ij * sum(S_block)
 
@@ -1354,7 +1354,7 @@ def _env_float(name: 'str', default: 'float') -> 'float':
 
 
 # Far pairs of an attenuating medium whose kernels are negligible are skipped:
-# with lower a lower bound of the point-pair distance (centre distance less
+# with lower a lower bound of the point-pair distance (center distance less
 # half of each length), |i H0(kr)/4| <= exp(-a)/sqrt(8 pi a) for a = -Im(k)
 # lower > 1 (DLMF 10.27.8, 10.32.9), below 1e-18 of the near-diagonal kernel
 # scale at the cut of 40 (the compressed backend applies the same bound at 32
@@ -1429,7 +1429,7 @@ def _assembly_tile_size(nelems: 'int', bytes_per_entry: 'int') -> 'int':
 
 # Calibrated far-rule orders per polynomial degree: rows (|k| Lmax bound,
 # (near, mid, far) for degree 1, 2, 3), where near, mid and far are the columns
-# for a smallest centre-distance ratio below 5, below 10, and from 10 up. Each
+# for a smallest center-distance ratio below 5, below 10, and from 10 up. Each
 # order is the smallest Gauss rule whose element-pair blocks stay within 1e-12
 # of an independent 48-point rule over the bin: S relative to the block's
 # largest entry, K' and D relative to the integral of the kernel magnitude (the
@@ -1730,7 +1730,7 @@ def _near_fixed_order_positions(
 
     The per-pair route applies three exclusions -- a self panel, a pair sharing
     an endpoint, and a pair close enough to need the adaptive rule -- and orders
-    the rest from the centre-distance ratio. Each is a geometric predicate, so
+    the rest from the center-distance ratio. Each is a geometric predicate, so
     all of them evaluate as arrays; doing it a pair at a time was the largest
     interpreter-locked stretch of the assembly and what kept it from using its
     threads.

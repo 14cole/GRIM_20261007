@@ -351,7 +351,7 @@ def _resample_azimuth_to_target(
     arcs don't get aliased by a long way-round wrap.
 
     Real and imaginary parts are interpolated independently — interpolating
-    magnitude or argument introduces phase-wrap artefacts.
+    magnitude or argument introduces phase-wrap artifacts.
     """
     source = np.asarray(source_deg, dtype=float)
     target = np.asarray(target_deg, dtype=float)
@@ -415,7 +415,7 @@ def _block_reduce_max(a: np.ndarray, factor: int, axis: int) -> np.ndarray:
 
 def _decimate_display_max(img: np.ndarray, max_side: int = 4096) -> np.ndarray:
     """Reduce an oversized display image with per-block MAX so bright
-    scatterers survive. imshow's nearest-neighbour draw-time resampling drops
+    scatterers survive. imshow's nearest-neighbor draw-time resampling drops
     ~97% of the pixels of a 36000-wide image in a ~1000-px viewport — point
     responses visibly blink in and out while panning. Max-pooling to a
     screen-comparable size keeps every peak (max in dB == max in linear).
@@ -574,7 +574,7 @@ def _compute_band_polar_format(
         return "ISAR computation superseded."
     isar_complex = np.fft.fftshift(isar_complex, axes=(0, 1))
     # Undo the padded 1/(n_az_fft·n_freq_fft) so amplitudes match the
-    # canonical unpadded ifft2 normalisation.
+    # canonical unpadded ifft2 normalization.
     # Normalize by the actual coherent aperture gain, not merely the number
     # of samples. This keeps a unit point target at 0 dB for every taper and
     # when gridding/missing-data masks reduce the usable k-space support.
@@ -1553,13 +1553,13 @@ def _compute_band_sparse_l1(
 ):
     """Experimental fixed-λ complex LASSO image reconstruction.
 
-    The accurately regridded Cartesian phase history ``S`` is modelled by a
+    The accurately regridded Cartesian phase history ``S`` is modeled by a
     partial Fourier operator, and FISTA solves
 
         min_X  ½‖W(A·X − S)‖₂² + λ‖X‖₁,
         λ = strength · ‖AᴴW²S‖_∞.
 
-    This is a penalised LASSO problem, *not* residual-constrained BPDN and not
+    This is a penalized LASSO problem, *not* residual-constrained BPDN and not
     target/contaminant decomposition.  Pixel sparsity may suppress sidelobes,
     noise, weak real returns, or distributed scattering alike; it cannot
     identify or remove a pylon, bird, cavity return, or other physical source.
@@ -1838,7 +1838,7 @@ def _compute_band_sparse_l1(
 
     # No rescale needed: a unit-amplitude scatterer produces |S| = 1 under the
     # forward model, so the recovered X IS the physical reflectivity (≈ 1 →
-    # 0 dB), matching the FFT path's normalisation convention.
+    # 0 dB), matching the FFT path's normalization convention.
     x_range, y_range = _scene_axes(
         n_az_fft, n_freq_fft, theta, freq_hz, df, unit_scale,
         elevation_deg=elevation_deg,
@@ -2544,8 +2544,8 @@ def _compute_band_composite(
     y_axis = np.linspace(-hy, hy, side)
     xq = axis[:, None].astype(np.float32)
     yq = y_axis[None, :].astype(np.float32)
-    comp = np.zeros(
-        (side, side), dtype=np.float32
+    comp = np.full(
+        (side, side), np.nan, dtype=np.float32
     )
     az_nonuni = 0.0
     fr_nonuni = 0.0
@@ -2648,8 +2648,11 @@ def _compute_band_composite(
             + mag[ix, iy + 1] * (1 - wx) * wy
             + mag[ix + 1, iy + 1] * wx * wy
         )
-        val[~valid] = np.float32(0.0)
-        np.maximum(comp, val, out=comp)
+        # Unknown body-grid cells are not measured zero returns. fmax keeps a
+        # previous contributing look when this look is unavailable, while an
+        # unknown-only cell stays NaN through display, artifacts, and ROI stats.
+        val[~valid] = np.nan
+        np.fmax(comp, val, out=comp)
         del r, mag, fx, fy, ix, iy, valid, wx, wy, val
         if _cancel_requested(cancel_check):
             return "ISAR computation superseded."
@@ -2677,6 +2680,7 @@ def _compute_band_composite(
             for chunk, center in chunk_specs
         ],
         "composite_aggregation": "maximum_magnitude",
+        "magnitude_missing_value": "nan_outside_sublook_coverage",
         "composite_look_diagnostics": look_diagnostics,
         "image_contract": {"version": 1, "image_plane": "horizontal", "phase_convention": "unavailable",
             "phase_center": "dataset_fixed_origin", "amplitude_normalization": "maximum_unit_point_look_gain",

@@ -452,7 +452,7 @@ class _RangeCalibrationWorker(QObject):
 
         for index, (target_name, target) in enumerate(self._targets, start=1):
             if QThread.currentThread().isInterruptionRequested():
-                failed.append("cancelled by user")
+                failed.append("canceled by user")
                 break
             try:
                 calibrated = target.range_calibrate(

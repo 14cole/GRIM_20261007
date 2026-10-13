@@ -78,7 +78,7 @@ def project_to_surface(points_m, *, surface=None, profile=None, cancel_check=lam
         raise ValueError("Choose a matching surface mesh or an embedded BoR body first.")
     for start in range(0, len(points), 128):
         if cancel_check():
-            raise InterruptedError("Surface projection cancelled.")
+            raise InterruptedError("Surface projection canceled.")
         sl = slice(start, start+128)
         if surface is not None:
             _, nearest[sl], normals[sl], _ = surface.nearest(points[sl])
@@ -457,7 +457,7 @@ class PlacementEditor(QDialog):
     def reject(self):
         if self._thread is not None:
             self._cancel.set()
-            self.status.setText("Cancelling surface helper; close again when it has stopped.")
+            self.status.setText("Canceling surface helper; close again when it has stopped.")
             return
         if self.rows() != self._saved_rows and QMessageBox.question(self, "Discard edits?", "Close without saving placement edits?", QMessageBox.Discard | QMessageBox.Cancel) != QMessageBox.Discard:
             return

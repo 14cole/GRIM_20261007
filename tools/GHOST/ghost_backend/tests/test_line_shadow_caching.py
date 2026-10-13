@@ -283,7 +283,7 @@ class LineShadowCachingTests(unittest.TestCase):
             # One setup check precedes the per-look checks.
             return checks >= 4
 
-        with self.assertRaisesRegex(InterruptedError, "cancelled"):
+        with self.assertRaisesRegex(InterruptedError, "canceled"):
             feature_sum._precompute_line_shadow_visibility(
                 ((origins, back_normals, "seal"),),
                 directions,

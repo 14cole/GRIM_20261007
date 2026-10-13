@@ -103,7 +103,7 @@ def test_remaining_cache_is_subtracted_from_inverse_storage_budget(enabled):
 def test_cancelled_reused_solve_propagates_without_rebuild_or_cache(enabled):
     f=factor(np.eye(16));f.solve(np.ones(16));f.retain_preconditioner()
     g=factor(np.eye(16),frequency=10.05)
-    g.checkpoint=mock.Mock(side_effect=InterruptedError('cancelled'))
+    g.checkpoint=mock.Mock(side_effect=InterruptedError('canceled'))
     with pytest.raises(InterruptedError):g.solve(np.ones(16))
     assert g.event['factorizations']==0 and recycling.live_bytes()==0
 

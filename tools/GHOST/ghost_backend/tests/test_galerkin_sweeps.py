@@ -87,7 +87,7 @@ class GalerkinSweepTests(unittest.TestCase):
         def checkpoint():
             calls.append(1)
             if len(calls) == 2:
-                raise InterruptedError('cancelled')
+                raise InterruptedError('canceled')
         factor.checkpoint = checkpoint
         with self.assertRaises(InterruptedError):
             solve(factor, rhs, SweepBasis(256))

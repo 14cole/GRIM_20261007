@@ -93,7 +93,7 @@ def reduce_phase(field, config):
     return result, count
 
 
-def display_values(dataset, values, *, phase, scale, frequency):
+def display_values(dataset, values, *, phase, scale, frequency, preserve_zeros=False):
     values = np.asarray(values, dtype=float)
     if phase:
         if str((dataset.units or {}).get("phase_wrap", "-180_180")) == "0_360":
@@ -101,10 +101,10 @@ def display_values(dataset, values, *, phase, scale, frequency):
         return np.mod(values + 180., 360.) - 180.
     if scale == "linear":
         return values
-    return dataset.linear_to_default_db(np.where(values > 0., values, np.nan), frequency_value=frequency, eps=0.)
+    return dataset.linear_to_default_db(np.where((values > 0.) | (preserve_zeros & (values == 0.)), values, np.nan), frequency_value=frequency, eps=0.)
 
 
-def iter_series(name, dataset, reference, selection, *, sweep_axis, config=None, phase=False, scale="dbsm"):
+def iter_series(name, dataset, reference, selection, *, sweep_axis, config=None, phase=False, scale="dbsm", preserve_zeros=False):
     """Yield x, y, informative label and semantic identity for each cut."""
     config = options(config)
     az_idx, el_idx, fr_idx, pol_idx = selection
@@ -145,7 +145,7 @@ def iter_series(name, dataset, reference, selection, *, sweep_axis, config=None,
                 reduced, count = reduce_phase(block, config) if phase else reduce_power(block, config)
                 description = short_statistic(config, phase=phase)
                 az_identity = tuple(float(value) for value in az_native)
-            display = display_values(dataset, reduced, phase=phase, scale=scale, frequency=frequency)
+            display = display_values(dataset, reduced, phase=phase, scale=scale, frequency=frequency, preserve_zeros=preserve_zeros)
             low_count, high_count = int(np.min(count)), int(np.max(count))
             coverage = f"n{low_count}/{len(group)}" if low_count == high_count else f"n{low_count}–{high_count}/{len(group)}"
             label = (f"{name} | Pol {dataset.polarizations[pol_idx]}, {fixed_name} {fixed_display:.6g} "

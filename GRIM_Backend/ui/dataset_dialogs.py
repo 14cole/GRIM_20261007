@@ -1545,7 +1545,7 @@ class TimeGateDialog(QDialog):
     """Choose a down-range gate with a live preview of the active dataset.
 
     The preview is the median Hann-windowed down-range profile over azimuth
-    for one elevation and polarization, before (gray) and after (colour)
+    for one elevation and polarization, before (gray) and after (color)
     gating, in dB relative to the ungated peak. The gate itself is applied
     without a window so in-gate responses keep their calibrated level.
     """

@@ -2421,7 +2421,7 @@ class FeatureAssemblyFormModel:
         # it through so a cache miss does not immediately reread every large
         # GRIM/STL response before the authoritative prepare operation.
         # A user-requested re-validation is a new review attempt: the old plan
-        # must not remain publishable if this attempt fails or is cancelled.
+        # must not remain publishable if this attempt fails or is canceled.
         self.invalidate_prepared_plan()
         semantic_before = self._semantic_signature()
         if before is None:
@@ -2429,7 +2429,7 @@ class FeatureAssemblyFormModel:
         if cancel_check is not None and cancel_check():
             self.invalidate_prepared_plan()
             raise InterruptedError(
-                "Placement validation cancelled; no reviewed plan was retained."
+                "Placement validation canceled; no reviewed plan was retained."
             )
         try:
             if _callable_accepts_runtime_hooks(adapter.prepare):
@@ -2446,7 +2446,7 @@ class FeatureAssemblyFormModel:
         if cancel_check is not None and cancel_check():
             self.invalidate_prepared_plan()
             raise InterruptedError(
-                "Placement validation cancelled; no reviewed plan was retained."
+                "Placement validation canceled; no reviewed plan was retained."
             )
         after = self._source_fingerprints()
         semantic_after = self._semantic_signature()
@@ -2473,7 +2473,7 @@ class FeatureAssemblyFormModel:
         if cancel_check is not None and cancel_check():
             self.invalidate_prepared_plan()
             raise InterruptedError(
-                "Placement validation cancelled; no reviewed plan was retained."
+                "Placement validation canceled; no reviewed plan was retained."
             )
         self._prepared_plan_cache = _PreparedPlanCache(
             plan=plan,
@@ -2668,7 +2668,7 @@ class FeatureAssemblyFormModel:
         self._validate_output_target()
         if cancel_check is not None and cancel_check():
             raise InterruptedError(
-                "Feature assembly cancelled; existing output kept."
+                "Feature assembly canceled; existing output kept."
             )
         plan_features_path = getattr(plan, "features_only_output_path", None)
         features_path = (
@@ -2747,7 +2747,7 @@ class FeatureAssemblyFormModel:
                 _normalized_grim_output_path(self.values.output_grim, base_dir=self.values.base_dir),
                 cancel_check=cancel_check)
             if updated is not cache.plan:
-                # The acknowledgement covers unchanged physics and warnings;
+                # The acknowledgment covers unchanged physics and warnings;
                 # only publication guards have been re-sealed by the backend.
                 if acknowledged_plan_sha256 == getattr(cache.plan, "prepared_plan_sha256", None):
                     acknowledged_plan_sha256 = updated.prepared_plan_sha256
@@ -2756,7 +2756,7 @@ class FeatureAssemblyFormModel:
         check_reviewed_destinations()
         if cancel_check is not None and cancel_check():
             raise InterruptedError(
-                "Feature assembly cancelled; existing output kept."
+                "Feature assembly canceled; existing output kept."
             )
         plan_features_path = getattr(
             cache.plan, "features_only_output_path", None

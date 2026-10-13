@@ -222,7 +222,7 @@ def test_numpy_unavailable_uses_finite_scalar_cutoff(pol, monkeypatch):
 def test_thick_loss_scaling_after_cutoff_and_sheet(pol):
     layers = [slab(), sheet(), slab(2.0, 10.0 - 10.0j)]
     freq, angle = 18.0, 45.0
-    # A two-metre absorbing layer is an independent half-space limit at 18 GHz.
+    # A two-meter absorbing layer is an independent half-space limit at 18 GHz.
     omega = 2 * math.pi * freq * 1e9
     kz = cmath.sqrt(omega ** 2 * c.MU0 * c.EPS0 * (10 - 10j - 0.5))
     load = omega * c.MU0 / kz if pol == "te" else kz / (omega * c.EPS0 * (10 - 10j))

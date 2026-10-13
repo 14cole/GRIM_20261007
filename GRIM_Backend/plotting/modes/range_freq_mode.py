@@ -3,7 +3,7 @@
 Each column is the range profile of one sub-band: the selected complex
 sweeps are windowed, inverse-FFT'd with zero padding, and their power is
 averaged over the selected azimuths and elevations. A point scatterer stays at
-one range in every sub-band; cavities, travelling waves, and resonances drift
+one range in every sub-band; cavities, traveling waves, and resonances drift
 in range or appear only in part of the band. Profiles are scaled by the
 window's coherent gain, so an isolated point shows its own level at its peak.
 """

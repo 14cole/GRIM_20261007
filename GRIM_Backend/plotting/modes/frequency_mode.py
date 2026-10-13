@@ -54,6 +54,7 @@ def _frequency_series(
         name, dataset, reference, (az_indices, elev_indices, freq_indices, pol_indices),
         sweep_axis="frequency", config=sweep_analysis.owner_options(self),
         phase=self._button_checked(self.btn_phase), scale=self._plot_scale_mode(),
+        preserve_zeros=self._button_checked(self.btn_pbp),
     )
 
 
@@ -160,13 +161,14 @@ def render(self) -> None:
     bands = self._new_pbp_bands(datasets) if pbp_active else None
     for plan in plans:
         name, dataset, selection = plan
+        line_breaks = common.selection_breaks(reference, dataset, "frequency", selection[0], freq_values) if bands is None else ()
         candidates = len(selection[2]) * (len(selection[1]) if individual else 1)
         if bands is None and rendered >= common.MAX_LINE_SERIES:
             omitted += candidates
             continue
         series = series_for(plan)
         for candidate_index, (x_values, display, label, trace_key) in enumerate(series):
-            if not np.any(np.isfinite(display)):
+            if not np.any(np.isfinite(display) | ((bands is not None) & np.isneginf(display))):
                 continue
             if bands is not None:
                 bands.update(dataset, display, polarization=(
@@ -175,7 +177,8 @@ def render(self) -> None:
                 rendered += 1
             elif rendered < common.MAX_LINE_SERIES:
                 self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
-                                        dataset=dataset, trace_key=trace_key)
+                                        dataset=dataset, trace_key=trace_key,
+                                        break_before=line_breaks)
                 rendered += 1
                 if rendered >= common.MAX_LINE_SERIES:
                     omitted += candidates - candidate_index - 1
@@ -197,6 +200,8 @@ def render(self) -> None:
             f"{pol_label}{elev_name} {elev_label}, "
             f"{sweep_analysis.statistic_name(config, phase=self._button_checked(self.btn_phase))} over {az_name} ({az_values[0]:g},{az_values[-1]:g}) {az_unit}",
             polar=False,
+            break_before=common.selection_breaks(reference, reference, "frequency",
+                self._axis_selection_for_dataset(reference, reference, "frequency", freq_values), freq_values),
         )
 
     if rendered == 0:

@@ -217,7 +217,7 @@ if GUI_AVAILABLE:
                 )
             except InterruptedError as exc:
                 self.cancelled.emit(
-                    str(exc) or "Feature assembly cancelled; existing output kept."
+                    str(exc) or "Feature assembly canceled; existing output kept."
                 )
             except Exception as exc:  # The UI reports authoritative validation errors.
                 self.failed.emit(str(exc) or type(exc).__name__)
@@ -811,7 +811,7 @@ if GUI_AVAILABLE:
             current = item
             while current is not None:
                 # The body is the required host response, not a switchable
-                # feature group. Keep its Use cell labelled ``Required`` while
+                # feature group. Keep its Use cell labeled ``Required`` while
                 # its point/line children summarize their own selections.
                 if current.data(0, self._ROLE_KIND) == "body":
                     break
@@ -2804,7 +2804,7 @@ if GUI_AVAILABLE:
                     )
                     if answer != QMessageBox.StandardButton.Yes:
                         self.status_changed.emit(
-                            "Surface binding refresh cancelled; existing sidecar kept."
+                            "Surface binding refresh canceled; existing sidecar kept."
                         )
                         return
             except Exception as exc:
@@ -3530,19 +3530,19 @@ if GUI_AVAILABLE:
             self._worker.request_cancel()
             self.cancel_operation_button.setEnabled(False)
             if self._active_kind == "wing":
-                self.operation_progress.setFormat("Cancelling wing expansion safely…")
+                self.operation_progress.setFormat("Canceling wing expansion safely…")
                 self.status_changed.emit(
                     "Wing expansion cancellation requested. Finishing the "
                     "current section; no partial output will be published."
                 )
             elif self._active_kind == "preview":
-                self.operation_progress.setFormat("Cancelling validation safely…")
+                self.operation_progress.setFormat("Canceling validation safely…")
                 self.status_changed.emit(
                     "Validation cancellation requested. Finishing the current safe "
                     "check; no reviewed plan will be retained."
                 )
             else:
-                self.operation_progress.setFormat("Cancelling assembly safely…")
+                self.operation_progress.setFormat("Canceling assembly safely…")
                 self.status_changed.emit(
                     "Assembly cancellation requested. Finishing the current safe "
                     "numerical step; no partial output will be published."
@@ -4585,7 +4585,7 @@ if GUI_AVAILABLE:
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     self.status_changed.emit(
-                        "Assembly cancelled; existing output files kept."
+                        "Assembly canceled; existing output files kept."
                     )
                     return
             build_estimate = self._validated_build_work_estimate()
@@ -4617,7 +4617,7 @@ if GUI_AVAILABLE:
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     self.status_changed.emit(
-                        "Large Assembly workload cancelled before computation; "
+                        "Large Assembly workload canceled before computation; "
                         "existing output files kept."
                     )
                     return
@@ -4746,20 +4746,20 @@ if GUI_AVAILABLE:
                 self.model.invalidate_prepared_plan()
                 self._preview_is_current = False
                 stale_message = (
-                    "Validation cancelled — the Assembly preview is not a current "
+                    "Validation canceled — the Assembly preview is not a current "
                     "authoritative review."
                 )
                 self._clear_validation_qa(
-                    "Validation cancelled. Assembly remains locked; run Validate "
+                    "Validation canceled. Assembly remains locked; run Validate "
                     "placements again when ready."
                 )
                 self.status_changed.emit(
                     text
-                    or "Placement validation cancelled; no reviewed plan was retained."
+                    or "Placement validation canceled; no reviewed plan was retained."
                 )
                 self.preview_stale.emit(stale_message)
                 return
-            self.status_changed.emit(text or "Assembly cancelled; existing output kept.")
+            self.status_changed.emit(text or "Assembly canceled; existing output kept.")
 
         @Slot(object)
         def _operation_succeeded(self, result: Any) -> None:

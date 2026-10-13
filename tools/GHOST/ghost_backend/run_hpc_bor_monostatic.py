@@ -1217,7 +1217,7 @@ def worker(run_dir_str, job_index, node_index):
     others = [u for u in units if _unit_claim_key(u) not in mine_keys]
     # Planned share first (dearest first), then everyone else's as a steal
     # pool. Array tasks are interchangeable: nothing is stranded when a task is
-    # cancelled, preempted, or never scheduled.
+    # canceled, preempted, or never scheduled.
     candidates = sorted(mine, key=_order_key) + sorted(others, key=_order_key)
 
     cores    = _detect_cores()

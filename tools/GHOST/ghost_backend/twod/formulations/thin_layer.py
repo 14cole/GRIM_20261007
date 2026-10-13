@@ -20,7 +20,7 @@ class ThinLayerDefinition:
             raise ValueError("Thin layer requires: flag thin_dielectric thickness_m dielectric_flag")
         d, material = float(row[2]), float(row[3])
         if not math.isfinite(d) or d <= 0 or not math.isfinite(material) or material <= 0 or not material.is_integer():
-            raise ValueError("Thin-layer thickness must be positive metres and dielectric flag a positive integer.")
+            raise ValueError("Thin-layer thickness must be positive meters and dielectric flag a positive integer.")
         return cls(d, int(material))
 
 

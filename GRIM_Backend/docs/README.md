@@ -45,7 +45,7 @@ remain missing; conflicting duplicate samples are rejected.
 
 Imported mapped tables appear as unsaved datasets. **Save** writes their GRIM
 representation, including the column and unit mapping in the history and
-metadata. Source text files are kept unchanged. Cancelling one file's labeling
+metadata. Source text files are kept unchanged. Canceling one file's labeling
 continues the remaining import queue. Use **FREDDY → File → File Converter…**
 to save a standalone converted CSV or whitespace table instead.
 
@@ -310,7 +310,7 @@ max-look composite of narrow subapertures and are qualitative rather than a
 single coherent 360-degree reconstruction.
 
 In **ISAR Settings**, enter the occupied cross-range and range half extents in
-metres, then choose **Recommended PFA** for a scene-dependent Fast/Accurate
+meters, then choose **Recommended PFA** for a scene-dependent Fast/Accurate
 choice. Formation plans each image from the acquired samples before
 interpolation, distinguishing native phase increments from Fast PFA
 range-curvature error, and records that plan with the result. Passing a
@@ -621,11 +621,11 @@ checklist row is ready and the exact current configuration
 has completed Validate placements. It never performs an unreviewed validation
 on the way to publication. Metadata and model advisories are visible but need
 no waiver in the default profile. Large workload reviews and warnings in an
-explicitly selected strict profile still require acknowledgement of the current
+explicitly selected strict profile still require acknowledgment of the current
 plan. The action performs the full response
 evaluation and writes the result. Its progress bar covers the
 direction/frequency work, and **Cancel
-assembly** cooperatively stops before publication. A cancelled or failed build
+assembly** cooperatively stops before publication. A canceled or failed build
 keeps any existing output and removes its temporary artifact. An unchanged
 validated plan is reused at assembly time; any
 path, option, or source-file change invalidates it. Prepared base, surface,

@@ -82,7 +82,7 @@ def copy_linear_mesh(mesh: 'LinearMesh') -> 'LinearMesh':
     """A mesh with its own node list and element records over the same node
     and element data, so polynomial enrichment of the copy (``basis.enrich``
     appends nodes and rewrites ``node_ids``) leaves ``mesh`` untouched.  The
-    geometric near-pair memo is shared with the copy: element centres and
+    geometric near-pair memo is shared with the copy: element centers and
     lengths are the same, so whichever of them counts first serves both."""
     from ghost_backend.twod.formulations.regions import near_pair_memo
     clone = LinearMesh(nodes=list(mesh.nodes), elements=[copy.copy(element) for element in mesh.elements])
@@ -1283,7 +1283,7 @@ def validate_geometry_snapshot_for_solver(
                     f"{math.hypot(p2[0] - p1[0], p2[1] - p1[1]):.3g} m long, not longer "
                     f"than the {NODE_WELD_TOLERANCE_M:g} m mesh node tolerance, so its two "
                     "ends would be one mesh node (a degenerate element). Remove it or merge "
-                    "it into a neighbouring primitive."
+                    "it into a neighboring primitive."
                 )
             primitives.append((seg_idx, prim_idx, seg_name, p1, p2))
             all_points.extend([p1, p2])
@@ -1353,7 +1353,7 @@ def validate_geometry_snapshot_for_solver(
     # The drawing-precision proximity tolerance is capped at half the local
     # feature size: the shortest primitive at a vertex or on a primitive. A
     # legitimate 2e-9..1e-6 m primitive is a feature, not a crack, and its two
-    # ends (or its neighbours' ends) must not be compared at 1e-6 * diagonal.
+    # ends (or its neighbors' ends) must not be compared at 1e-6 * diagonal.
     proximity_fraction = 0.5
     primitive_feature = [
         min(math.hypot(p2[0] - p1[0], p2[1] - p1[1]), vertex_feature[key1], vertex_feature[key2])
@@ -1840,7 +1840,7 @@ def _build_panels(
                 raise ValueError(
                     f"Segment '{name}' has a primitive {prim_len:.3g} m long, not longer than "
                     f"the {NODE_WELD_TOLERANCE_M:g} m mesh node tolerance: its two ends would "
-                    "be one mesh node. Remove it or merge it into a neighbouring primitive."
+                    "be one mesh node. Remove it or merge it into a neighboring primitive."
                 )
             ends.append((p0, p1, prim_len))
         lengths = [end[2] for end in ends]

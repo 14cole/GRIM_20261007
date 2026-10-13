@@ -156,6 +156,41 @@ class InlineEngineeringAnalysisTests(unittest.TestCase):
         phase_difference = panel._samples["polarization"][0][2]
         np.testing.assert_allclose(phase_difference, np.rad2deg(.2))
 
+    def test_polarization_phase_summary_respects_wrap_and_undefined_direction(self):
+        field = np.ones((1, 1, 2, 2), complex)
+        field[0, 0, :, 0] = np.exp(1j * np.deg2rad([179., -179.]))
+        grid = make_grid(field, frequencies=[9., 10.], polarizations=("HH", "VV"))
+        self.window.btn_auto_plot.setChecked(False)
+        self.window._add_dataset_row(grid, "Wrapped", "Loaded", "wrapped.grim")
+        self.window.table.selectRow(0)
+        self.window.list_freq.selectAll()
+        panel = self.window._show_engineering_tool("polarization")
+        panel.pol_view.setCurrentIndex(panel.pol_view.findData("phase"))
+        panel._update_current()
+
+        def phase_summary():
+            rows = panel._panels["polarization"][2].rows
+            self.assertFalse(any(row[0].endswith(" median") for row in rows))
+            return next(row for row in rows if row[0].endswith(" phase difference"))
+
+        self.assertAlmostEqual(abs(float(phase_summary()[1])), 180.)
+        panel._panels["polarization"][2].copy()
+        self.assertNotIn("median", QApplication.clipboard().text())
+        self.assertIn("circular mean", QApplication.clipboard().text())
+
+        # Opposite channel phase differences have no single average direction.
+        grid.rcs_phase[0, 0, :, 0] = np.deg2rad([90., -90.])
+        panel._update_current()
+        self.assertEqual(phase_summary()[1], "not defined")
+
+        # A power-ratio median remains meaningful and available in ratio views.
+        panel.pol_view.setCurrentIndex(panel.pol_view.findData("ratios"))
+        panel._update_current()
+        rows = panel._panels["polarization"][2].rows
+        median = next(row for row in rows if row[0].endswith(" median"))
+        self.assertEqual(float(median[1]), 0.)
+        self.assertEqual(median[2], "dB power ratio")
+
     def test_analysis_axes_keep_distinct_ordinates_when_limits_change(self):
         self.load_sample()
         self.window._show_engineering_tool("phase")

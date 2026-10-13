@@ -122,7 +122,7 @@ class BorExecutionTests(unittest.TestCase):
         value=validate_options({})
         self.assertEqual(value['factorization'],'auto')
         self.assertEqual(value['compressed_storage_mib'],0)
-        # 0 is the automatic sentinel; an explicit cap is still honoured.
+        # 0 is the automatic sentinel; an explicit cap is still honored.
         self.assertEqual(validate_options({'compressed_storage_mib':4096})['compressed_storage_mib'],4096)
 
     def test_automatic_storage_exceeds_the_old_fixed_cap(self):

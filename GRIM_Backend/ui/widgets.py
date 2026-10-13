@@ -165,7 +165,7 @@ class PlotSettingsPopup(QFrame):
 class CollapsibleSection(QWidget):
     """A titled panel whose body collapses when its header is clicked.
 
-    Purely presentational — it organises the control dock into Datasets /
+    Purely presentational — it organizes the control dock into Datasets /
     Parameters / Operations / Plot Tools groups while holding the exact same
     widgets the app has always used.
     """

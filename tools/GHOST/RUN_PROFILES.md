@@ -63,7 +63,7 @@ Monostatic runs:
 Bistatic runs use dense LU on the global linear mesh, with the same validated
 CPU kernel tables and native far assembly as monostatic runs. Their bounded
 table state spans polarization and certification passes and is released when
-the request completes or is cancelled. `cpu_kernel_execution` records table
+the request completes or is canceled. `cpu_kernel_execution` records table
 validation and use. Explicit mixed-precision API calls use the same kernel
 tables and factor with mixed-precision LU; explicit GPU calls keep their
 existing execution path.

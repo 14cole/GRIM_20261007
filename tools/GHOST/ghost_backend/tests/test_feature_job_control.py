@@ -550,7 +550,7 @@ class FeatureJobControlTests(unittest.TestCase):
                 calls += 1
                 return calls >= 4
 
-            with self.assertRaisesRegex(InterruptedError, "cancelled"):
+            with self.assertRaisesRegex(InterruptedError, "canceled"):
                 feature_sum.add_features_to_monostatic_grim(
                     str(base),
                     str(output),
@@ -645,7 +645,7 @@ class FeatureJobControlTests(unittest.TestCase):
         segment = np.asarray([[[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]]])
         normals = np.asarray([[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]])
 
-        with self.assertRaisesRegex(InterruptedError, "cancelled"):
+        with self.assertRaisesRegex(InterruptedError, "canceled"):
             expand_perimeter(
                 segment,
                 coefficient,

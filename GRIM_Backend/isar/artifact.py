@@ -175,7 +175,7 @@ def _small_metadata(container: dict | None) -> dict[str, Any]:
 
 
 
-def _numeric_array(name: str, value: Any, *, ndim: int) -> np.ndarray:
+def _numeric_array(name: str, value: Any, *, ndim: int, allow_nan: bool = False) -> np.ndarray:
     array = np.asarray(value)
     if array.ndim != ndim:
         raise ValueError(f"ISAR artifact {name} must be {ndim}-D")
@@ -183,7 +183,7 @@ def _numeric_array(name: str, value: Any, *, ndim: int) -> np.ndarray:
         raise ValueError(f"ISAR artifact {name} must be numeric")
     if array.size == 0:
         raise ValueError(f"ISAR artifact {name} cannot be empty")
-    if not np.all(np.isfinite(array)):
+    if not np.all(np.isfinite(array) | (np.isnan(array) if allow_nan else False)):
         raise ValueError(f"ISAR artifact {name} contains non-finite values")
     return array
 
@@ -348,8 +348,16 @@ def _validated_band_payload(
     else:
         if "magnitude" not in band:
             raise ValueError(f"ISAR artifact band {index} is missing magnitude")
+        # Composite image cells outside every rotated look have no measured
+        # value. Preserve their NaNs explicitly instead of serializing zeros.
+        # Other images, axes, and complex payloads retain finite-only checks.
+        allow_missing = (
+            band_manifest.get("magnitude_missing_value") == "nan_outside_sublook_coverage"
+            and int(band_manifest.get("composite_looks", 0)) > 0
+            and band_manifest.get("image_contract", {}).get("image_kind") == "maximum_magnitude_composite"
+        )
         raw_magnitude = _numeric_array(
-            f"band {index} magnitude", band["magnitude"], ndim=2
+            f"band {index} magnitude", band["magnitude"], ndim=2, allow_nan=allow_missing
         )
         if np.iscomplexobj(raw_magnitude):
             raise ValueError(
@@ -357,7 +365,7 @@ def _validated_band_payload(
             )
         with np.errstate(over="ignore", invalid="ignore"):
             magnitude = raw_magnitude.astype(np.float32, copy=False)
-        if not np.all(np.isfinite(magnitude)):
+        if not np.all(np.isfinite(magnitude) | (np.isnan(magnitude) if allow_missing else False)):
             raise ValueError(
                 f"ISAR artifact band {index} magnitude cannot be represented "
                 "as finite float32 values"
@@ -448,6 +456,7 @@ def build_isar_manifest(
                 "composite_sublooks": _json_safe(band.get("composite_sublooks", [])),
                 "composite_look_diagnostics": _json_safe(band.get("composite_look_diagnostics", [])),
                 "composite_aggregation": band.get("composite_aggregation"),
+                "magnitude_missing_value": band.get("magnitude_missing_value"),
                 "scene_cropped": bool(band.get("scene_cropped", False)),
                 "azimuth_spacing_spread": float(
                     band.get("az_nonuniformity", 0.0)

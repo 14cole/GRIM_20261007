@@ -84,7 +84,7 @@ class _PbpBands:
             return PBP_BAND_KEY
         return pbp_band_key(uuid4().hex)
 
-    def draw(self, x_values, description: str, *, polar: bool, to_plot_x=None) -> None:
+    def draw(self, x_values, description: str, *, polar: bool, to_plot_x=None, break_before=()) -> None:
         owner = self._owner
         held_keys = {
             artist._grim_dataset_key
@@ -95,11 +95,11 @@ class _PbpBands:
         heatmap = not multiple and owner.pbp_fill_mode in ("heatmap_rcs", "heatmap_density")
         if multiple and owner.pbp_fill_mode in ("heatmap_rcs", "heatmap_density"):
             owner._note_plot_render(
-                "New PBP bands use translucent plot colours when several bands "
+                "New PBP bands use translucent plot colors when several bands "
                 "are displayed; heatmap fills apply to a single band."
             )
         # Preserve dataset selection order, then polarization order, just as
-        # ordinary curves do. Each complete band consumes one line-cycle colour.
+        # ordinary curves do. Each complete band consumes one line-cycle color.
         for identity, envelope in self._envelopes.items():
             if envelope.lower is None:
                 envelope.close()
@@ -107,9 +107,26 @@ class _PbpBands:
             lower, upper, density = envelope.result()
             percentiles = envelope.percentiles
             envelope.close()
-            native_edges = (to_plot_x(x_values) if to_plot_x is not None else x_values, lower, upper)
-            x_display, lower, upper, density = owner._bounded_plot_envelope(
-                x_values, lower, upper, density
+            x_segmented, lower_segmented, upper_segmented, density_segmented = plot_common.insert_plot_breaks(
+                break_before, x_values, lower, upper, density)
+            if envelope.phase_degrees:
+                lower_segmented, upper_segmented = plot_common.continuous_phase_envelope(
+                    lower_segmented, upper_segmented)
+            # Probes keep original sample positions; drawing adds separators.
+            native_mask = np.isfinite(x_segmented)
+            native_x = x_segmented[native_mask]
+            native_edges = (to_plot_x(native_x) if to_plot_x is not None else native_x,
+                            lower_segmented[native_mask], upper_segmented[native_mask])
+            zero_notice = None
+            if np.any(np.isneginf(lower)) or np.any(np.isneginf(upper)):
+                owner._note_plot_render(
+                    "PBP includes zero returns as −∞ dB. Unbounded fill is omitted; finite edges remain visible."
+                )
+                if not np.any(np.isfinite(lower) | np.isfinite(upper)):
+                    zero_notice = owner.plot_ax.text(.5, .5, "PBP bounds: −∞ dB (zero power)",
+                                                    ha="center", va="center", transform=owner.plot_ax.transAxes)
+            x_display, lower, upper, density_display = owner._bounded_plot_envelope(
+                x_segmented, lower_segmented, upper_segmented, density_segmented
             )
             if to_plot_x is not None:
                 x_display = to_plot_x(x_display)
@@ -122,12 +139,15 @@ class _PbpBands:
             label = f"{prefix} {name} | Pol {identity[1]}, {band_description}"
             color = owner.plot_ax._get_lines.get_next_color()
             key = self._band_key()
+            if zero_notice is not None:
+                zero_notice._grim_dataset_key = key
             owner._plot_pbp_band(
-                x_display, lower, upper, label, polar, density=density,
+                x_display, lower, upper, label, polar, density=density_display,
                 key=key, color=color, heatmap=heatmap, native_edges=native_edges,
             )
             for artist in owner._plot_item_artists(key):
                 artist._grim_pbp_identity = identity
+                artist._grim_pbp_count = np.asarray(density)
                 owner._tag_native_db_artist(artist, self._db_quantities.get(identity, set()))
 
 
@@ -432,6 +452,22 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             elif self.last_plot_mode == "frequency":
                 self._plot_frequency()
 
+    @staticmethod
+    def _reset_plot_color_limits(context) -> None:
+        """Discard limits expressed in the previous display scale for this tab.
+
+        Equal endpoints and a zero tick step select automatic color scaling.
+        Block live callbacks so an ISAR scale edit still waits for Apply and
+        the old image is not temporarily recolored with the new scale's limits.
+        """
+        for spin in (context.spin_plot_zmin, context.spin_plot_zmax,
+                     context.spin_plot_zstep):
+            was_blocked = spin.blockSignals(True)
+            try:
+                spin.setValue(0.0)
+            finally:
+                spin.blockSignals(was_blocked)
+
     def _on_plot_scale_changed(self) -> None:
         if self.last_plot_mode is None:
             self._apply_plot_theme()
@@ -448,6 +484,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         elif self.last_plot_mode == "elevation_sweep":
             self._plot_elevation_sweep()
             self._fit_y()
+        elif self.last_plot_mode == "compare":
+            self._plot_compare()
         elif self.last_plot_mode == "cdf":
             self._plot_cdf()
             self._fit_both()
@@ -489,7 +527,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _phase_display_degrees(self, dataset: RcsGrid, values):
         raw = np.asarray(values)
-        phase_radians = np.angle(raw) if np.iscomplexobj(raw) else raw.astype(float)
+        if np.iscomplexobj(raw):
+            valid = np.isfinite(raw) & (np.abs(raw) > 0.)
+            phase_radians = np.where(valid, np.angle(raw), np.nan)
+        else:
+            phase_radians = raw.astype(float)
         return self._wrap_phase_degrees(dataset, np.degrees(phase_radians))
 
     def _rcs_display_values(self, dataset: RcsGrid, rcs_values, frequency_value=None):
@@ -577,7 +619,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if not np.any(valid):
             return
 
+        coverage_bar = None
+        coverage_max = max(1., float(np.nanmax(density))) if density is not None and len(density) else 1.
+
         def draw_segment(seg_x, seg_min, seg_max, seg_density=None) -> None:
+            nonlocal coverage_bar
             lower = np.minimum(seg_min, seg_max)
             upper = np.maximum(seg_min, seg_max)
             if seg_x.size == 0:
@@ -602,8 +648,19 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             x_grid = np.tile(x_edges, (samples + 1, 1))
 
             cmap = self._effective_colormap()
-            mesh = self.plot_ax.pcolormesh(x_grid, y_edges, values, shading="auto", cmap=cmap)
+            coverage = self.pbp_fill_mode == "heatmap_density"
+            limits = {"vmin": 0., "vmax": coverage_max} if coverage else {}
+            mesh = self.plot_ax.pcolormesh(x_grid, y_edges, values, shading="auto", cmap=cmap, **limits)
             mesh._grim_dataset_key = key
+            if coverage and coverage_bar is None:
+                from matplotlib.ticker import MaxNLocator
+                coverage_bar = self.plot_figure.colorbar(mesh, ax=self.plot_ax)
+                coverage_bar._grim_dataset_key = key
+                coverage_bar.set_label("Valid cuts (count at each coordinate)")
+                coverage_bar.locator = MaxNLocator(integer=True)
+                coverage_bar.update_ticks()
+                self.plot_colorbars.append(coverage_bar)
+                self._note_plot_render("PBP fill color shows valid-cut coverage, not return-level density.")
 
         start = None
         for idx, is_valid in enumerate(valid):
@@ -915,7 +972,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     # --- shared display-quantity helpers (used by the plot_modes modules) ----
 
-    def _display_from_values(self, dataset, values, frequency_value):
+    def _display_from_values(self, dataset, values, frequency_value, *, preserve_zeros=False):
         """Raw samples -> the current display quantity: phase (deg) when the
         Phase toggle is on, otherwise linear or the dataset's default dB per
         the plot-scale combo. `frequency_value` may be scalar or an array
@@ -925,22 +982,22 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         linear = dataset.rcs_to_linear(values)
         if self._plot_scale_is_linear():
             return linear
-        return self._display_from_linear(dataset, linear, frequency_value)
+        return self._display_from_linear(dataset, linear, frequency_value, preserve_zeros=preserve_zeros)
 
-    def _display_from_linear(self, dataset, linear_values, frequency_value):
+    def _display_from_linear(self, dataset, linear_values, frequency_value, *, preserve_zeros=False):
         """Already-linear power values -> current display scale (no phase branch;
         used by the P50/statistics paths that aggregate in linear space)."""
         if self._plot_scale_is_linear():
             return linear_values
         linear_values = np.asarray(linear_values, dtype=float)
         positive = np.isfinite(linear_values) & (linear_values > 0.0)
-        if np.any(np.isfinite(linear_values) & ~positive):
+        if not preserve_zeros and np.any(np.isfinite(linear_values) & ~positive):
             self._note_plot_render(
                 "Zero/nonpositive samples are omitted on logarithmic axes; "
                 "positive levels are not floored."
             )
         return dataset.linear_to_default_db(
-            np.where(positive, linear_values, np.nan),
+            np.where(positive | (preserve_zeros & (linear_values == 0.)), linear_values, np.nan),
             frequency_value=frequency_value, eps=0.0,
         )
 
@@ -1223,7 +1280,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         signature = self._line_plot_signature(mode, projection, reference, datasets)
         desired_projection = "polar" if projection == "polar" else "rectilinear"
         figure = self.plot_figure
-        axes = list(figure.axes)
+        band_colorbar_axes = {
+            bar.ax for bar in self.plot_colorbars
+            if is_pbp_band_key(getattr(bar, "_grim_dataset_key", None))
+        }
+        axes = [ax for ax in figure.axes if ax not in band_colorbar_axes]
         has_images_or_collections = any(
             not is_pbp_band_key(getattr(artist, "_grim_dataset_key", None))
             for ax in axes
@@ -1249,6 +1310,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self._ensure_axes(projection)
         if not hold:
             self._release_native_plot_samples()
+            self._remove_colorbar()
             self.plot_ax.clear()
             self._style_plot_axes()
         figure._grim_line_plot_signature = signature
@@ -1313,11 +1375,14 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         phase = self._button_checked(self.btn_phase)
         percentiles = self._pbp_percentiles()
         if phase:
-            self._note_plot_render("Phase bands use the shortest containing arc and may cross ±180°.")
+            self._note_plot_render("Phase bands use a continuous branch of shortest containing arcs and may extend beyond ±180°.")
             if percentiles is not None:
                 self._note_plot_render("Percentile PBP bands apply to magnitude; phase uses min–max arcs.")
                 percentiles = None
-        return plot_common.StreamingEnvelope(phase_degrees=phase, percentiles=percentiles)
+        if percentiles is not None:
+            self._note_plot_render("PBP percentiles interpolate in displayed units; missing samples are excluded, zero power is retained.")
+        return plot_common.StreamingEnvelope(phase_degrees=phase, percentiles=percentiles,
+                                             include_negative_infinity=not phase and not self._plot_scale_is_linear())
 
     def _configure_line_budget(self, candidate_count):
         """Allocate a display target across this render's visible curves."""
@@ -1331,7 +1396,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         ))
 
     def _plot_bounded_line(self, ax, x_values, y_values, *args, dataset=None,
-                           trace_key=None, native_values=None, **kwargs):
+                           trace_key=None, native_values=None, break_before=(), **kwargs):
+        source_values = (x_values, y_values)
+        x_values, y_values = plot_common.insert_plot_breaks(break_before, x_values, y_values)
         limit = getattr(self, "_plot_line_point_limit", plot_common.MAX_LINE_POINTS)
         x_display, y_display, decimated = plot_common.decimate_line(
             x_values, y_values, max_points=limit
@@ -1377,8 +1444,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                 return []
         if dataset is not None:
             kwargs.setdefault("linestyle", "-")
+        if "marker" not in kwargs:
+            for name, value in plot_common.singleton_line_markers(x_display, y_display).items():
+                kwargs.setdefault(name, value)
         lines = ax.plot(x_display, y_display, *args, **kwargs)
-        native_x, native_y = native_values if native_values is not None else (x_values, y_values)
+        native_x, native_y = native_values if native_values is not None else source_values
         reduced = decimated or len(native_x) != len(x_display)
         for line in lines:
             line._grim_trace_key = trace_key
@@ -2301,7 +2371,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if waterfall_limits is not None:
             self.plot_ax.set_xlim(*waterfall_limits)
         elif delta is not None:
-            edges = delta_map_mode.cell_edges(delta.x)
+            edges = delta.x_support.edges
             self.plot_ax.set_xlim(edges[0], edges[-1])
         else:
             self.plot_ax.set_autoscale_on(True)
@@ -2354,7 +2424,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             ymin, ymax = self._waterfall_coordinate_limits(1)
             self.plot_ax.set_ylim(ymin, ymax)
         elif hasattr(self.plot_ax, "_grim_delta_map"):
-            edges = delta_map_mode.cell_edges(self.plot_ax._grim_delta_map.y)
+            edges = self.plot_ax._grim_delta_map.y_support.edges
             ymin, ymax = edges[0], edges[-1]
             self.plot_ax.set_ylim(ymin, ymax)
         elif self.last_plot_mode == "cdf":

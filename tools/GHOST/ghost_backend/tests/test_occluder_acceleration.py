@@ -128,7 +128,7 @@ class OccluderAccelerationTests(unittest.TestCase):
         self.assertFalse(np.any(actual))
 
     def test_default_bias_is_numerical_not_vehicle_scale(self):
-        triangles = _box_triangles() * 2.5  # five-metre body width
+        triangles = _box_triangles() * 2.5  # five-meter body width
         blocker = Occluder(triangles)
         self.assertLess(blocker.bias, 1e-4)
 
@@ -144,7 +144,7 @@ class OccluderAccelerationTests(unittest.TestCase):
         np.testing.assert_array_equal(result[:, 0], [False, True])
         self.assertEqual(progress, [(1, 2), (2, 2)])
 
-        with self.assertRaisesRegex(InterruptedError, "cancelled"):
+        with self.assertRaisesRegex(InterruptedError, "canceled"):
             blocker.visible_many(
                 [[0.0, 0.0, 0.0]], [[1.0, 0.0, 0.0]],
                 cancel_check=lambda: True,

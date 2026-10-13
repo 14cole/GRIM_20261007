@@ -169,7 +169,7 @@ class PolynomialPairTests(unittest.TestCase):
             with self.assertRaises(InterruptedError):
                 with pp.polynomial_pair_scope(3):
                     pp.remember(fine, infos, 'TE', spool, layout, 'dense')
-                    raise InterruptedError('cancelled')
+                    raise InterruptedError('canceled')
             self.assertTrue(spool.file.closed)
             spool = DensePairSpool(matrix, directory, lambda: None)
             spool.file.truncate(16)
@@ -267,7 +267,7 @@ class PolynomialPairTests(unittest.TestCase):
         with self.assertRaises(InterruptedError):
             with pp.polynomial_pair_scope(3):
                 pp.remember(fine, infos, 'TE', owned, {}, 'compressed')
-                raise InterruptedError('cancelled')
+                raise InterruptedError('canceled')
         self.assertTrue(owned.closed)
         self.assertIsNone(pp.current_pair())
 

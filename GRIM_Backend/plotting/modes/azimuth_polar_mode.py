@@ -55,6 +55,7 @@ def render(self) -> None:
     omitted = 0
     bands = self._new_pbp_bands(datasets) if pbp_active else None
     for name, dataset, selection in plans:
+        line_breaks = common.selection_breaks(reference, dataset, "azimuth", selection[0], az_values) if bands is None else ()
         candidates = len(selection[1]) * len(selection[2])
         if bands is None and rendered >= common.MAX_LINE_SERIES:
             omitted += candidates
@@ -62,7 +63,7 @@ def render(self) -> None:
         for candidate_index, (x_values, display, label, trace_key) in enumerate(_series(
             self, reference, dataset, name, selection, polarization
         )):
-            if not np.any(np.isfinite(display)):
+            if not np.any(np.isfinite(display) | ((bands is not None) & np.isneginf(display))):
                 continue
             if bands is not None:
                 bands.update(dataset, display, polarization=(
@@ -74,7 +75,8 @@ def render(self) -> None:
                     x_values, "azimuth", angular_unit, "rad"
                 )
                 self._plot_bounded_line(self.plot_ax, theta, display, label=label,
-                                        dataset=dataset, trace_key=trace_key)
+                                        dataset=dataset, trace_key=trace_key,
+                                        break_before=line_breaks)
                 rendered += 1
                 if rendered >= common.MAX_LINE_SERIES:
                     omitted += candidates - candidate_index - 1
@@ -99,6 +101,8 @@ def render(self) -> None:
             az_values, f"{pol_label}Freq {freq_label}, {elev_name} {elev_label}",
             polar=True,
             to_plot_x=lambda x: common.convert_axis_values(x, "azimuth", angular_unit, "rad"),
+            break_before=common.selection_breaks(reference, reference, "azimuth",
+                self._axis_selection_for_dataset(reference, reference, "azimuth", az_values), az_values),
         )
 
     if rendered == 0:

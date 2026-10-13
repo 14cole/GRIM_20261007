@@ -418,7 +418,7 @@ def _symmetric_near_relation(near_sources) -> 'bool':
 
 
 def _adjacent_pairs_near(near_sources) -> 'bool':
-    """True when every element is near its neighbours (``|e - f| <= 1``).
+    """True when every element is near its neighbors (``|e - f| <= 1``).
 
     A far pair ``e < f`` then has ``f >= e + 2``: its node pairs ``(e + a,
     f + b)`` all lie strictly above the diagonal (packed EFIE storage).
@@ -971,7 +971,7 @@ _PROCESS_START_TIMES = {}
 
 
 class StreamingSpillError(BorAdmissionError):
-    """The planned far-block spill cannot be honoured on this host at run time.
+    """The planned far-block spill cannot be honored on this host at run time.
 
     An admission-type rejection of the streamed plan (``streaming=True``): a
     spill that cannot be written never turns into holding every mode in RAM,

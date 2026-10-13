@@ -60,7 +60,7 @@ class ContributionInspector:
             raise ValueError("Assembly changed; validate it again before inspecting.")
         for source, expected in plan.prepared_source_sha256.items():
             if cancel_check():
-                raise InterruptedError("Inspection cancelled.")
+                raise InterruptedError("Inspection canceled.")
             if sha256_file(source) != expected:
                 raise ValueError(f"Assembly source changed: {Path(source).name}. Validate again.")
         if any(Path(path).exists() for path in plan.prepared_absent_paths):
@@ -98,7 +98,7 @@ class ContributionInspector:
                       polarizations=channels, labels=labels, key=key)
         for source, expected in plan.prepared_source_sha256.items():
             if cancel_check():
-                raise InterruptedError("Inspection cancelled.")
+                raise InterruptedError("Inspection canceled.")
             if sha256_file(source) != expected:
                 raise ValueError("An Assembly source changed during inspection; validate again.")
         output["body"].setflags(write=False)

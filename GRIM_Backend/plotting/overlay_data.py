@@ -78,7 +78,7 @@ def axes_signature(ax) -> tuple[str, str]:
     result = []
     for axis in ("x", "y"):
         name, unit, _scale = axis_info(ax, axis)
-        # Length values are stored in metres. Other axes stay in their shown
+        # Length values are stored in meters. Other axes stay in their shown
         # units, and must not accidentally reappear on a different quantity.
         result.append(name + (" [length]" if unit in LENGTH_UNITS else f" [{unit}]"))
     return tuple(result)
@@ -140,7 +140,7 @@ def project_points(points, plane: str, ax, length_unit: str) -> np.ndarray:
 @dataclass(eq=False)
 class OverlayPath:
     name: str
-    points: np.ndarray  # N x 2; length coordinates in metres, NaN rows separate paths.
+    points: np.ndarray  # N x 2; length coordinates in meters, NaN rows separate paths.
     signature: tuple[str, str]
     panel: int
     color: str = "#ff4fa3"

@@ -156,7 +156,7 @@ def _reduce_constrained_operator(matrix, transform):
 
     With ``Q = S + E`` (selection plus a few relations of inactive rows) this
     is one gathered copy of ``A`` plus rank-one row/column updates -- the
-    generalisation of ``BorPecSolver.reduce_pole_operator``.  The former
+    generalization of ``BorPecSolver.reduce_pole_operator``.  The former
     sparse product copied ``A`` about three times (SciPy ravels F-ordered
     operands) and ran 6.7x slower at 2,400 unknowns.
     """
@@ -622,14 +622,14 @@ def plan_bor_mode_workers(n_dofs, n_rhs, workers, mode_tasks, assembly_peak_gb,
 # Near pairs differ several-fold in cost (self cells hold 920 points, adjacent
 # 260, disjoint 180), so a queue of exactly one task per worker, consumed in
 # order, idles every worker that finishes ahead of the oldest task (simulated
-# 39-49 % utilisation; measured 1.68-1.78x slower preparation with 8 and 15
+# 39-49 % utilization; measured 1.68-1.78x slower preparation with 8 and 15
 # process workers). Queued tasks hold no scratch -- only running ones do, and
 # the pool size bounds those -- and a result is a few 2x2 mode blocks, so a
 # deeper in-order queue costs well under a megabyte.
 NEAR_SUBMIT_DEPTH = 4
 # Pairs per process task: each submit pickles the task with its generatrix
 # (about 170 kB on a 3,000-element mesh), and a task integrates its pairs
-# together (NearTask.run_batch), so batches amortise both.
+# together (NearTask.run_batch), so batches amortize both.
 NEAR_PROCESS_BATCH = 32
 # Pairs integrated together on the thread and serial paths.
 NEAR_LOCAL_BATCH = 32
@@ -1707,7 +1707,7 @@ class BorPecSolver:
         return self._far_gap_cache
 
     def _kernel_tables(self, m_max: 'int'):
-        """G_m table [P, P, m_max+2] at base Gauss points; local-neighbour
+        """G_m table [P, P, m_max+2] at base Gauss points; local-neighbor
         element point-pairs zeroed (their Galerkin blocks are added by the
         refined near-pair path)."""
 

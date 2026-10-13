@@ -349,13 +349,13 @@ class Occluder:
             if self._bvh_ready:
                 return
             if self._cancelled(cancel_check):
-                raise InterruptedError("Body-shadow acceleration build cancelled.")
+                raise InterruptedError("Body-shadow acceleration build canceled.")
 
             centres = self.tris.mean(axis=1)
             order = np.argsort(self._morton_codes(centres), kind="mergesort")
             del centres
             if self._cancelled(cancel_check):
-                raise InterruptedError("Body-shadow acceleration build cancelled.")
+                raise InterruptedError("Body-shadow acceleration build canceled.")
 
 
             ordered = self.tris[order]
@@ -382,7 +382,7 @@ class Occluder:
                                            bvh_hi[2 * nodes + 1])
                 level //= 2
             if self._cancelled(cancel_check):
-                raise InterruptedError("Body-shadow acceleration build cancelled.")
+                raise InterruptedError("Body-shadow acceleration build canceled.")
 
 
             self._tris = _immutable_array(ordered)
@@ -616,7 +616,7 @@ class Occluder:
             node, active = stack.pop()
             visited += 1
             if visited % 64 == 0 and self._cancelled(cancel_check):
-                raise InterruptedError("Body-shadow query cancelled.")
+                raise InterruptedError("Body-shadow query canceled.")
             active = active[~blocked[active]]
             if not active.size:
                 continue
@@ -655,7 +655,7 @@ class Occluder:
             node, _entry = stack.pop()
             visited += 1
             if visited % 256 == 0 and self._cancelled(cancel_check):
-                raise InterruptedError("Body-shadow query cancelled.")
+                raise InterruptedError("Body-shadow query canceled.")
             if node >= self._bvh_base:
                 if self._leaf_hit(node, origin, direction, minimum_t,
                                   leaf_cache):
@@ -727,7 +727,7 @@ class Occluder:
         result = np.empty((len(dirs), len(np.atleast_2d(points))), dtype=bool)
         for index, direction in enumerate(dirs):
             if self._cancelled(cancel_check):
-                raise InterruptedError("Body-shadow query cancelled.")
+                raise InterruptedError("Body-shadow query canceled.")
             result[index] = self.visible(
                 points, direction, bias=bias, cancel_check=cancel_check)
             if progress_callback is not None:
@@ -801,7 +801,7 @@ class Occluder:
         all_indices = np.arange(len(pts), dtype=np.intp)
         for direction_index, direction in enumerate(dirs):
             if self._cancelled(cancel_check):
-                raise InterruptedError("Body-shadow query cancelled.")
+                raise InterruptedError("Body-shadow query canceled.")
             active = (
                 all_indices
                 if normals is None
@@ -822,7 +822,7 @@ class Occluder:
             if progress_callback is not None:
                 progress_callback(direction_index + 1, len(dirs))
         if self._cancelled(cancel_check):
-            raise InterruptedError("Body-shadow query cancelled.")
+            raise InterruptedError("Body-shadow query canceled.")
         return PackedVisibility(
             packed,
             n_points=len(pts),

@@ -60,7 +60,7 @@ class JunctionLawTests(unittest.TestCase):
                              (.026+.026j, 16),  # copper at 10 GHz next to 75-20j: Dirichlet-like at the panel scale
                              (1., 16), (15., 16),
                              (30., 0), (75-20j, 0), (200., 0),     # within a factor of four: a staircase step
-                             (400., 16), (1e5, 16)):               # PMC-like: the TE analogue
+                             (400., 16), (1e5, 16)):               # PMC-like: the TE analog
             with self.subTest(law=value):
                 snapshot = _halves(104, 2, [law(value)])
                 self.assertEqual(len(td._build_panels(snapshot, 1., self.WAVELENGTH)), 104+extra)

@@ -659,7 +659,7 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
         self.assertEqual(self.window.table.rowCount(), 1)
         completion.assert_not_called()
         self.assertTrue(self.window.btn_dataset_cancel.isHidden())
-        self.assertIn("cancelled", self.window.status.currentMessage().lower())
+        self.assertIn("canceled", self.window.status.currentMessage().lower())
 
     def test_open_and_overlap_have_distinct_discoverable_shortcuts(self) -> None:
         shortcuts = {

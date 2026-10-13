@@ -159,7 +159,7 @@ class ExecutorPool:
     def __exit__(self, *exc_info) -> 'bool':
         if getattr(self._executor, "_broken", False):
             self._release_feeder(self._executor)
-        # On an error, queued units are cancelled; running ones still finish.
+        # On an error, queued units are canceled; running ones still finish.
         try:
             self._executor.shutdown(
                 wait=True, cancel_futures=exc_info[0] is not None

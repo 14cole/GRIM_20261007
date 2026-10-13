@@ -52,10 +52,10 @@ def build_material_faces(
     *,
     close_axis: bool = False,
 ) -> list[dict]:
-    """Return bounded faces with material labels, colours, and nesting depth.
+    """Return bounded faces with material labels, colors, and nesting depth.
 
     ``segments`` use the editor's paired x/y coordinate arrays.
-    ``side_materials(segment)`` returns left label/colour, right label/colour
+    ``side_materials(segment)`` returns left label/color, right label/color
     (the left side is the positive normal side). Returned dictionaries retain
     the old preview's points/label/color/consistent/rows/depth contract and add
     area and label_point. Shared material junctions are walked as separate

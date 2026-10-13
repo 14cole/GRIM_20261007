@@ -61,7 +61,7 @@ def capture_assembly_sources(request, *, cancel_check=None, progress_callback=No
     if not isinstance(request, FeatureAssemblyRequest):
         raise TypeError("request must be a FeatureAssemblyRequest.")
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Feature placement validation cancelled.")
+        raise InterruptedError("Feature placement validation canceled.")
     if progress_callback is not None:
         progress_callback(0, 100, "Checking Assembly inputs")
     base = resolve_path(request.base_grim, base_dir=request.base_dir)
@@ -111,7 +111,7 @@ def capture_assembly_sources(request, *, cancel_check=None, progress_callback=No
         "base_grim": {"path": str(base), "sha256": base_sha256}
     }
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Feature placement validation cancelled.")
+        raise InterruptedError("Feature placement validation canceled.")
     if progress_callback is not None:
         progress_callback(12, 100, "Reading clean-body response")
 
@@ -155,7 +155,7 @@ def capture_assembly_sources(request, *, cancel_check=None, progress_callback=No
         label="Point-placement CSV",
     )
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Feature placement validation cancelled.")
+        raise InterruptedError("Feature placement validation canceled.")
 
     return AssemblySources(
         active_features=active_features,
@@ -238,7 +238,7 @@ def prepare_assembly_placements(request, sources: 'AssemblySources', *, embedded
             "retain this setting for an intentional no-shadow study."
         )
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Feature placement validation cancelled.")
+        raise InterruptedError("Feature placement validation canceled.")
     if progress_callback is not None:
         progress_callback(35, 100, "Checking body surface and topology")
 

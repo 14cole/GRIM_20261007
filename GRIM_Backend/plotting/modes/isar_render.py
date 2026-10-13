@@ -6,6 +6,7 @@ from . import common
 from . import isar_mode as computation
 from GRIM_Backend.isar.geometry import (
     angular_bands, angular_sublooks, image_extent, draw_image, attach_block_peak_probe,
+    image_axis_labels,
 )
 from GRIM_Backend.isar.quality import reconstruction_advisories
 
@@ -344,7 +345,7 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
     az_target_deg = params["az_target_deg"]
 
     # Convert coherent magnitude to generic image intensity. Image formation
-    # does not guarantee an absolute square-metre normalization, so neither
+    # does not guarantee an absolute square-meter normalization, so neither
     # branch claims dBsm/dBke. (Magnitude was already max-pool decimated on the
     # worker; block-max commutes with squaring and log.)
     for br in band_results:
@@ -373,7 +374,7 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
         self.plot_axes = None
         active_axes = [self.plot_ax]
     else:
-        ax_array = self.plot_figure.subplots(1, n_bands, sharey=True)
+        ax_array = self.plot_figure.subplots(1, n_bands)
         if not isinstance(ax_array, np.ndarray):
             ax_array = np.array([ax_array])
         active_axes = list(ax_array.ravel())
@@ -455,7 +456,10 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
         recon_label = " | Fast PFA"
     composite_subs = max((br.get("composite", 0) for br in band_results), default=0)
     if composite_subs:
-        recon_label += f" | Wide-Aperture Composite ({composite_subs} looks)"
+        if all(br.get("composite") for br in band_results):
+            recon_label += f" | Wide-Aperture Composite ({composite_subs} looks)"
+        else:
+            recon_label += " | Coherent + Wide-Aperture Composite"
     fig_title = (
         f"ISAR Image | {elev_name} {elev_value:g} deg | Pol {pol_value}{recon_label}"
     )
@@ -464,21 +468,12 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
     else:
         active_axes[0].set_title(fig_title, color=self._current_plot_text())
 
-    # Composite images live in the body frame (θ=0 radar frame), not a single
-    # look's cross-range/range frame — label accordingly.
-    horizontal_projection = abs(float(params.get("elevation_deg", 0.0))) > 1.0e-9
-    if composite_subs:
-        x_label = f"Cross-Range at 0° ({unit_name})"
-        y_label = f"Down-Range at 0° ({unit_name})"
-    elif horizontal_projection:
-        x_label = f"Horizontal Cross-Range ({unit_name})"
-        y_label = f"Horizontal Range ({unit_name})"
-    else:
-        x_label = f"Cross-Range ({unit_name})"
-        y_label = f"Range ({unit_name})"
-    for ax in active_axes:
+    for ax, br in zip(active_axes, band_results):
+        x_label, y_label = image_axis_labels(
+            br, unit_name, elev_value, explicit_frame=n_bands > 1
+        )
         ax.set_xlabel(x_label)
-    active_axes[0].set_ylabel(y_label)
+        ax.set_ylabel(y_label)
 
     if self.chk_colorbar.isChecked() and last_mesh is not None:
         if shared_scale:
@@ -517,11 +512,11 @@ def display_results(self, params: dict, band_results: list, elapsed: float) -> N
     self.spin_plot_ymin.blockSignals(False)
     self.spin_plot_ymax.blockSignals(False)
 
-    # Auto-fit the z (dB) spinboxes only on the *first* render of a new
-    # dataset. Re-running this on every render — which the per-keystroke
+    # Auto-fit the color spinboxes on the first render of a dataset/scale
+    # combination. Re-running this on every render — which the per-keystroke
     # `valueChanged` signal triggers — would clobber the user's typing
     # whenever zmin transiently exceeds zmax mid-keystroke.
-    state_key = id(dataset)
+    state_key = (id(dataset), self._plot_scale_is_linear())
     last_state = getattr(self, "_isar_last_autofit_state", None)
     autofit_limits = None
     if state_key != last_state:

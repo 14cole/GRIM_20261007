@@ -1043,7 +1043,7 @@ def _gate_fft_size(count: int) -> int:
 
 
 def gate_geometry(dataset: RcsGrid) -> dict[str, float]:
-    """Down-range resolution and unambiguous range (metres) of a sweep."""
+    """Down-range resolution and unambiguous range (meters) of a sweep."""
 
     from GRIM_Backend.datasets.constants import C0
 
@@ -1127,7 +1127,7 @@ def time_gate(
 
     Each azimuth/elevation/polarization sweep is transformed to down range
     (inverse FFT over frequency, zero-padded), multiplied by a gate over
-    ``[start_m, stop_m]`` metres from the phase reference (positive away from
+    ``[start_m, stop_m]`` meters from the phase reference (positive away from
     the radar), and transformed back to the original frequencies. ``taper``
     is the fraction of the gate width given to raised-cosine edges.
     ``mode="remove"`` keeps everything except the gate. ``compensate``
@@ -1265,7 +1265,7 @@ def translate_phase_center(
     y_m: float,
     z_m: float,
 ) -> RcsGrid:
-    """Move the phase reference to body point ``(x, y, z)`` metres.
+    """Move the phase reference to body point ``(x, y, z)`` meters.
 
     GRIM angles are coming-from radar directions
     ``u = (cos el cos az, cos el sin az, sin el)`` in body axes, and a point

@@ -145,7 +145,7 @@ class NativeFormatMixin:
     ):
         """Check a solver raw-field pair against displayed power and phase.
 
-        GHOST stores its unnormalised far-field amplitude alongside physical
+        GHOST stores its unnormalized far-field amplitude alongside physical
         ``rcs_power``.  The relationship is quantity dependent: sigma3D is
         ``4*pi*|A|^2`` and sigma2D is ``|A|^2/(4*k0)``.  This routine mirrors
         the producer-side tolerances while scanning bounded blocks, so loading

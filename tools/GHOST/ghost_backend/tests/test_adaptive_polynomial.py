@@ -201,7 +201,7 @@ class AdaptivePolynomialTests(unittest.TestCase):
     def test_cancellation_and_unrelated_errors_do_not_trigger_conservative_retry(self):
         from ghost_backend.twod import adaptivity
         options = validate_options(dict(mesh_strategy='adaptive', factorization='dense'))
-        for failure in (InterruptedError('cancelled'), ValueError('unrelated invalid input')):
+        for failure in (InterruptedError('canceled'), ValueError('unrelated invalid input')):
             with execution_scope(options):
                 with self.assertRaises(type(failure)), patch.object(s, '_finish_certified_2d_pair') as finish:
                     low_level = unittest.mock.Mock(side_effect=failure)

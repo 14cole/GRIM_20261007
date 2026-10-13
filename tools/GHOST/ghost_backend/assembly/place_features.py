@@ -34,7 +34,7 @@ VALIDATION_PROFILE = "advisory"         # advisory (default), external, or produ
 
 # Large workload reviews (and warnings in an explicitly selected strict
 # profile) require the printed plan digest here. Metadata advisories in the
-# default profile need no acknowledgement. Input changes invalidate a digest.
+# default profile need no acknowledgment. Input changes invalidate a digest.
 ACKNOWLEDGED_PLAN_SHA256 = None
 
 # The Production profile verifies that this file declares the coherent

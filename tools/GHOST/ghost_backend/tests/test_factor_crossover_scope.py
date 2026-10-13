@@ -18,7 +18,7 @@ def test_scope_installs_choices_and_restores_after_failure():
             with pytest.raises(InterruptedError):
                 with crossover.scope({6000:'lu'}):
                     assert not automatic_hierarchical(6000)
-                    raise InterruptedError('cancelled')
+                    raise InterruptedError('canceled')
             assert automatic_hierarchical(6000)
         assert not automatic_hierarchical(6000)
     with pytest.raises(RuntimeError):crossover.install({6000:'hodlr'})

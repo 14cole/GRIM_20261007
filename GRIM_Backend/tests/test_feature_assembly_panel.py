@@ -1472,10 +1472,10 @@ class FeatureAssemblyModelTests(unittest.TestCase):
             ):
                 self.calls.append(("prepare", request))
                 progress_callback(1, 4, "Checking body surface")
-                raise InterruptedError("operator cancelled validation")
+                raise InterruptedError("operator canceled validation")
 
         workflow = CancellingPrepareWorkflow()
-        with self.assertRaisesRegex(InterruptedError, "operator cancelled"):
+        with self.assertRaisesRegex(InterruptedError, "operator canceled"):
             model.prepare_preview(
                 workflow,
                 cancel_check=lambda: False,
@@ -1509,7 +1509,7 @@ class FeatureAssemblyModelTests(unittest.TestCase):
         workflow = _FakeWorkflow()
         model = _ready_point_model()
 
-        with self.assertRaisesRegex(InterruptedError, "cancelled"):
+        with self.assertRaisesRegex(InterruptedError, "canceled"):
             model.assemble(workflow, cancel_check=lambda: True)
 
         self.assertEqual(
@@ -2363,7 +2363,7 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
             worker.request_cancel.assert_called_once_with()
             self.assertFalse(panel.cancel_operation_button.isEnabled())
             self.assertIn(
-                "Cancelling assembly safely", panel.operation_progress.format()
+                "Canceling assembly safely", panel.operation_progress.format()
             )
             self.assertIn("no partial output", panel.status_label.text())
         finally:
@@ -2500,16 +2500,16 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
             worker.request_cancel.assert_called_once_with()
             self.assertFalse(panel.cancel_operation_button.isEnabled())
             self.assertIn(
-                "Cancelling validation safely", panel.operation_progress.format()
+                "Canceling validation safely", panel.operation_progress.format()
             )
             self.assertIn("no reviewed plan", panel.status_label.text())
 
-            panel._operation_cancelled("operator cancelled validation")
+            panel._operation_cancelled("operator canceled validation")
             self.assertIsNone(panel.model._prepared_plan_cache)
             self.assertFalse(panel._validated_plan_current)
             self.assertFalse(panel._preview_is_current)
             self.assertFalse(panel.build_button.isEnabled())
-            self.assertIn("operator cancelled", panel.status_label.text())
+            self.assertIn("operator canceled", panel.status_label.text())
         finally:
             panel._active_kind = ""
             panel._worker = None

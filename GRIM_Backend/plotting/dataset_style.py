@@ -57,6 +57,7 @@ class DatasetPlotStyleMixin:
         line._grim_base_style = {
             name: getattr(line, f"get_{name}")() for name in _LINE_PROPERTIES
         }
+        line._grim_base_markevery = line.get_markevery()
         line._grim_base_zorder = line.get_zorder()
         line._grim_base_path_effects = line.get_path_effects()
         line.set_pickradius(6)
@@ -69,6 +70,7 @@ class DatasetPlotStyleMixin:
         base = line._grim_base_style
         style = getattr(self, "_dataset_plot_styles", {}).get(key, {})
         line.set(**base)
+        line.set_markevery(getattr(line, "_grim_base_markevery", None))
         for name in ("color", "linewidth", "linestyle", "markersize"):
             if name in style:
                 getattr(line, f"set_{name}")(style[name])
@@ -80,6 +82,7 @@ class DatasetPlotStyleMixin:
         if style.get("kind", "line") == "scatter":
             line.set_linestyle("None")
             line.set_marker(style.get("marker", "o"))
+            line.set_markevery(None)
         selected = key in getattr(self, "_highlighted_plot_datasets", set())
         effects = line._grim_base_path_effects
         if selected:
@@ -271,10 +274,14 @@ class DatasetPlotStyleMixin:
 
     def _remove_plot_item_artists(self, key) -> list:
         """Detach one dataset's curves (or the PBP band) from the canvas."""
+        for colorbar in list(getattr(self, "plot_colorbars", [])):
+            if getattr(colorbar, "_grim_dataset_key", None) == key:
+                colorbar.remove()
+                self.plot_colorbars.remove(colorbar)
         removed = []
         for ax in self.plot_figure.axes:
             artists = [
-                artist for artist in (*ax.lines, *ax.collections)
+                artist for artist in (*ax.lines, *ax.collections, *ax.texts)
                 if getattr(artist, "_grim_dataset_key", None) == key
             ]
             for artist in artists:

@@ -1044,7 +1044,7 @@ def _node_icon(node_type: str, expanded: bool = False, has_data: bool = True) ->
       Branch (closed) — teal rounded rect
       Branch (open)   — teal rounded rect, lighter fill
       Leaf (loaded)   — green circle
-      Leaf (empty)    — grey circle  (also italicised/dimmed by _apply_leaf_style)
+      Leaf (empty)    — gray circle  (also italicized/dimmed by _apply_leaf_style)
     """
     node_type = _preview_icon_type(node_type)
     pix = QPixmap(_ICON, _ICON)
@@ -1081,7 +1081,7 @@ def _node_icon(node_type: str, expanded: bool = False, has_data: bool = True) ->
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _grid_to_b64(grid) -> str:
-    """Serialise an RcsGrid to a base-64 string."""
+    """Serialize an RcsGrid to a base-64 string."""
     buf = io.BytesIO()
     units_payload = json.dumps(grid.units) if grid.units else ""
     payload = dict(grid._extra_to_write())
@@ -1174,7 +1174,7 @@ def _b64_to_grid(b64: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tree item serialisation helpers
+# Tree item serialization helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _item_to_dict(item: QTreeWidgetItem) -> dict | None:
@@ -1555,12 +1555,12 @@ def _apply_preview_flags(item: QTreeWidgetItem) -> None:
 
 
 def _apply_leaf_style(item: QTreeWidgetItem, has_data: bool) -> None:
-    """Italicise and dim leaves that have no RcsGrid loaded yet."""
+    """Italicize and dim leaves that have no RcsGrid loaded yet."""
     font = item.font(0)
     font.setItalic(not has_data)
     item.setFont(0, font)
     if has_data:
-        item.setForeground(0, QBrush())          # default colour
+        item.setForeground(0, QBrush())          # default color
     else:
         item.setForeground(0, QBrush(QColor("#888888")))
         item.setToolTip(0, "No dataset data loaded – drag from the Datasets table")
@@ -2502,7 +2502,7 @@ class AssemblyTreePanel(QWidget):
         self.btn_build = QToolButton(text="Build Platform")
         self.btn_build.setToolTip(
             "Recursively combine the selected root/branch into a single dataset, "
-            "honouring Use checkboxes and each node's pre-aligned field / "
+            "honoring Use checkboxes and each node's pre-aligned field / "
             "incoherent power add-mode, then aligning axes using the strategy "
             "chosen in the dialog."
         )
@@ -2592,7 +2592,7 @@ class AssemblyTreePanel(QWidget):
     def request_close(self, parent: QWidget | None = None) -> bool:
         if self._build_thread is not None:
             self._build_cancel.set()
-            self._notify("Cancelling Assembly build; close again after it stops.")
+            self._notify("Canceling Assembly build; close again after it stops.")
             return False
         if self._save_in_progress:
             QMessageBox.warning(
@@ -2854,7 +2854,7 @@ class AssemblyTreePanel(QWidget):
 
     def _build_completed(self, result):
         if self._build_cancel.is_set():
-            self._notify("Assembly build cancelled; no result published.")
+            self._notify("Assembly build canceled; no result published.")
         elif result.get("error"):
             self._notify("Build failed: "+result["error"])
         elif result["grid"] is not None:
@@ -3623,7 +3623,7 @@ def _combine_children(
     if coh_grids:
         for g in coh_grids:
             if cancel_check is not None and cancel_check():
-                raise InterruptedError("Assembly build cancelled.")
+                raise InterruptedError("Assembly build canceled.")
             missing = np.isfinite(g.rcs_power) & ~np.isfinite(g.rcs_phase)
             if np.any(missing):
                 raise ValueError(
@@ -3639,7 +3639,7 @@ def _combine_children(
         C_coh = np.array(_field(coh_grids[0]), copy=True)
         for g in coh_grids[1:]:
             if cancel_check is not None and cancel_check():
-                raise InterruptedError("Assembly build cancelled.")
+                raise InterruptedError("Assembly build canceled.")
             next_field = _field(g)
             result_dtype = np.result_type(C_coh.dtype, next_field.dtype)
             if C_coh.dtype != result_dtype:
@@ -3651,7 +3651,7 @@ def _combine_children(
         P_incoh = np.array(incoh_grids[0].rcs_power, copy=True)
         for g in incoh_grids[1:]:
             if cancel_check is not None and cancel_check():
-                raise InterruptedError("Assembly build cancelled.")
+                raise InterruptedError("Assembly build canceled.")
             result_dtype = np.result_type(P_incoh.dtype, g.rcs_power.dtype)
             if P_incoh.dtype != result_dtype:
                 P_incoh = P_incoh.astype(result_dtype)
@@ -3776,7 +3776,7 @@ def build_assembly_grid(
     coherent_metadata_attested: bool = False,
     cancel_check=None,
 ):
-    """Recursively materialise an assembly subtree into a single RcsGrid.
+    """Recursively materialize an assembly subtree into a single RcsGrid.
 
     Leaves return their stored grid (or None if empty). Branches/roots gather
     every enabled, non-None child grid, separate them by add-mode, align all
@@ -3791,7 +3791,7 @@ def build_assembly_grid(
     no loaded data.
     """
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Assembly build cancelled.")
+        raise InterruptedError("Assembly build canceled.")
     if not isinstance(coherent_metadata_attested, (bool, np.bool_)):
         raise TypeError("coherent_metadata_attested must be True or False")
     if _is_preview_item(node):
@@ -3867,7 +3867,7 @@ def build_assembly_grid(
     )
     n_coh = len(coh)
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Assembly build cancelled.")
+        raise InterruptedError("Assembly build canceled.")
     aligned_coh = aligned[:n_coh]
     aligned_incoh = aligned[n_coh:]
     ref = aligned[0]
@@ -3892,7 +3892,7 @@ def build_assembly_grid(
         losses = [int(source.rcs_power.size-aligned_grid.rcs_power.size) for source, aligned_grid in zip(grids_in_order, aligned)]
         history += " | Exact intersection discarded samples per input: " + ", ".join(map(str, losses))
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Assembly build cancelled.")
+        raise InterruptedError("Assembly build canceled.")
     if len(coh) > 1:
         if coherent_metadata_attested:
             history += (

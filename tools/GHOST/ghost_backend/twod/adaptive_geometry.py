@@ -79,7 +79,7 @@ def panel_parameters(snapshot, segment, a, b, base_count, fixed_count, refinemen
     elif right: t = 1 - (1-t)**1.7
     points = a[None, :] + t[:, None] * (b-a)[None, :]
     # The ends are the primitive's own vertices: a + 1.0*(b - a) can miss b in
-    # the last place and split the shared vertex from its neighbour's copy.
+    # the last place and split the shared vertex from its neighbor's copy.
     points[0] = a
     points[-1] = b
     return key, points

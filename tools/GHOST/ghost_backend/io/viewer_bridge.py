@@ -87,7 +87,7 @@ def from_grid(grid, out_path: 'str', *, amp: 'Optional[np.ndarray]' = None,
     """Write an RcsGrid back as a .grim this repo can read.
 
     ``grid.save`` already preserves rcs_amp_real/imag for a grid that was loaded
-    and not reshaped (the viewer tool carries unmodelled keys through), so this
+    and not reshaped (the viewer tool carries unmodeled keys through), so this
     is only needed when the grid was DERIVED -- cropped, joined, interpolated --
     and therefore dropped the stale amplitude, or when the amplitude came from
     somewhere else.  Pass ``amp`` (complex, shaped like the grid) to supply it.

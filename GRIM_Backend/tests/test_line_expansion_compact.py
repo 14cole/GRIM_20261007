@@ -153,10 +153,10 @@ class LineExpansionCompactTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     raise RuntimeError("Test cancellation did not arrive")
                 time.sleep(0.001)
-            raise InterruptedError("Cancelled test expansion")
+            raise InterruptedError("Canceled test expansion")
 
         self.tab._append_row(["section.geo"] + ["0"] * 8 + ["1"] + [""] * 3)
-        self.tab.output_edit.setText(str(Path(self.temp.name) / "cancelled.grim"))
+        self.tab.output_edit.setText(str(Path(self.temp.name) / "canceled.grim"))
         with patch.object(module, "expand_wing_sections", side_effect=slow_expansion):
             self.tab.run_button.click()
             deadline = time.monotonic() + 5
@@ -174,7 +174,7 @@ class LineExpansionCompactTests(unittest.TestCase):
                 self.app.processEvents()
                 time.sleep(0.001)
             self.assertFalse(self.tab.job_is_running())
-        self.assertEqual(self.tab.status_label.text(), "Cancelled test expansion")
+        self.assertEqual(self.tab.status_label.text(), "Canceled test expansion")
         self.assertTrue(self.tab.run_button.isEnabled())
         self.assertTrue(self.tab.section_table.isEnabled())
         self.assertFalse(Path(self.tab.output_edit.text()).exists())

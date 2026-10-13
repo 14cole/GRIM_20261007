@@ -57,7 +57,7 @@ def scene_extents(value):
         return None
     values = np.asarray(value, dtype=float)
     if values.shape != (2,) or not np.all(np.isfinite(values)) or np.any(values <= 0):
-        raise ValueError("Scene half extents must be two finite positive distances in metres")
+        raise ValueError("Scene half extents must be two finite positive distances in meters")
     return tuple(float(v) for v in values)
 
 

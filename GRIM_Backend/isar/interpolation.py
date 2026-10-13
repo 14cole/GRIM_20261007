@@ -141,7 +141,7 @@ def resample_pair(source, field, coverage, target, *, axis, support, cancel_chec
         selected = np.flatnonzero((tap_count == taps) & np.asarray(support))
         for start in range(0, len(selected), 2048):
             if cancel_check is not None and cancel_check():
-                raise InterruptedError('ISAR computation cancelled')
+                raise InterruptedError('ISAR computation canceled')
             ids = selected[start:start + 2048]
             indices = right[ids, None] + np.arange(-taps//2, taps//2)[None, :]
             contiguous = sectors[indices[:, 0]] == sectors[indices[:, -1]]
@@ -158,7 +158,7 @@ def resample_pair(source, field, coverage, target, *, axis, support, cancel_chec
             coefficients = coefficients.astype(np.float32)
             for column in range(0, values.shape[1], max(1, 65536//len(ids))):
                 if cancel_check is not None and cancel_check():
-                    raise InterruptedError('ISAR computation cancelled')
+                    raise InterruptedError('ISAR computation canceled')
                 end = min(values.shape[1], column + max(1, 65536//len(ids)))
                 reference = values[left[ids], column:end]
                 interpolated = reference.copy()
@@ -184,7 +184,7 @@ def cartesian_pair(field, coverage, theta, frequency, axes, *, block_size=128, c
     az_block = min(block_size, max(1, 65536 // len(theta)))
     for start in range(0, len(frequency), az_block):
         if cancel_check is not None and cancel_check():
-            raise InterruptedError('ISAR computation cancelled')
+            raise InterruptedError('ISAR computation canceled')
         end = min(start + az_block, len(frequency))
         arg = q[:, None] / (frequency[None, start:end] / fc)
         coordinates = (np.arcsin(np.clip(arg, -1, 1)) - psi[0]) / np.mean(np.diff(psi))
@@ -197,7 +197,7 @@ def cartesian_pair(field, coverage, theta, frequency, axes, *, block_size=128, c
     range_block = min(block_size, max(1, 65536 // len(frequency)))
     for start in range(0, len(q), range_block):
         if cancel_check is not None and cancel_check():
-            raise InterruptedError('ISAR computation cancelled')
+            raise InterruptedError('ISAR computation canceled')
         end = min(start + range_block, len(q))
         required_f = np.sqrt(v[None, :]**2 + u[start:end, None]**2)
         coordinates = (required_f - frequency[0]) / np.mean(np.diff(frequency))

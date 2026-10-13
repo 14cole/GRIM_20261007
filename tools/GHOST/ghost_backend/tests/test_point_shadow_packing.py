@@ -137,7 +137,7 @@ class PointShadowPackingTests(unittest.TestCase):
             cancellation_checks += 1
             return cancellation_checks >= 3
 
-        with self.assertRaisesRegex(InterruptedError, "cancelled"):
+        with self.assertRaisesRegex(InterruptedError, "canceled"):
             blocker.visible_many_packed(
                 points,
                 directions,

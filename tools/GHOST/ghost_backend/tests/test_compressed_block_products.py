@@ -82,7 +82,7 @@ def test_cancellation_waits_for_running_groups_and_closes_pool():
             import threading
             def cancel():
                 if threading.current_thread().name.startswith('ghost-inverse-products'):
-                    raise InterruptedError('cancelled')
+                    raise InterruptedError('canceled')
             op.checkpoint = cancel
             apply(rows, cols, np.ones((1024, 8), complex))
     assert team.pool is None

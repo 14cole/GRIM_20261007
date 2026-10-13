@@ -172,7 +172,7 @@ class ImportQueueTests(unittest.TestCase):
             root = Path(directory)
             unknown = root / "custom.dat"
             unknown.write_text("frequency_Hz azimuth phase magnitude\n1e9 0 90 2\n")
-            cancelled = root / "cancelled.csv"
+            cancelled = root / "canceled.csv"
             cancelled.write_text("f,mag\n1e9,2\n")
             standard, queued = root / "standard.grim", root / "queued.grim"
             grid = grid_from_mapped_rows(records(), "source", "RCS power (m²)")
@@ -202,7 +202,7 @@ class ImportQueueTests(unittest.TestCase):
                     if self.window._background_worker_thread is None and not self.window._pending_import_batches:
                         break
                     time.sleep(.005)
-            self.assertEqual(seen, ["custom.dat", "cancelled.csv"])
+            self.assertEqual(seen, ["custom.dat", "canceled.csv"])
             self.assertEqual(self.window.table.rowCount(), 3, self.window.status.currentMessage())
             mapped_row = next(r for r in range(3) if self.window.table.item(r, 0).text() == "custom")
             self.assertTrue(self.window.table.item(mapped_row, 0).data(DATASET_DIRTY_ROLE))
@@ -210,4 +210,4 @@ class ImportQueueTests(unittest.TestCase):
             mapped = self.window.table.item(mapped_row, 0).data(Qt.UserRole)
             self.assertAlmostEqual(mapped.rcs_power.item(), 4.0)
             self.assertFalse(self.window._table_mapping_active)
-            self.assertIn("cancelled", self.window._last_import_summary)
+            self.assertIn("canceled", self.window._last_import_summary)

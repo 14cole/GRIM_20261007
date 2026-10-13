@@ -32,7 +32,7 @@ def _union(intervals):
 
 def visible_intervals(occluder, starts, ends, direction, cancel_check=None):
     if cancel_check is not None and cancel_check():
-        raise InterruptedError("Line visibility cancelled.")
+        raise InterruptedError("Line visibility canceled.")
     starts, ends = np.asarray(starts, float), np.asarray(ends, float)
     direction = np.asarray(direction, float)
     if (starts.ndim != 2 or starts.shape[1] != 3 or ends.shape != starts.shape
@@ -55,7 +55,7 @@ def visible_intervals(occluder, starts, ends, direction, cancel_check=None):
     tolerance = 4e-9 * occluder.diag
     for offset in range(0, len(starts), 128):
         if cancel_check is not None and cancel_check():
-            raise InterruptedError("Line visibility cancelled.")
+            raise InterruptedError("Line visibility canceled.")
         p = starts[offset:offset+128]
         delta = ends[offset:offset+128] - p
         blocked = [[] for _ in p]
@@ -63,7 +63,7 @@ def visible_intervals(occluder, starts, ends, direction, cancel_check=None):
         terms_cache = {}
         while stack:
             if cancel_check is not None and cancel_check():
-                raise InterruptedError("Line visibility cancelled.")
+                raise InterruptedError("Line visibility canceled.")
             node, rows = stack.pop()
             # A conservative ray/box test against the segment-expanded box.
             lo = occluder._bvh_lo[node] - np.maximum(delta[rows], 0) - tolerance

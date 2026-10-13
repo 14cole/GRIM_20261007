@@ -50,9 +50,9 @@ class ExactSpoolTests(unittest.TestCase):
 
     def test_cancellation_during_build_closes_files(self):
         surface = bor.BorPecSolver(bor.sphere_generatrix(.035,8),1e9)
-        surface._checkpoint = mock.Mock(side_effect=RuntimeError('cancelled'))
+        surface._checkpoint = mock.Mock(side_effect=RuntimeError('canceled'))
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RuntimeError,'cancelled'):
+            with self.assertRaisesRegex(RuntimeError,'canceled'):
                 SpooledFarBlocks(surface,3,mode_block=2,spill=directory,tile_threads=1)
             self.assertEqual(list(Path(directory).iterdir()),[])
 
@@ -78,8 +78,8 @@ class ExactSpoolTests(unittest.TestCase):
         with mock.patch.object(bor,'COMPRESSED_FAR_CACHE_MIN_NODES',1), \
                 mock.patch.object(bor,'plan_compressed_far_spill',return_value=('not-used',1.)), \
                 mock.patch('ghost_backend.bor.spooled_far.SpooledFarBlocks',
-                           side_effect=InterruptedError('cancelled')):
-            with self.assertRaisesRegex(InterruptedError,'cancelled'):
+                           side_effect=InterruptedError('canceled')):
+            with self.assertRaisesRegex(InterruptedError,'canceled'):
                 bor.solve_bor(bor.sphere_generatrix(.035,8),1e9,[0.,180.],
                               bor_options=dict(factorization='compressed'))
 
