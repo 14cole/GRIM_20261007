@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import csv
+import io
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLabel, QPushButton,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QSizePolicy, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 from matplotlib.widgets import SpanSelector
@@ -13,6 +15,19 @@ from matplotlib.widgets import SpanSelector
 from GRIM_Backend.plotting.engineering_tools import finite_runs, measure_trace
 from GRIM_Backend.plotting.modes.common import NativeSamples, decimate_line
 from GRIM_Backend.ui.engineering_analysis import EngineeringAnalysisDialog, ResultTable, _number
+from GRIM_Backend.ui.iq_analysis import IQControls, render_iq
+
+
+_PHASE_HELP = {
+    "iq": "I is the real field and Q is the imaginary field. Distance from the origin is amplitude; its square is linear RCS, scattering width, or power ratio. Angle is phase relative to the measurement reference. Color and arrows follow frequency or angle, not elapsed time or a target outline. Radial motion indicates amplitude change; rotation indicates phase change. A loop alone does not identify a fault or count scatterers.",
+    "iq_compare": "Compare A and B at matching physical coordinates. Radial separation indicates amplitude mismatch; angular separation indicates phase mismatch. Choose Common peak = 1 for one shared scale. Phase only removes amplitude information. Different phase references can rotate otherwise similar measurements, so check the metadata notes in Results.",
+    "iq_difference": "This plots the complex field A − B at matching physical coordinates. Agreement is at the origin in native/common-peak scaling. Phase only shows residual direction and discards mismatch magnitude; zero has no direction. A large difference can come from amplitude, phase, or both; it is not the difference between dB values. Compare the A/B overlay before attributing a residual to a physical cause.",
+    "iq_compensated": "Set a phase offset and, for frequency cuts, a delay in Options. Original and corrected curves remain visible. The correction removes only the stated rotation and phase slope, around the reference frequency reported in Results. A flatter curve can help isolate remaining structure; it does not prove a propagation path or target range. Original data are unchanged.",
+    "iq_repeat": "Select repeated datasets before clicking Update. Each point is one run at the same frequency, azimuth, elevation, and polarization. Move the coordinate to examine another location. A tight cloud indicates repeatable complex returns; spread can reflect amplitude or phase variation. The cross is the complex mean. This view does not pool a sweep into a noise cloud or establish coherence from a single run.",
+    "phase": "Magnitude shows return strength; phase shows its reference-relative angle. Wrapped phase jumps at ±180 degrees. Unwrapping removes these display jumps within usable segments, but cannot recover missing cycles. Near a null, phase is undefined or unreliable; the floor in Options masks weak phase samples.",
+    "residual": "Phase residual is A minus B at matching physical coordinates. A constant offset can indicate a reference difference; a frequency-dependent slope can indicate a delay difference. Use compatible phase conventions before assigning a physical cause.",
+    "slope": "The fitted frequency phase slope gives an apparent delay under the selected time convention. Phase sampling can alias delay; unwrapping assumes adjacent changes below 180 degrees. Inspect residuals and the fit span in Results before interpreting the slope as a physical path.",
+}
 
 
 class _RegionSelector(SpanSelector):
@@ -66,7 +81,6 @@ class InlineEngineeringAnalysis(QWidget):
     _region = EngineeringAnalysisDialog._region
     _maximum_gap = EngineeringAnalysisDialog._maximum_gap
     _sync_region_context = EngineeringAnalysisDialog._sync_region_context
-    _copy_samples = EngineeringAnalysisDialog._copy_samples
     _export_results = EngineeringAnalysisDialog._export_results
     _analyze_phase = EngineeringAnalysisDialog._analyze_phase
     _analyze_polarization = EngineeringAnalysisDialog._analyze_polarization
@@ -91,6 +105,8 @@ class InlineEngineeringAnalysis(QWidget):
         self._selected_sweep_preference = True
         self._panels = {}
         self._display_serial = 0
+        self._iq_controller = None
+        self._iq_hold = False
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(3)
@@ -103,6 +119,8 @@ class InlineEngineeringAnalysis(QWidget):
         self.trace_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.phase_view, self.pol_view = QComboBox(), QComboBox()
         for title, code in (("Magnitude + phase", "phase"), ("I/Q trajectory", "iq"),
+                            ("I/Q overlay A / B", "iq_compare"), ("I/Q difference A − B", "iq_difference"),
+                            ("I/Q phase / delay compensation", "iq_compensated"), ("I/Q repeated runs", "iq_repeat"),
                             ("Phase residual A − B", "residual"), ("Frequency phase-slope fit", "slope")):
             self.phase_view.addItem(title, code)
         for title, code in (("Channel strengths / ratios", "ratios"), ("HV / VH reciprocity", "reciprocity"),
@@ -128,12 +146,22 @@ class InlineEngineeringAnalysis(QWidget):
         self.options_button.setCheckable(True); row.addWidget(self.options_button)
         self.results_button = QToolButton(); self.results_button.setText("Results")
         self.results_button.setCheckable(True); row.addWidget(self.results_button)
+        self.interpret_button = QToolButton(); self.interpret_button.setText("Interpret")
+        self.interpret_button.setCheckable(True); row.addWidget(self.interpret_button)
         close = QToolButton(); close.setText("×"); close.setToolTip("Hide analysis controls")
         close.clicked.connect(self.deactivate); row.addWidget(close)
         outer.addLayout(row)
         self.summary = QLabel(); self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.PlainText); measure_row.addWidget(self.summary, 1)
         outer.addLayout(measure_row)
+        self.interpretation = QLabel(); self.interpretation.setWordWrap(True)
+        self.interpretation.setTextFormat(Qt.PlainText); self.interpretation.hide()
+        self.interpret_button.toggled.connect(lambda checked: self.interpretation.setVisible(checked and self.active_key == "phase"))
+        outer.addWidget(self.interpretation)
+        self.iq_controls = IQControls()
+        self.iq_controls.changed.connect(self._update_current)
+        outer.addWidget(self.iq_controls.cursor_widget)
+        self.iq_controls.cursor_widget.hide()
 
         self.options = QScrollArea(); self.options.setWidgetResizable(True)
         self.options.setFixedHeight(110); self.options.setFrameShape(QScrollArea.NoFrame)
@@ -152,43 +180,45 @@ class InlineEngineeringAnalysis(QWidget):
         for column, (label, combo) in enumerate(((self.dataset_label, self.dataset_combo),
                                                 (self.axis_label, self.axis_combo),
                                                 (self.reference_label, self.reference_combo))):
-            grid.addWidget(label, 0, column * 2); grid.addWidget(combo, 0, column * 2 + 1)
+            grid.addWidget(label, 1, column * 2); grid.addWidget(combo, 1, column * 2 + 1)
         self.fixed, self.fixed_labels = {}, {}
         for column, name in enumerate(("azimuth", "elevation", "frequency", "polarization")):
             combo = QComboBox(); label = QLabel(name.capitalize())
             self.fixed[name], self.fixed_labels[name] = combo, label
-            grid.addWidget(label, 1, column * 2); grid.addWidget(combo, 1, column * 2 + 1)
+            grid.addWidget(label, 2, column * 2); grid.addWidget(combo, 2, column * 2 + 1)
             combo.currentIndexChanged.connect(self._update_current)
         self.use_region = QCheckBox("Use region")
         self.region_start, self.region_stop = self._spin(), self._spin()
-        grid.addWidget(self.use_region, 2, 0); grid.addWidget(self.region_start, 2, 1)
-        grid.addWidget(QLabel("to"), 2, 2); grid.addWidget(self.region_stop, 2, 3)
+        grid.addWidget(self.use_region, 3, 0); grid.addWidget(self.region_start, 3, 1)
+        grid.addWidget(QLabel("to"), 3, 2); grid.addWidget(self.region_stop, 3, 3)
         self.gap_enabled = QCheckBox("Split gaps above")
         self.gap = self._spin(minimum=1e-12, maximum=1e300, value=1.)
-        grid.addWidget(self.gap_enabled, 2, 4); grid.addWidget(self.gap, 2, 5)
+        grid.addWidget(self.gap_enabled, 3, 4); grid.addWidget(self.gap, 3, 5)
         self.floor = self._spin(minimum=-300., maximum=0., value=-60.); self.floor.setSuffix(" dB")
         self.floor_label = QLabel("Mask below peak")
-        grid.addWidget(self.floor_label, 3, 0); grid.addWidget(self.floor, 3, 1)
+        grid.addWidget(self.floor_label, 4, 0); grid.addWidget(self.floor, 4, 1)
         self.crossing_level, self.peak_drop = self._spin(value=-10.), self._spin(minimum=0., value=3.)
         self.crossing_label, self.peak_drop_label = QLabel("Crossing level"), QLabel("Peak drop for width")
-        grid.addWidget(self.crossing_label, 3, 0); grid.addWidget(self.crossing_level, 3, 1)
-        grid.addWidget(self.peak_drop_label, 3, 2); grid.addWidget(self.peak_drop, 3, 3)
+        grid.addWidget(self.crossing_label, 4, 0); grid.addWidget(self.crossing_level, 4, 1)
+        grid.addWidget(self.peak_drop_label, 4, 2); grid.addWidget(self.peak_drop, 4, 3)
         self.phase_sign = QComboBox()
         for title, code in (("Declared sign (+jwt if unspecified)", "auto"), ("exp(+jwt)", "+jwt"), ("exp(−jwt)", "-jwt")):
             self.phase_sign.addItem(title, code)
-        grid.addWidget(self.phase_sign, 3, 2, 1, 2)
+        grid.addWidget(self.phase_sign, 4, 2, 1, 2)
         self.pol_a, self.pol_b = QComboBox(), QComboBox()
         self.pol_a_label, self.pol_b_label = QLabel("Channel A"), QLabel("Channel B")
-        grid.addWidget(self.pol_a_label, 3, 2); grid.addWidget(self.pol_a, 3, 3)
-        grid.addWidget(self.pol_b_label, 3, 4); grid.addWidget(self.pol_b, 3, 5)
-        analyze = QPushButton("Apply options"); grid.addWidget(analyze, 3, 6, 1, 2)
+        grid.addWidget(self.pol_a_label, 4, 2); grid.addWidget(self.pol_a, 4, 3)
+        grid.addWidget(self.pol_b_label, 4, 4); grid.addWidget(self.pol_b, 4, 5)
+        analyze = QPushButton("Apply options"); grid.addWidget(analyze, 4, 6, 1, 2)
         analyze.clicked.connect(self._update_current)
         self.selected_sweep = QCheckBox("Use selected sweep samples")
         self.selected_sweep.setChecked(True)
         self.selected_sweep.setToolTip("Use the sweep-axis samples selected in the main parameter list when Update was clicked. Uncheck for the full native cut.")
         self.selected_sweep.toggled.connect(self._selected_sweep_changed)
         self.sweep_note = QLabel(); self.sweep_note.setWordWrap(True)
-        grid.addWidget(self.selected_sweep, 4, 0, 1, 3); grid.addWidget(self.sweep_note, 4, 3, 1, 5)
+        grid.addWidget(self.selected_sweep, 5, 0, 1, 3); grid.addWidget(self.sweep_note, 5, 3, 1, 5)
+        grid.addWidget(self.iq_controls, 0, 0, 1, 8)
+        self.iq_controls.hide()
 
         self.results = QScrollArea(); self.results.setWidgetResizable(True)
         self.results.setFrameShape(QScrollArea.NoFrame)
@@ -215,6 +245,9 @@ class InlineEngineeringAnalysis(QWidget):
                                 ("Copy analysis samples", lambda: self._copy_samples(self.active_key)),
                                 ("Export results CSV…", lambda: self._export_results(self.active_key))):
             button = QPushButton(title); button.clicked.connect(callback); result_actions.addWidget(button)
+        self.export_samples_button = QPushButton("Export I/Q samples CSV…")
+        self.export_samples_button.clicked.connect(self._export_iq_samples)
+        result_actions.addWidget(self.export_samples_button); self.export_samples_button.hide()
         result_actions.addStretch(); result_layout.insertLayout(0, result_actions)
         host = self.canvas.parentWidget()
         host_layout = host.layout() if host is not None else None
@@ -349,6 +382,7 @@ class InlineEngineeringAnalysis(QWidget):
         index = index[(index >= 0) & (index < len(cut.x))]
         context = f"Main selection: {len(index)} of {len(cut.x)} native {cut.axis} samples, captured at Update."
         return replace(cut, x=cut.x[index], power=cut.power[index], field=cut.field[index], db=cut.db[index],
+                       native_indices=cut.native_indices[index] if cut.native_indices is not None else index,
                        notes=[*cut.notes, context])
 
     def _reset_measurement(self, *_args):
@@ -358,6 +392,48 @@ class InlineEngineeringAnalysis(QWidget):
             self._prefer_native_source = self.trace_combo.currentData() is None
         self._measurement = None; self._peak_position = -1
         self._update_current()
+
+    def _iq_repeat_cuts(self):
+        """One cut per selected run, with fixed coordinates matched to A."""
+        cuts, notes = [self._cut()], []
+        self._iq_repeat_skipped = []
+        source = self.dataset_combo.currentIndex()
+        for index, (name, _dataset) in enumerate(self._datasets):
+            if index == source:
+                continue
+            try:
+                cuts.append(EngineeringAnalysisDialog._cut(self, dataset_index=index))
+            except (ValueError, IndexError, KeyError) as error:
+                notes.append(f"Skipped {name}: {error}")
+                self._iq_repeat_skipped.append({"label": name, "reason": str(error)})
+        if len(cuts) < 2:
+            notes.append("Only one usable run: select repeated datasets and click Update to compare repeatability.")
+        return cuts, notes
+
+    def _copy_samples(self, key):
+        controller = self._iq_controller if key == "phase" else None
+        if controller is None:
+            return EngineeringAnalysisDialog._copy_samples(self, key)
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter="\t", lineterminator="\n")
+        writer.writerow(controller.headers); writer.writerows(controller.rows)
+        QApplication.clipboard().setText(output.getvalue())
+
+    def _export_iq_samples(self):
+        controller = self._iq_controller
+        if controller is None:
+            return
+        path, _filter = QFileDialog.getSaveFileName(self, "Export native I/Q samples", "iq-samples.csv", "CSV (*.csv)")
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8-sig") as output:
+            writer = csv.writer(output)
+            writer.writerow(controller.headers); writer.writerows(controller.rows)
+
+    def _disconnect_iq(self):
+        if self._iq_controller is not None:
+            self._iq_controller.disconnect()
+            self._iq_controller = None
 
     def _presentation(self):
         key = self.active_key
@@ -369,7 +445,16 @@ class InlineEngineeringAnalysis(QWidget):
         native = key != "measure" or self.trace_combo.currentData() is None
         for widget in (self.dataset_label, self.dataset_combo, self.axis_label, self.axis_combo):
             widget.setVisible(native)
-        residual = key == "phase" and self.phase_view.currentData() == "residual"
+        view = self.phase_view.currentData()
+        iq = key == "phase" and str(view).startswith("iq")
+        self.iq_controls.setVisible(iq); self.iq_controls.cursor_widget.setVisible(iq)
+        self.options.setFixedHeight(170 if iq else 110)
+        self.export_samples_button.setVisible(iq)
+        if iq: self.iq_controls.configure(view)
+        self.interpret_button.setVisible(key == "phase")
+        self.interpretation.setText(_PHASE_HELP.get(view, ""))
+        self.interpretation.setVisible(key == "phase" and self.interpret_button.isChecked())
+        residual = key == "phase" and view in {"residual", "iq_compare", "iq_difference"}
         self.reference_label.setVisible(residual); self.reference_combo.setVisible(residual)
         for name, combo in self.fixed.items():
             visible = native and name != self.axis_combo.currentData() and not (key == "polarization" and name == "polarization")
@@ -377,7 +462,7 @@ class InlineEngineeringAnalysis(QWidget):
         for widget in (self.crossing_label, self.crossing_level, self.peak_drop_label, self.peak_drop):
             widget.setVisible(key == "measure")
         self.floor_label.setVisible(key != "measure"); self.floor.setVisible(key != "measure")
-        self.phase_sign.setVisible(key == "phase" and self.phase_view.currentData() == "slope")
+        self.phase_sign.setVisible(key == "phase" and view in {"slope", "iq_compensated"})
         for widget in (self.pol_a_label, self.pol_a, self.pol_b_label, self.pol_b):
             widget.setVisible(key == "polarization" and self.pol_view.currentData() == "phase")
         index = self.dataset_combo.currentIndex()
@@ -410,6 +495,8 @@ class InlineEngineeringAnalysis(QWidget):
             self._show_analysis_error(key, error)
 
     def _show_analysis_error(self, key, error):
+        self._disconnect_iq()
+        self.iq_controls.readout.clear()
         self._panels[key][2].populate([]); self._panels[key][3].setText(str(error))
         self._samples[key] = []
         if key == "measure":
@@ -427,16 +514,22 @@ class InlineEngineeringAnalysis(QWidget):
     def _render_diagnostic(self, key):
         cut = self._cut()
         view = self.phase_view.currentData() if key == "phase" else self.pol_view.currentData()
+        iq = key == "phase" and str(view).startswith("iq")
         if key == "phase" and view == "slope" and cut.axis != "frequency":
             raise ValueError("Choose Frequency in Options for a phase-slope fit.")
         if key == "phase" and view == "residual":
             self._cut(reference=True)
         signature = (key, view, cut.axis, cut.x_unit, cut.level_unit)
+        if iq:
+            signature += (self.iq_controls.scale_combo.currentData(), self.iq_controls.linked_checkbox.isChecked(), cut.linear_quantity)
         same_layout = getattr(self.figure, "_grim_engineering_signature", None) == signature
         old_limits = [(axes.get_xlim(), axes.get_ylim()) for axes in self.figure.axes] if same_layout else []
         hold = getattr(self.owner, "btn_hold", None)
         held = bool(hold is not None and hold.isChecked() and self.figure.axes and
                     same_layout)
+        self._iq_hold = bool(iq and view == "iq" and held)
+        if not iq: self.figure._grim_iq_held = None
+        if iq: held = False  # The renderer rebuilds held native cuts with one shared scale.
         self._rendering = True
         self._remove_overlays()
         self.owner.last_plot_mode = "engineering_" + key
@@ -458,14 +551,20 @@ class InlineEngineeringAnalysis(QWidget):
             if held:
                 self._panels[key] = (_HeldFigure(self.figure), *original[1:])
             try:
-                getattr(self, "_analyze_" + key)()
+                if iq:
+                    self._iq_controller = render_iq(self, cut, view)
+                    self._samples[key] = self._iq_controller.sample_tuples
+                else:
+                    getattr(self, "_analyze_" + key)()
             finally:
                 self._panels[key] = original
             self.figure._grim_engineering_signature = signature
-            self.figure._grim_independent_y = len(self.figure.axes) > 1
+            data_axes = self._iq_controller.axes if iq else list(self.figure.axes)
+            self.figure._grim_independent_y = len(data_axes) > 1
+            self.figure._grim_independent_x = iq and len(data_axes) > 1
             self.figure._grim_line_plot_signature = None
-            self.owner.plot_ax = self.figure.axes[0]
-            self.owner.plot_axes = list(self.figure.axes) if len(self.figure.axes) > 1 else None
+            self.owner.plot_ax = data_axes[0]
+            self.owner.plot_axes = data_axes if len(data_axes) > 1 else None
             sync = getattr(self.owner, "_sync_plot_limit_spins_from_axes", None)
             if callable(sync): sync(self.owner.plot_ax)
             theme = getattr(self.owner, "_apply_plot_theme", None)
@@ -486,9 +585,8 @@ class InlineEngineeringAnalysis(QWidget):
                 if callable(sync): sync(self.owner.plot_ax)
             restore_markers = getattr(self.owner, "_restore_plot_markers", None)
             if callable(restore_markers): restore_markers()
-            self.summary.setText({
+            self.summary.setText(self._iq_controller.summary if iq else {
                 ("phase", "phase"): "Return strength above; wrapped and locally unwrapped phase below.",
-                ("phase", "iq"): "Complex return trajectory: amplitude changes and phase rotation. Green points start each usable segment.",
                 ("phase", "residual"): "Phase A − B at matching physical coordinates. Use a common phase reference.",
                 ("phase", "slope"): "Frequency phase slope above; fit residual below. Apparent delay and sign assumptions are in Results.",
                 ("polarization", "ratios"): "Channel strengths above; co- and cross-channel power ratios below.",
@@ -508,8 +606,10 @@ class InlineEngineeringAnalysis(QWidget):
             # leave the main toolbar referring to detached axes afterward.
             if not self.figure.axes:
                 self.figure.add_subplot(111)
-            self.owner.plot_ax = self.figure.axes[0]
-            self.owner.plot_axes = list(self.figure.axes) if len(self.figure.axes) > 1 else None
+            data_axes = self._iq_controller.axes if self._iq_controller is not None else [ax for ax in self.figure.axes if ax.get_label() != "<colorbar>"]
+            if not data_axes: data_axes = [self.figure.add_subplot(111)]
+            self.owner.plot_ax = data_axes[0]
+            self.owner.plot_axes = data_axes if len(data_axes) > 1 else None
             self._rendering = False
 
     def _display_line(self, axes, x, y, *, label=None, split_gaps=True, **kwargs):
@@ -597,6 +697,7 @@ class InlineEngineeringAnalysis(QWidget):
                 ax = self.figure.add_subplot(111)
                 self.owner.plot_ax, self.owner.plot_axes = ax, None
                 self.figure._grim_independent_y = False
+                self.figure._grim_independent_x = False
                 self.figure._grim_engineering_signature = None
                 self._display_serial = 0
                 line = self._display_line(ax, x, y, label=label)
@@ -702,6 +803,7 @@ class InlineEngineeringAnalysis(QWidget):
             self._update_current()
 
     def _remove_overlays(self):
+        self._disconnect_iq()
         self.stop_region_selection()
         for artist in self._overlays:
             try: artist.remove()
@@ -711,6 +813,7 @@ class InlineEngineeringAnalysis(QWidget):
     def deactivate(self, *_args):
         if self._rendering: return
         self._remove_overlays()
+        self.figure._grim_iq_held = None
         self._measurement = None
         self.active_key = None
         self.results_button.setChecked(False)

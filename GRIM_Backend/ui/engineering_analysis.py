@@ -382,14 +382,14 @@ class EngineeringAnalysisDialog(QDialog):
         for name, combo in self.fixed.items(): combo.setEnabled(name != axis)
         self._reset_measurement()
 
-    def _cut(self, *, reference=False, polarization=None):
-        index = self.reference_combo.currentIndex() if reference else self.dataset_combo.currentIndex()
+    def _cut(self, *, reference=False, polarization=None, dataset_index=None):
+        index = (self.reference_combo.currentIndex() if reference else self.dataset_combo.currentIndex()) if dataset_index is None else dataset_index
         if not 0 <= index < len(self._datasets): raise ValueError("Select a dataset and refresh the analysis sources.")
         name, dataset = self._datasets[index]
         axis = str(self.axis_combo.currentData())
         fixed = {key + "_index": int(self.fixed[key].currentData() or 0) for key in ("azimuth", "elevation", "frequency")}
         source_index = self.dataset_combo.currentIndex()
-        if reference and 0 <= source_index < len(self._datasets):
+        if (reference or index != source_index) and 0 <= source_index < len(self._datasets):
             source = self._datasets[source_index][1]
             for key in ("azimuth", "elevation", "frequency"):
                 if key == axis: continue
@@ -402,7 +402,7 @@ class EngineeringAnalysisDialog(QDialog):
                 nearest = int(valid[np.argmin(np.abs(values[valid] - converted))])
                 tolerance = np.finfo(float).eps * max(abs(converted), float(np.max(np.abs(values[valid]))), np.finfo(float).tiny) * 32
                 if abs(values[nearest] - converted) > tolerance:
-                    raise ValueError(f"Reference B has no matching {key}={converted:.9g} {axis_unit(dataset, key)} cut.")
+                    raise ValueError(f"{name} has no matching {key}={converted:.9g} {axis_unit(dataset, key)} cut.")
                 fixed[key + "_index"] = nearest
         pol = polarization or self.fixed["polarization"].currentText()
         return dataset_cut(dataset, axis, polarization=pol, label=name, **fixed)
@@ -584,11 +584,13 @@ class EngineeringAnalysisDialog(QDialog):
             for run in phases["runs"]:
                 self._display_line(ax, cut.field[run].real, cut.field[run].imag, label=None, split_gaps=False)
                 ax.plot(cut.field[run[0]].real, cut.field[run[0]].imag, "o", color="#2a9d8f")
-            ax.set(xlabel="I: real normalized field", ylabel="Q: imaginary normalized field", title=cut.label)
+            from GRIM_Backend.plotting.iq_tools import field_unit
+            unit = field_unit(cut)
+            ax.set(xlabel=f"I: real field ({unit})", ylabel=f"Q: imaginary field ({unit})", title=cut.label)
             ax.set_aspect("equal", adjustable="datalim"); ax.grid(True, alpha=.25)
             notes.append("Green points begin each valid run. I/Q uses the normalized complex field, not a dB magnitude.")
             selected = cut.field[phases["valid"]]
-            samples = [("I/Q", selected.real, selected.imag, "normalized field")]
+            samples = [("I/Q", selected.real, selected.imag, unit)]
         elif view == "residual":
             reference = self._cut(reference=True)
             rows.append(("Reference B", reference.label, f"{reference.axis} ({reference.x_unit})"))

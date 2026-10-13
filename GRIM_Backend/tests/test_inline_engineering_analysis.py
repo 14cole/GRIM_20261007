@@ -239,7 +239,8 @@ class InlineEngineeringAnalysisTests(unittest.TestCase):
         self.assertLess(axes[0].get_ylim()[0], -6.)
         self.assertGreater(axes[0].get_ylim()[1], 6.)
         panel.phase_view.setCurrentIndex(panel.phase_view.findData("iq"))
-        self.assertEqual(len(self.window.plot_figure.axes), 1)
+        self.assertEqual(len(panel._iq_controller.axes), 1)
+        self.assertEqual(len(self.window.plot_figure.axes), 2)  # I/Q plus coordinate colorbar.
         self.assertNotIn(axes[0], self.window.plot_figure.axes)
 
     def test_manual_limits_survive_analysis_update_when_auto_scale_is_off(self):

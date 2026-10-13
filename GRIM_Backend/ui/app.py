@@ -15,6 +15,7 @@ from PySide6.QtCore import Qt, QMimeData, QSettings, QTimer
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
+    QIcon,
     QKeySequence,
     QPixmap,
     QShortcut,
@@ -86,6 +87,31 @@ from GRIM_Backend.ui.palette import (
 )
 
 SPLASH_DURATION_MS = 4000
+APPLICATION_ICON_PATH = Path(__file__).resolve().parent / "assets" / "GRIM.png"
+
+
+def _application_icon() -> QIcon:
+    """Use the bundled GRIM artwork for this application and its dialogs."""
+    icon = QIcon(str(APPLICATION_ICON_PATH))
+    app = QApplication.instance()
+    if app is not None and not icon.isNull():
+        app.setWindowIcon(icon)
+    return icon
+
+
+def _set_windows_app_id() -> None:
+    """Give the Python-launched app its own Windows taskbar identity."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "GRIM.RadarImagingMetrics"
+        )
+    except (AttributeError, ImportError, OSError):
+        # Cosmetic shell integration must never prevent GRIM from starting.
+        pass
 
 
 # Plot-operation buttons, per tab: a tuple of toolbar rows. Each spec is
@@ -338,6 +364,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
 
     def __init__(self, *, settings: QSettings | None = None) -> None:
         super().__init__()
+        self.setWindowIcon(_application_icon())
         self.setAcceptDrops(True)
         self._settings = settings if settings is not None else QSettings(
             "GRIM", "GRIM"
@@ -2645,9 +2672,11 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
 
 
 def main() -> int:
+    _set_windows_app_id()
     app = QApplication(sys.argv)
+    _application_icon()
     splash = None
-    splash_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "GRIM.png")
+    splash_path = str(APPLICATION_ICON_PATH)
     if os.path.exists(splash_path):
         splash_pixmap = QPixmap(splash_path)
         if not splash_pixmap.isNull():

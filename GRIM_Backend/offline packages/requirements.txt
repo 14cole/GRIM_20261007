@@ -1,0 +1,23 @@
+# GRIM offline distribution skeleton: Windows x64.
+# Resolve wheels for the Python you supply in ../python_env (currently 3.14.6).
+# Download with dependencies; pip selects compatible versions and wheel tags.
+# Keep the resulting wheel set together for every copy of the distribution.
+# Exact == pins are also supported if you maintain a validated release lock.
+# See README.txt for the download command. Nothing is downloaded during setup.
+
+# Offline environment creation and package installation.
+virtualenv>=20.36.1
+pip>=25.3
+setuptools>=80.9.0
+wheel>=0.45.1
+
+# GRIM, FREDDY, and GHOST runtime.
+numpy>=2.0,<3
+scipy>=1.16,<2
+matplotlib>=3.10,<4
+PySide6>=6.10,<7
+psutil>=7,<8
+pywin32>=311
+
+# pip also downloads dependencies such as PySide6_Addons, PySide6_Essentials,
+# shiboken6, pillow, contourpy, and virtualenv's bootstrap dependencies.

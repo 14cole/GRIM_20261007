@@ -6,7 +6,7 @@ Unwrapping is local to valid runs; no phase is inferred across missing samples.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 import numpy as np
 from scipy.signal import find_peaks
 
@@ -25,6 +25,10 @@ class EngineeringCut:
     label: str
     time_convention: str
     notes: list[str]
+    linear_quantity: str = ""
+    polarization: str = ""
+    fixed_coordinates: dict = dataclass_field(default_factory=dict)
+    native_indices: np.ndarray | None = None
 
 
 def dataset_cut(dataset, axis="frequency", *, azimuth_index=0, elevation_index=0,
@@ -62,13 +66,16 @@ def dataset_cut(dataset, axis="frequency", *, azimuth_index=0, elevation_index=0
         else:
             notes.append(f"{key}: {values[0]}")
     fixed = []
+    fixed_coordinates = {}
     for name, index in zip(numeric_axes, indices[:3]):
         if name != axis:
+            fixed_coordinates[name] = (float(dataset.get_axis(name)[index]), axis_unit(dataset, name))
             fixed.append(f"{name}={float(dataset.get_axis(name)[index]):.9g} {axis_unit(dataset, name)}")
     return EngineeringCut(x, power, field, db, axis, axis_unit(dataset, axis),
                           dataset.default_log_unit(),
                           f"{label} | {polarization} | " + ", ".join(fixed),
-                          declaration, notes)
+                          declaration, notes, dataset.linear_quantity(), str(polarization), fixed_coordinates,
+                          np.arange(len(x), dtype=int))
 
 
 def finite_runs(x, valid, *, maximum_gap=None):

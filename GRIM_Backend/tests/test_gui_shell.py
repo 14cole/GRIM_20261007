@@ -18,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 from matplotlib.colors import to_hex
 from PySide6.QtCore import QItemSelectionModel, QMimeData, QThread, QUrl, Qt, Signal
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -167,6 +167,20 @@ class UnifiedGuiShellTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_grim_artwork_is_used_for_window_application_and_dialogs(self) -> None:
+        expected = QIcon(str(grim_cut_gui.APPLICATION_ICON_PATH))
+        self.assertFalse(expected.isNull())
+        expected_image = expected.pixmap(32, 32).toImage()
+        dialog = QDialog()
+        try:
+            for icon in (
+                self.window.windowIcon(), self.app.windowIcon(), dialog.windowIcon()
+            ):
+                self.assertFalse(icon.isNull())
+                self.assertEqual(icon.pixmap(32, 32).toImage(), expected_image)
+        finally:
+            dialog.deleteLater()
 
     def test_application_palette_choices_are_not_plot_colormaps(self) -> None:
         context = self.window._plot_contexts["plotting"]

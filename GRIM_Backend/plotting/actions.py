@@ -755,6 +755,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         ax.tick_params(colors=text)
         ax.xaxis.label.set_color(text)
         ax.yaxis.label.set_color(text)
+        for annotation in ax.texts:
+            if annotation.get_label() == "_iq_guide":
+                annotation.set_color(text)
         if hasattr(ax, "zaxis") and ax.zaxis is not None:
             ax.zaxis.label.set_color(text)
         if hasattr(ax, "spines"):
@@ -882,7 +885,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if panel is not None:
             panel.deactivate()
         self.plot_figure._grim_independent_y = False
+        self.plot_figure._grim_independent_x = False
         self.plot_figure._grim_engineering_signature = None
+        self.plot_figure._grim_iq_held = None
         self._release_native_plot_samples()
         overlays = getattr(self, "spatial_overlays", None)
         if overlays is not None:
@@ -1092,7 +1097,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             panel.deactivate()
         if not str(self.last_plot_mode).startswith("engineering_"):
             self.plot_figure._grim_independent_y = False
+            self.plot_figure._grim_independent_x = False
             self.plot_figure._grim_engineering_signature = None
+            self.plot_figure._grim_iq_held = None
         else:
             self._set_compare_sector_controls_visible(False)
         image_controls = getattr(self, "image_analysis_controls", None)
@@ -1171,6 +1178,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         figures.add(self.plot_figure)
         self._clear_plot_markers(redraw=False)
         for figure in figures:
+            figure._grim_iq_held = None
             linked_cuts = getattr(figure, "_grim_linked_cuts", None)
             if linked_cuts is not None:
                 linked_cuts.disconnect()
@@ -1523,7 +1531,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     ) -> None:
         if ax is None:
             return
-        if getattr(self.plot_figure, "_grim_independent_y", False):
+        if (getattr(self.plot_figure, "_grim_independent_y", False)
+                or getattr(self.plot_figure, "_grim_independent_x", False)):
             self.plot_figure._grim_limit_axes = ax
 
         if sync_x:
@@ -1916,6 +1925,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                             (self.spin_plot_ymin, ymin), (self.spin_plot_ymax, ymax)):
             plot_common.set_spin_value(spin, value)
         axes = self.plot_axes or [self.plot_ax]
+        independent_x = getattr(self.plot_figure, "_grim_independent_x", False)
         independent_y = getattr(self.plot_figure, "_grim_independent_y", False)
         y_axis = getattr(self.plot_figure, "_grim_limit_axes", self.plot_ax)
         if y_axis not in axes:
@@ -1947,7 +1957,10 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                         "increase the X tick step."
                     )
                 self._set_polar_thetagrids(ax, ticks)
-            else:
+            elif not independent_x or ax is y_axis:
+                # Mixed diagnostic layouts have I/Q coordinates alongside a
+                # frequency/angle sweep. Only the selected axis (and its
+                # Matplotlib shared-X siblings) receives these bounds.
                 ax.set_xlim(xmin, xmax)
                 if xstep > 0.0:
                     ticks = plot_common.bounded_ticks(xmin, xmax, xstep)
@@ -1973,6 +1986,10 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self.plot_canvas.draw_idle()
 
     def _fit_both(self) -> None:
+        if (getattr(self.plot_figure, "_grim_independent_x", False)
+                or getattr(self.plot_ax, "_grim_data_limits", None) is not None):
+            self._fit_independent_analysis_axes(scalex=True, scaley=True)
+            return
         if self.plot_ax.name == "polar":
             self._fit_y()
             return
@@ -2362,7 +2379,56 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             return None
         return min(float(np.min(v)) for v in edges), max(float(np.max(v)) for v in edges)
 
+    def _fit_independent_analysis_axes(self, *, scalex, scaley):
+        """Fit mixed-coordinate diagnostics without fitting cursor overlays.
+
+        Analysis renderers can retain native extrema as ``_grim_data_limits``
+        (xmin, xmax, ymin, ymax), so display reduction and annotation artists
+        cannot hide a narrow feature or expand the data bounds. Collections
+        are included when no explicit bounds are available; relim omits them.
+        """
+        axes = self._zoom_target_axes()
+        for ax in axes:
+            bounds = getattr(ax, "_grim_data_limits", None)
+            if bounds is not None and np.shape(bounds) == (4,) and np.all(np.isfinite(bounds)):
+                xmin, xmax, ymin, ymax = bounds
+                ax.dataLim.set_points(np.array([[xmin, ymin], [xmax, ymax]], dtype=float))
+            else:
+                ax.relim(visible_only=True)
+                for collection in ax.collections:
+                    if collection.get_visible():
+                        points = collection.get_datalim(ax.transData).get_points()
+                        if np.all(np.isfinite(points)):
+                            ax.update_datalim(points)
+            if scalex:
+                ax.set_autoscalex_on(True)
+            if scaley:
+                ax.set_autoscaley_on(True)
+        # Refresh every dataLim before shared axes compute their union.
+        for ax in axes:
+            ax.autoscale_view(scalex=scalex, scaley=scaley)
+            if scalex:
+                ax.set_autoscalex_on(False)
+            if scaley:
+                ax.set_autoscaley_on(False)
+        for coordinate, enabled in (("x", scalex), ("y", scaley)):
+            if enabled:
+                spin = getattr(self, f"spin_plot_{coordinate}step")
+                blocked = spin.blockSignals(True)
+                spin.setValue(0.)
+                spin.blockSignals(blocked)
+        selected = getattr(self.plot_figure, "_grim_limit_axes", self.plot_ax)
+        if selected not in axes:
+            selected = self.plot_ax
+        # Applying the toolbar writes both coordinates, so read both current
+        # bounds even when only one dimension was fitted.
+        self._sync_plot_limit_spins_from_axes(selected, sync_x=True, sync_y=True)
+
     def _fit_x(self) -> None:
+        if (getattr(self.plot_figure, "_grim_independent_x", False)
+                or getattr(self.plot_ax, "_grim_data_limits", None) is not None):
+            self._fit_independent_analysis_axes(scalex=True, scaley=False)
+            return
         if self.plot_ax.name == "polar":
             return
 
@@ -2391,6 +2457,10 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self._apply_plot_limits()
 
     def _fit_y(self) -> None:
+        if (getattr(self.plot_figure, "_grim_independent_x", False)
+                or getattr(self.plot_ax, "_grim_data_limits", None) is not None):
+            self._fit_independent_analysis_axes(scalex=False, scaley=True)
+            return
         if getattr(self.plot_figure, "_grim_independent_y", False):
             for ax in self.plot_axes or [self.plot_ax]:
                 ax.set_autoscaley_on(True)

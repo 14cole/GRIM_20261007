@@ -1,0 +1,5 @@
+# Locally supplied distribution payloads and generated environments.
+/offline packages/*.whl
+/python_env/*
+!/python_env/README.txt
+/.offline_envs/

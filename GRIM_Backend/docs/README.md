@@ -13,12 +13,66 @@ The [vehicle assembly guide](ASSEMBLY_WORKFLOW.md) describes the Body, Points,
 Line features, and Build workflow, including direct feature authoring and reusable
 assembly recipes.
 
-Run GRIM from the repository root after an editable installation:
+For the offline Windows distribution, extract your 64-bit embedded Python
+(Python 3.14.6 for the intended release) into `GRIM_Backend/python_env` and
+place matching wheels and their dependencies in
+`GRIM_Backend/offline packages`, and run `Setup_GRIM_Offline.bat` followed by
+`Launch_GRIM_Offline.bat`. Both launchers are inside `GRIM_Backend`.
+This repository provides the setup skeleton; the runtime and wheels are
+supplied on the release computer. Setup detects the supplied interpreter
+instead of requiring this development computer's Python version.
+The [offline setup instructions](../offline%20packages/README.txt) include
+the wheel download command. Keep the sibling `tools` directory in the
+distribution for FREDDY and GHOST.
+
+For an existing development checkout, run GRIM from the repository root
+after an editable installation:
 
 ```powershell
 py -m pip install -e .
 grim
 ```
+
+## Reading and comparing complex returns
+
+Open **Phase Analysis** in the existing Plotting or ISAR workspace, then choose
+an I/Q view. **Interpret** shows a short explanation for the current view;
+**Options** contains scaling, linked magnitude/phase plots, and radius/phase
+guides. Both stay collapsed until requested. The coordinate box and slider snap
+to native samples; clicking the I/Q curve or a linked plot selects the same
+coordinate. The default colormap is Turbo and follows the sweep coordinate.
+Start/end symbols and arrows show acquisition order, not elapsed time.
+
+- **I/Q trajectory** shows real versus imaginary complex field. Radius is
+  amplitude; squared radius is the dataset's linear RCS, scattering width, or
+  power ratio. Native components use meters for 3-D RCS, square-root meters for
+  2-D width, and dimensionless values for ratios. They are not raw receiver volts.
+- **I/Q overlay A / B** matches physical coordinates, including units and fixed
+  coordinates, without interpolation. Select the datasets before **Update** and
+  choose Dataset A and Reference B in Options. **Common peak = 1** uses one
+  denominator for both curves; **Phase only** removes amplitude information.
+- **I/Q difference A − B** subtracts complex fields. Agreement approaches the
+  origin; a difference can reflect amplitude, phase, or both. It is not dB
+  subtraction. Original log levels and the frequency-dependent dBke reference
+  remain correctly labeled.
+- **I/Q phase / delay compensation** keeps original and corrected curves visible.
+  Enter an offset in degrees and a delay in nanoseconds. Delay applies only to
+  frequency sweeps. Results state the reference frequency, time convention, and
+  exact correction. This is a display operation and leaves stored data intact.
+- **I/Q repeated runs** takes one sample from each selected dataset at the same
+  physical frequency, angles, and polarization. Results report the complex mean,
+  population RMS distance from that mean, and sample I/Q standard deviations.
+  Runs without the chosen coordinate are listed as skipped. A single run can be
+  viewed, but cannot establish repeatability.
+
+Weak finite returns stay visible in native/common-peak I/Q views. Phase is masked
+below the chosen floor and is undefined at zero. Paths break at missing samples
+and omitted native sweep indices. Large overview paths may be reduced; coordinate
+lookup and **Copy analysis samples / Export I/Q samples CSV** retain native values,
+indices, units, polarization, and fixed coordinates. **Results** also offers
+copyable metrics. A/B differences need a meaningful shared phase reference;
+metadata concerns appear as notes. Shape alone does not identify measurement
+faults, coherence, scatterer count, or physical target range.
 
 ## Importing an unfamiliar text table
 
