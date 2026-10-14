@@ -206,8 +206,8 @@ def test_headless_waterfall_independent_cuts_use_requested_irregular_sample(hori
         np.testing.assert_allclose(image.lines[0].get_ydata(), [11.,11.])
     if vertical:
         cut = fig.axes[slot]
-        np.testing.assert_allclose(cut.lines[0].get_xdata(), ds.frequencies)
-        np.testing.assert_allclose(cut.lines[0].get_ydata(), data[1,:])
+        np.testing.assert_allclose(cut.lines[0].get_ydata(), ds.frequencies)
+        np.testing.assert_allclose(cut.lines[0].get_xdata(), data[1,:])
         assert "0.75 deg" in cut.get_title()
         np.testing.assert_allclose(image.lines[-1].get_xdata(), [.75,.75])
 
@@ -226,13 +226,13 @@ def test_headless_waterfall_legacy_flags_and_default_position(options, legacy, e
         if cut.get_xlabel().startswith("Azimuth"):
             np.testing.assert_allclose(cut.lines[0].get_ydata(), data[:,2])
         else:
-            np.testing.assert_allclose(cut.lines[0].get_ydata(), data[1,:])
+            np.testing.assert_allclose(cut.lines[0].get_xdata(), data[1,:])
 
 
 def test_headless_waterfall_outside_position_snaps_to_endpoints():
     fig, ds, data = waterfall_example(options={"linked_cuts":True,"cut_position":[99.,-100.]})
     np.testing.assert_allclose(fig.axes[1].lines[0].get_ydata(), data[:,0])
-    np.testing.assert_allclose(fig.axes[2].lines[0].get_ydata(), data[-1,:])
+    np.testing.assert_allclose(fig.axes[2].lines[0].get_xdata(), data[-1,:])
     assert "2 GHz" in fig.axes[1].get_title()
     assert "9.5 deg" in fig.axes[2].get_title()
 
@@ -245,8 +245,8 @@ def test_headless_waterfall_reversed_axes_use_display_coordinates_for_snapping()
     horizontal, vertical = fig.axes[1:]
     np.testing.assert_allclose(horizontal.lines[0].get_xdata(),ds.frequencies)
     np.testing.assert_allclose(horizontal.lines[0].get_ydata(),data[-1,:])
-    np.testing.assert_allclose(vertical.lines[0].get_xdata(),ds.azimuths)
-    np.testing.assert_allclose(vertical.lines[0].get_ydata(),data[:,1])
+    np.testing.assert_allclose(vertical.lines[0].get_ydata(),ds.azimuths)
+    np.testing.assert_allclose(vertical.lines[0].get_xdata(),data[:,1])
     assert "9.5 deg" in horizontal.get_title()
     assert "4 GHz" in vertical.get_title()
 
@@ -259,20 +259,20 @@ def test_headless_waterfall_click_updates_enabled_cuts_on_each_panel():
     assert len(image_a.lines) == len(image_b.lines) == 1
     click = MouseEvent("button_press_event", fig.canvas, *image_b.transData.transform((8.,5.)), button=1)
     fig.canvas.callbacks.process("button_press_event",click)
-    np.testing.assert_allclose(cut_a.lines[0].get_ydata(),data[-1,:])
+    np.testing.assert_allclose(cut_a.lines[0].get_xdata(),data[-1,:])
     # Navigation tools own mouse input while active.
     fig.canvas.toolbar = SimpleNamespace(mode="pan/zoom")
     click = MouseEvent("button_press_event", fig.canvas, *image_a.transData.transform((-2.,3.)), button=1)
     fig.canvas.callbacks.process("button_press_event",click)
-    np.testing.assert_allclose(cut_a.lines[0].get_ydata(),data[-1,:])
+    np.testing.assert_allclose(cut_a.lines[0].get_xdata(),data[-1,:])
     fig.canvas.toolbar = None
-    np.testing.assert_allclose(cut_b.lines[0].get_ydata(),data[-1,:]+1000.)
+    np.testing.assert_allclose(cut_b.lines[0].get_xdata(),data[-1,:]+1000.)
     np.testing.assert_allclose(image_a.lines[0].get_xdata(),[9.5,9.5])
     np.testing.assert_allclose(image_b.lines[0].get_xdata(),[9.5,9.5])
     # A context-menu click must not change the selected sample.
     click = MouseEvent("button_press_event", fig.canvas, *image_a.transData.transform((-2.,3.)), button=3)
     fig.canvas.callbacks.process("button_press_event",click)
-    np.testing.assert_allclose(cut_a.lines[0].get_ydata(),data[-1,:])
+    np.testing.assert_allclose(cut_a.lines[0].get_xdata(),data[-1,:])
 
 
 @pytest.mark.parametrize("position", [[1.], [1.,2.,3.], [np.nan,2.], [1.,np.inf]])

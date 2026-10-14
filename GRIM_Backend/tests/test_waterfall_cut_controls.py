@@ -305,5 +305,5 @@ def test_recorded_recipe_replays_independent_cuts_at_saved_native_position(horiz
     if horizontal:
         np.testing.assert_array_equal(next(cut_axes).lines[0].get_ydata(), dataset.rcs_power[:, 0, 1, 0])
     if vertical:
-        np.testing.assert_array_equal(next(cut_axes).lines[0].get_ydata(), dataset.rcs_power[2, 0, :, 0])
+        np.testing.assert_array_equal(next(cut_axes).lines[0].get_xdata(), dataset.rcs_power[2, 0, :, 0])
     figure.clear()

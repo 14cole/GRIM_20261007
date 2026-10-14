@@ -157,8 +157,9 @@ def test_python_waterfall_replay_preserves_gap_masks_and_cut_breaks():
     mesh = figure.axes[0].collections[0]
     mask = np.ma.getmaskarray(mesh.get_array())
     assert mask.shape == (7, 7) and mask[3, :].all() and mask[:, 3].all()
-    for cut_axes in figure.axes[1:]:
-        assert np.isnan(cut_axes.lines[0].get_ydata()).sum() == 1
+    horizontal, vertical = figure.axes[1:]
+    assert np.isnan(horizontal.lines[0].get_ydata()).sum() == 1
+    assert np.isnan(vertical.lines[0].get_xdata()).sum() == 1
     figure.canvas.draw()
     figure.clear()
 

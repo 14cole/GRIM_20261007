@@ -205,10 +205,12 @@ class LinkedImageCuts:
         self.position = None
         self.artists = []
         units_by_axes = {}
+        records_by_axes = {}
         for _image, cut_axes, record in panels:
             for ax in cut_axes:
                 if ax is not None:
                     units_by_axes.setdefault(ax, set()).add(record.value_unit)
+                    records_by_axes[ax] = records_by_axes.get(ax, 0) + 1
         for index,(image_ax, (horizontal, vertical), record) in enumerate(panels,1):
             hline = vline = hcursor = vcursor = None
             if horizontal is not None:
@@ -227,9 +229,9 @@ class LinkedImageCuts:
                 vertical.yaxis.set_major_locator(MaxNLocator(3))
                 vertical.xaxis.set_major_locator(MaxNLocator(3))
             self.artists.append((hline, vline, hcursor, vcursor))
-        if len(panels)>1:
-            for legend_ax in (ax for ax in panels[0][1] if ax is not None):
-                legend = legend_ax.legend(ncol=min(4,len(panels)),fontsize=7,loc="upper right")
+        for legend_ax, count in records_by_axes.items():
+            if count > 1:
+                legend = legend_ax.legend(ncol=min(4,count),fontsize=7,loc="upper right")
                 for text in legend.get_texts():
                     text.set_color(legend_ax.xaxis.label.get_color())
                 legend.get_frame().set_facecolor(legend_ax.get_facecolor())
@@ -276,11 +278,15 @@ class LinkedImageCuts:
         if positions == self._last:
             return
         self._last = positions
-        selected_x, selected_y = [], []
+        cut_selections = {}
         for (image_ax, (horizontal, vertical), record), artists in zip(self.panels, self.artists):
             xs, row, ys, column, px, py = cuts(record, x, y)
-            selected_x.append(px)
-            selected_y.append(py)
+            for ax, value, direction, axis, unit in (
+                (horizontal, py, "Horizontal", record.y_axis, record.y_unit),
+                (vertical, px, "Vertical", record.x_axis, record.x_unit),
+            ):
+                if ax is not None:
+                    cut_selections.setdefault((ax, direction, axis, unit), []).append(value)
             hline, vline, hcursor, vcursor = artists
             if hline is not None:
                 hx,hy,_ = decimate_line(*line_with_gaps(xs,row,breaks=record.metadata.get("x_cut_breaks")))
@@ -290,18 +296,11 @@ class LinkedImageCuts:
                 vy,vx,_ = decimate_line(*line_with_gaps(ys,column,breaks=record.metadata.get("y_cut_breaks")))
                 vline.set_data(vx, vy)
                 vcursor.set_xdata([px,px])
-        horizontal, vertical = self.panels[0][1]
-        record = self.panels[0][2]
-        for ax, values, direction, axis, unit in (
-            (horizontal, selected_y, "Horizontal", record.y_axis, record.y_unit),
-            (vertical, selected_x, "Vertical", record.x_axis, record.x_unit),
-        ):
-            if ax is None:
-                continue
+        for (ax, direction, axis, unit), values in cut_selections.items():
             ax.relim()
-            ax.autoscale_view(scalex=ax is vertical, scaley=ax is horizontal)
+            ax.autoscale_view(scalex=direction == "Vertical", scaley=direction == "Horizontal")
             label = f"{min(values):.6g}" if min(values) == max(values) else f"{min(values):.6g}–{max(values):.6g} (per panel)"
-            separator = "\n" if ax is vertical else " · "
+            separator = "\n" if direction == "Vertical" else " · "
             ax.set_title(f"{direction} cuts{separator}{axis} = {label} {unit}", fontsize=8,
                          color=ax.xaxis.label.get_color(),pad=2)
         self.canvas.draw_idle()

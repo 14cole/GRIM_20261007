@@ -163,7 +163,9 @@ def plot_datasets(
     ``horizontal_cuts`` and ``vertical_cuts`` independently override the legacy
     ``linked_cuts`` flag. ``cut_position=[x, y]`` uses displayed physical units;
     each panel snaps to its nearest samples, without interpolation. Omission
-    starts at the center sample of the first panel.
+    starts at the center sample of the first panel. Horizontal cuts appear
+    below their image and share its X axis; vertical cuts appear to the right
+    with response on X and the image's physical Y coordinate on Y.
     """
 
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -298,8 +300,11 @@ def plot_datasets(
         figure = Figure(figsize=(10., max(4., 4.*len(panels))), dpi=100, facecolor="white")
         FigureCanvasAgg(figure)
         cut_count = int(horizontal_cuts) + int(vertical_cuts)
-        spec = figure.add_gridspec(len(panels), 1 + cut_count,
-                                  width_ratios=(2, *([1] * cut_count)) if cut_count else None)
+        shared_bar = bool(show_colorbar and shared_colorbar)
+        spec = figure.add_gridspec(
+            len(panels), 2 if shared_bar else 1,
+            width_ratios=[1, .035] if shared_bar else None,
+        )
         if cut_position is None:
             first_x, first_y = panels[0][1:3]
             cut_position = (first_x[len(first_x) // 2], first_y[len(first_y) // 2])
@@ -312,7 +317,17 @@ def plot_datasets(
         callbacks, image_axes, meshes, cut_views = [], [], [], []
         global_limits = (min(v[0] for v in norms.values()), max(v[1] for v in norms.values())) if norms else None
         for i, (title, x, y, data, response, widths) in enumerate(panels):
-            ax = figure.add_subplot(spec[i, 0])
+            individual_bar = bool(show_colorbar and not shared_colorbar)
+            # Marginal cuts occupy the same grid column/row as their image.
+            # Dedicated colorbar cells preserve that alignment after layout.
+            panel_spec = spec[i, 0].subgridspec(
+                2 if horizontal_cuts else 1,
+                1 + int(vertical_cuts) + int(individual_bar),
+                height_ratios=[3, 1] if horizontal_cuts else None,
+                width_ratios=[4] + ([1.4] if vertical_cuts else [])
+                             + ([.16] if individual_bar else []),
+            )
+            ax = figure.add_subplot(panel_spec[0, 0])
             limits = color_limits if color_limits is not None else global_limits if shared_colorbar else None
             norm = Normalize(*limits) if limits is not None else None
             xe, ye, display = image_grid(x, y, data.T, x_width=widths[0], y_width=widths[1])
@@ -321,29 +336,34 @@ def plot_datasets(
             ax.set(title=title, xlabel=plot_common.axis_label(reference, x_axis), ylabel=plot_common.axis_label(reference, y_axis))
             ax.grid(bool(show_grid))
             image_axes.append(ax); meshes.append(mesh)
-            if show_colorbar and not shared_colorbar:
-                figure.colorbar(mesh, ax=ax, label=response)
             if cut_count:
                 ix = int(np.argmin(abs(x - cut_position[0])))
                 iy = int(np.argmin(abs(y - cut_position[1])))
                 horizontal = vertical = row = column = hline = vline = None
-                slot = 1
                 if horizontal_cuts:
-                    horizontal = figure.add_subplot(spec[i, slot])
-                    slot += 1
+                    horizontal = figure.add_subplot(panel_spec[1, 0], sharex=ax)
                     row, = horizontal.plot(*line_with_gaps(x, data[:, iy]))
                     hline = ax.axhline(y[iy], color="white", linewidth=.8)
                     horizontal.set(xlabel=plot_common.axis_label(reference, x_axis), ylabel=response,
                                    title=f"{y_axis} = {y[iy]:g} {plot_common.axis_unit(reference, y_axis)}")
                     horizontal.grid(bool(show_grid))
+                    ax.set_xlabel("")
+                    ax.tick_params(axis="x", labelbottom=False)
                 if vertical_cuts:
-                    vertical = figure.add_subplot(spec[i, slot])
-                    column, = vertical.plot(*line_with_gaps(y, data[ix, :]))
+                    vertical = figure.add_subplot(panel_spec[0, 1], sharey=ax)
+                    coordinates, values = line_with_gaps(y, data[ix, :])
+                    column, = vertical.plot(values, coordinates)
                     vline = ax.axvline(x[ix], color="white", linewidth=.8)
-                    vertical.set(xlabel=plot_common.axis_label(reference, y_axis), ylabel=response,
+                    vertical.set(xlabel=response,
                                  title=f"{x_axis} = {x[ix]:g} {plot_common.axis_unit(reference, x_axis)}")
                     vertical.grid(bool(show_grid))
+                    vertical.tick_params(axis="y", labelleft=False)
                 cut_views.append((x, y, data, horizontal, vertical, row, column, hline, vline))
+            ax.set_xlim(xe[0], xe[-1])
+            ax.set_ylim(ye[0], ye[-1])
+            if individual_bar:
+                color_axis = figure.add_subplot(panel_spec[0, -1])
+                figure.colorbar(mesh, cax=color_axis, label=response)
         if cut_views:
             def update(event):
                 if (event.inaxes not in image_axes or event.button != 1
@@ -360,17 +380,19 @@ def plot_datasets(
                         row.set_data(*line_with_gaps(x, data[:, iy]))
                         hline.set_ydata([y[iy], y[iy]])
                         horizontal.set_title(f"{y_axis} = {y[iy]:g} {plot_common.axis_unit(reference, y_axis)}")
-                        horizontal.relim(); horizontal.autoscale_view()
+                        horizontal.relim(); horizontal.autoscale_view(scalex=False)
                     if vertical is not None:
-                        column.set_data(*line_with_gaps(y, data[ix, :]))
+                        coordinates, values = line_with_gaps(y, data[ix, :])
+                        column.set_data(values, coordinates)
                         vline.set_xdata([x[ix], x[ix]])
                         vertical.set_title(f"{x_axis} = {x[ix]:g} {plot_common.axis_unit(reference, x_axis)}")
-                        vertical.relim(); vertical.autoscale_view()
+                        vertical.relim(); vertical.autoscale_view(scaley=False)
                 figure.canvas.draw_idle()
             callbacks.append(figure.canvas.mpl_connect("button_press_event", update))
         if show_colorbar and shared_colorbar:
             response = panels[0][4] if len({p[4] for p in panels}) == 1 else "Mixed dB"
-            figure.colorbar(meshes[-1], ax=image_axes, label=response)
+            color_axis = figure.add_subplot(spec[:, 1])
+            figure.colorbar(meshes[-1], cax=color_axis, label=response)
         figure._grim_heatmap_cut_callbacks = callbacks
         figure.set_layout_engine("constrained")
         return figure

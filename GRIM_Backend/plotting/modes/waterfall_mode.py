@@ -120,27 +120,41 @@ def render(self) -> None:
     self.plot_figure.clear()
     self.plot_figure.set_facecolor(self._current_plot_bg())
     self.plot_figure.set_layout_engine("constrained")
-    horizontal = vertical = None
+    shared = self.chk_colorbar_shared.isChecked()
+    show_colorbar = self.chk_colorbar.isChecked()
+    colorbar_axes = []
+    cut_axes = [(None, None)] * len(panels)
     if show_cuts:
-        # Shared cut axes compare all panels without tripling the number of
-        # plot rows. Two image panels remain legible on a laptop canvas.
-        outer = (self.plot_figure.add_gridspec(2,1,height_ratios=[3,1.35]) if show_horizontal
-                 else self.plot_figure.add_gridspec(1,2,width_ratios=[3,1]))
-        columns = min(3,len(panels))
-        images = outer[0].subgridspec(int(np.ceil(len(panels)/columns)),columns)
-        axes = [self.plot_figure.add_subplot(images[i//columns,i%columns]) for i in range(len(panels))]
-        if show_horizontal and show_vertical:
-            cuts_grid = outer[1].subgridspec(1,2,width_ratios=[3,1])
-            horizontal = self.plot_figure.add_subplot(cuts_grid[0],sharex=axes[0])
-            vertical = self.plot_figure.add_subplot(cuts_grid[1],sharey=axes[0])
-        elif show_horizontal:
-            horizontal = self.plot_figure.add_subplot(outer[1],sharex=axes[0])
-        else:
-            vertical = self.plot_figure.add_subplot(outer[1],sharey=axes[0])
-        for ax in (horizontal,vertical):
-            if ax is not None:
-                self._style_axes(ax)
-                ax.tick_params(labelsize=7)
+        # Each marginal shares a grid column/row and the physical axis of its
+        # image. Explicit colorbar slots keep colorbars from shrinking just
+        # the image and breaking that alignment after a draw or resize.
+        columns = min(3, int(np.ceil(np.sqrt(len(panels)))))
+        rows = int(np.ceil(len(panels) / columns))
+        outer = self.plot_figure.add_gridspec(
+            rows, columns + int(show_colorbar and shared),
+            width_ratios=[1.] * columns + ([.04] if show_colorbar and shared else []))
+        panel_grids = []
+        for index in range(len(panels)):
+            widths = [4.] + ([1.4] if show_vertical else [])
+            if show_colorbar and not shared:
+                widths.append(.16)
+            panel_grids.append(outer[index // columns, index % columns].subgridspec(
+                1 + int(show_horizontal), len(widths), width_ratios=widths,
+                height_ratios=[3., 1.] if show_horizontal else [1.]))
+        axes = [self.plot_figure.add_subplot(grid[0, 0]) for grid in panel_grids]
+        cut_axes = []
+        for ax, grid in zip(axes, panel_grids):
+            horizontal = self.plot_figure.add_subplot(grid[1, 0], sharex=ax) if show_horizontal else None
+            vertical = self.plot_figure.add_subplot(grid[0, 1], sharey=ax) if show_vertical else None
+            cut_axes.append((horizontal, vertical))
+            for cut in (horizontal, vertical):
+                if cut is not None:
+                    self._style_axes(cut)
+                    cut.tick_params(labelsize=7)
+            if show_colorbar and not shared:
+                colorbar_axes.append(self.plot_figure.add_subplot(grid[0, -1]))
+        if show_colorbar and shared:
+            colorbar_axes.append(self.plot_figure.add_subplot(outer[:, -1]))
     else:
         columns = min(3,int(np.ceil(np.sqrt(len(panels)))))
         slots = self.plot_figure.subplots(int(np.ceil(len(panels)/columns)),columns,squeeze=False).ravel()
@@ -149,7 +163,6 @@ def render(self) -> None:
             self.plot_figure.delaxes(extra)
     self.plot_axes, self.plot_ax = axes, axes[0]
     zmin, zmax = self.spin_plot_zmin.value(), self.spin_plot_zmax.value()
-    shared = self.chk_colorbar_shared.isChecked()
     limits = common.finite_data_limits(p["display"] for p in panels) if shared else None
     vmin, vmax = (zmin, zmax) if zmin < zmax else (limits if limits else (None, None))
     meshes, records = [], []
@@ -195,9 +208,22 @@ def render(self) -> None:
         ax.set_xlabel(self._plot_axis_label(reference, x_axis),fontsize=8 if compact else 10,labelpad=1)
         ax.set_ylabel(self._plot_axis_label(reference, y_axis),fontsize=8 if compact else 10,labelpad=1)
         ax.tick_params(labelsize=7 if compact else 10)
-    if self.chk_colorbar.isChecked():
-        self.plot_colorbars = ([self.plot_figure.colorbar(meshes[-1], ax=axes)] if shared
-            else [self.plot_figure.colorbar(mesh, ax=ax) for mesh, ax in zip(meshes, axes)])
+        horizontal, vertical = cut_axes[panel_index - 1]
+        if horizontal is not None:
+            horizontal.set_xlabel(self._plot_axis_label(reference, x_axis), fontsize=8, labelpad=1)
+            ax.set_xlabel("")
+            ax.tick_params(labelbottom=False)
+        if vertical is not None:
+            # Keep one physical y scale beside the image; the shared scale
+            # still governs the vertical cut when limits or direction change.
+            vertical.tick_params(labelleft=False)
+    if show_colorbar:
+        if colorbar_axes:
+            self.plot_colorbars = ([self.plot_figure.colorbar(meshes[-1], cax=colorbar_axes[0])] if shared
+                else [self.plot_figure.colorbar(mesh, cax=cax) for mesh, cax in zip(meshes, colorbar_axes)])
+        else:
+            self.plot_colorbars = ([self.plot_figure.colorbar(meshes[-1], ax=axes)] if shared
+                else [self.plot_figure.colorbar(mesh, ax=ax) for mesh, ax in zip(meshes, axes)])
         for index, colorbar in enumerate(self.plot_colorbars):
             self._apply_colorbar_ticks(colorbar)
             ds = datasets if shared else [(panels[index]["name"], panels[index]["dataset"])]
@@ -211,7 +237,7 @@ def render(self) -> None:
             return not busy and not (overlays is not None and (
                 overlays.drawing is not None or overlays.drag is not None))
         controller = LinkedImageCuts(self.plot_canvas,
-            list(zip(axes, [(horizontal,vertical)]*len(panels), records)), can_select=can_select)
+            list(zip(axes, cut_axes, records)), can_select=can_select)
         self.plot_figure._grim_linked_cuts = controller
         if callable(getattr(controls, "bind", None)):
             controls.bind(controller)
