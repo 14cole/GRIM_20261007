@@ -74,6 +74,7 @@ from GRIM_Backend.reports.workspace import DatasetCatalogEntry, PptWorkspace
 from GRIM_Backend.plotting.models import PlotContext
 from GRIM_Backend.ui.delta_map_controls import DeltaMapControls
 from GRIM_Backend.ui.spatial_overlays import SpatialOverlayPanel
+from GRIM_Backend.ui.responsive_controls import ResponsiveButtonPanel, ResponsiveControlTabs
 
 from GRIM_Backend.ui.palette import (
     APPLICATION_PALETTES,
@@ -114,8 +115,9 @@ def _set_windows_app_id() -> None:
         pass
 
 
-# Plot-operation buttons, per tab: a tuple of toolbar rows. Each spec is
-# (button label, role key). Roles drive both the attribute wiring in
+# Plot-operation buttons, per tab: groups in presentation order (the toolbar
+# wraps according to width). Each spec is (button label, role key). Roles drive
+# both the attribute wiring in
 # _activate_plot_tab and the signal connections in __init__.
 PLOT_OPS_SPECS = {
     "plotting": (
@@ -1910,8 +1912,8 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             lambda event, lbl=hover_readout: self._reset_hover_readout(lbl),
         )
 
-        # Reuse these controls across compact pages on Plotting; ISAR retains
-        # its toolbar rows. Only the presentation changes, not the actions.
+        # Reuse the existing controls, letting the toolbar width determine
+        # line breaks. Only the presentation changes, not the actions.
         row_specs = PLOT_OPS_SPECS[tab_key]
         plot_controls: dict[str, QToolButton] = {}
 
@@ -1991,6 +1993,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
 
         plot_ops_bar = QFrame()
         plot_ops_bar.setObjectName("plotToolbar")
+        plot_ops_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         plot_ops_bar_layout = QVBoxLayout(plot_ops_bar)
         plot_ops_bar_layout.setContentsMargins(8, 6, 8, 6)
         plot_ops_bar_layout.setSpacing(4)
@@ -1998,46 +2001,27 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             for label, role in _specs:
                 _make_plot_button(label, role)
         if tab_key == "plotting":
-            plot_ops_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            groups = QTabWidget()
+            groups = ResponsiveControlTabs()
             groups.setObjectName("plottingControlTabs")
-            groups.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            groups.setStyleSheet(
-                "QTabWidget#plottingControlTabs::right-corner { top: 1px; }"
-            )
-            common_controls = QWidget()
-            common_controls.setObjectName("plottingCommonControls")
-            common_layout = QHBoxLayout(common_controls)
-            common_layout.setContentsMargins(8, 0, 0, 0)
-            common_layout.setSpacing(4)
-            common_layout.addWidget(chk_plot_legend)
+            groups.addCommonWidget(chk_plot_legend)
             for role in ("auto_plot", "auto_scale", "hold", "clear"):
-                common_layout.addWidget(plot_controls[role])
-            groups.setCornerWidget(common_controls, Qt.TopRightCorner)
+                groups.addCommonWidget(plot_controls[role])
             for title, rows in PLOTTING_CONTROL_GROUPS:
-                page = QWidget()
-                page_layout = QVBoxLayout(page)
-                page_layout.setContentsMargins(6, 5, 6, 5)
-                page_layout.setSpacing(4)
+                page = ResponsiveButtonPanel()
+                page.setObjectName("plottingButtons" if title == "Plots" else "plotManipulationButtons")
                 for roles in rows:
-                    bar_row = QHBoxLayout()
-                    bar_row.setSpacing(4)
                     for role in roles:
-                        bar_row.addWidget(plot_controls[role])
-                    bar_row.addStretch(1)
-                    page_layout.addLayout(bar_row)
+                        page.addWidget(plot_controls[role])
                 groups.addTab(page, title)
             plot_ops_bar_layout.addWidget(groups)
         else:
-            for _row_index, _specs in enumerate(row_specs):
-                bar_row = QHBoxLayout()
-                bar_row.setSpacing(4)
-                if _row_index == 0:
-                    bar_row.addWidget(chk_plot_legend)
+            buttons = ResponsiveButtonPanel()
+            buttons.setObjectName("isarButtons")
+            buttons.addWidget(chk_plot_legend)
+            for _specs in row_specs:
                 for _label, role in _specs:
-                    bar_row.addWidget(plot_controls[role])
-                bar_row.addStretch(1)
-                plot_ops_bar_layout.addLayout(bar_row)
+                    buttons.addWidget(plot_controls[role])
+            plot_ops_bar_layout.addWidget(buttons)
         self._plot_controls_by_tab[tab_key] = plot_controls
 
         left_layout.addWidget(plot_frame, 1)

@@ -5,7 +5,7 @@ from dataclasses import replace
 import csv
 import io
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QSizePolicy, QTabWidget, QToolButton, QVBoxLayout, QWidget,
@@ -72,6 +72,29 @@ class _HeldFigure:
         return getattr(self.figure, name)
 
 
+class _SettingsScrollArea(QScrollArea):
+    """Let short controls fit naturally; scroll expanded settings before the plot shrinks."""
+
+    def sizeHint(self):
+        body = self.widget()
+        if body is None:
+            return super().sizeHint()
+        hint = body.sizeHint()
+        layout = body.layout()
+        height = (layout.heightForWidth(max(1, self.viewport().width()))
+                  if layout.hasHeightForWidth() else hint.height())
+        frame = 2 * self.frameWidth()
+        return QSize(hint.width() + frame, min(max(0, height) + frame, self.maximumHeight()))
+
+    def minimumSizeHint(self):
+        return QSize(0, 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if event.oldSize().width() != event.size().width():
+            self.updateGeometry()
+
+
 class InlineEngineeringAnalysis(QWidget):
     """Small contextual controls; computations and result formats remain shared."""
     TAB_NAMES = EngineeringAnalysisDialog.TAB_NAMES
@@ -114,6 +137,10 @@ class InlineEngineeringAnalysis(QWidget):
         row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0); row.setSpacing(5)
         self.tool_label = QLabel("Measure")
         row.addWidget(self.tool_label)
+        self.header_controls = QWidget()
+        controls_row = QHBoxLayout(self.header_controls)
+        controls_row.setContentsMargins(0, 0, 0, 0); controls_row.setSpacing(5)
+        row.addWidget(self.header_controls, 1)
         self.trace_combo = QComboBox(); self.trace_combo.setMinimumWidth(110)
         self.trace_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.trace_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -130,7 +157,7 @@ class InlineEngineeringAnalysis(QWidget):
             combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(10)
             combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            row.addWidget(combo, 1)
+            controls_row.addWidget(combo, 1)
         measure_row = QHBoxLayout(); measure_row.setSpacing(5)
         self.measure_buttons = []
         for title, mode in (("Peak", "peak"), ("Minimum", "minimum"), ("Next peak", "next")):
@@ -141,26 +168,42 @@ class InlineEngineeringAnalysis(QWidget):
         self.drag_region.toggled.connect(self._update_current); measure_row.addWidget(self.drag_region)
         self.refresh_button = QPushButton("Update")
         self.refresh_button.setToolTip("Use the current dataset and parameter selections.")
-        self.refresh_button.clicked.connect(self.refresh_from_selection); row.addWidget(self.refresh_button)
+        self.refresh_button.clicked.connect(self.refresh_from_selection); controls_row.addWidget(self.refresh_button)
         self.options_button = QToolButton(); self.options_button.setText("Options")
-        self.options_button.setCheckable(True); row.addWidget(self.options_button)
+        self.options_button.setCheckable(True); controls_row.addWidget(self.options_button)
         self.results_button = QToolButton(); self.results_button.setText("Results")
-        self.results_button.setCheckable(True); row.addWidget(self.results_button)
+        self.results_button.setCheckable(True); controls_row.addWidget(self.results_button)
         self.interpret_button = QToolButton(); self.interpret_button.setText("Interpret")
-        self.interpret_button.setCheckable(True); row.addWidget(self.interpret_button)
+        self.interpret_button.setCheckable(True); controls_row.addWidget(self.interpret_button)
+        self.settings_button = QToolButton(); self.settings_button.setText("Hide settings")
+        self.settings_button.setCheckable(True); self.settings_button.setChecked(True)
+        self.settings_button.setToolTip("Hide or show analysis settings without resetting the plot, selected sample, or options.")
+        row.addWidget(self.settings_button)
         close = QToolButton(); close.setText("×"); close.setToolTip("Hide analysis controls")
         close.clicked.connect(self.deactivate); row.addWidget(close)
         outer.addLayout(row)
+        self.settings_area = _SettingsScrollArea()
+        self.settings_area.setWidgetResizable(True)
+        self.settings_area.setFrameShape(QScrollArea.NoFrame)
+        self.settings_area.setMaximumHeight(190)
+        self.settings_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.settings_body = QWidget(); self.settings_area.setWidget(self.settings_body)
+        self.settings_body.setAutoFillBackground(False)
+        self.settings_area.viewport().setAutoFillBackground(False)
+        details = QVBoxLayout(self.settings_body)
+        details.setContentsMargins(0, 0, 0, 0); details.setSpacing(3)
+        outer.addWidget(self.settings_area)
+        self.settings_button.toggled.connect(self._toggle_settings)
         self.summary = QLabel(); self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.PlainText); measure_row.addWidget(self.summary, 1)
-        outer.addLayout(measure_row)
+        details.addLayout(measure_row)
         self.interpretation = QLabel(); self.interpretation.setWordWrap(True)
         self.interpretation.setTextFormat(Qt.PlainText); self.interpretation.hide()
         self.interpret_button.toggled.connect(lambda checked: self.interpretation.setVisible(checked and self.active_key == "phase"))
-        outer.addWidget(self.interpretation)
+        details.addWidget(self.interpretation)
         self.iq_controls = IQControls()
         self.iq_controls.changed.connect(self._update_current)
-        outer.addWidget(self.iq_controls.cursor_widget)
+        details.addWidget(self.iq_controls.cursor_widget)
         self.iq_controls.cursor_widget.hide()
 
         self.options = QScrollArea(); self.options.setWidgetResizable(True)
@@ -172,7 +215,7 @@ class InlineEngineeringAnalysis(QWidget):
         grid = QGridLayout(options_body)
         grid.setContentsMargins(0, 3, 0, 3); grid.setHorizontalSpacing(6); grid.setVerticalSpacing(3)
         self.options_button.toggled.connect(self._toggle_options)
-        outer.addWidget(self.options); self.options.hide()
+        details.addWidget(self.options); self.options.hide()
         self.dataset_combo, self.reference_combo, self.axis_combo = QComboBox(), QComboBox(), QComboBox()
         for title, key in (("Frequency", "frequency"), ("Azimuth", "azimuth"), ("Elevation", "elevation")):
             self.axis_combo.addItem(title, key)
@@ -266,8 +309,17 @@ class InlineEngineeringAnalysis(QWidget):
         self.hide()
 
     def _update_canvas_minimum(self):
-        expanded = self.options_button.isChecked()
-        self.canvas.setMinimumHeight(min(40 if expanded else 180, self._saved_canvas_minimum.height()))
+        self.canvas.setMinimumHeight(min(180, self._saved_canvas_minimum.height()))
+        self.settings_area.updateGeometry()
+
+    def _toggle_settings(self, checked):
+        self.settings_button.setText("Hide settings" if checked else "Show settings")
+        self.header_controls.setVisible(checked)
+        self.settings_area.setVisible(checked)
+        results = checked and self.results_button.isChecked()
+        self.results.setVisible(results)
+        self.canvas.setVisible(not results)
+        self._update_canvas_minimum()
 
     def _toggle_options(self, checked):
         if checked: self.results_button.setChecked(False)
@@ -276,8 +328,9 @@ class InlineEngineeringAnalysis(QWidget):
 
     def _toggle_results(self, checked):
         if checked: self.options_button.setChecked(False)
-        self.canvas.setVisible(not checked)
-        self.results.setVisible(checked)
+        visible = checked and self.settings_button.isChecked()
+        self.canvas.setVisible(not visible)
+        self.results.setVisible(visible)
         self._update_canvas_minimum()
 
     def open_tool(self, key):
@@ -287,6 +340,7 @@ class InlineEngineeringAnalysis(QWidget):
             return
         previous = self.active_key
         self.active_key = key
+        self.settings_button.setChecked(True)
         if previous != key:
             self._prefer_native_source = False
         self._updating = True
@@ -478,6 +532,7 @@ class InlineEngineeringAnalysis(QWidget):
         self.sweep_note.setText(f"{len(indices)} selected native samples; Update follows the main selection." if indices is not None else
                                "Full native cut for Dataset A." if selected_available else
                                "Full native cut: Dataset A is not the active parameter-list dataset.")
+        self.settings_area.updateGeometry()
 
     def _update_current(self, *_args):
         if self._updating or not self.active_key or self.owner.plot_figure is not self.figure:
@@ -544,6 +599,7 @@ class InlineEngineeringAnalysis(QWidget):
                 markers = getattr(self.owner, "_clear_plot_markers", None)
                 if callable(markers) and not same_layout: markers(redraw=False)
                 self.figure.set_layout_engine("constrained")
+                self.figure._grim_engineering_layout = True
             self._invalidate_recipe()
             self._display_serial = 0
             self._display_cut = cut
@@ -608,6 +664,8 @@ class InlineEngineeringAnalysis(QWidget):
                 self.figure.add_subplot(111)
             data_axes = self._iq_controller.axes if self._iq_controller is not None else [ax for ax in self.figure.axes if ax.get_label() != "<colorbar>"]
             if not data_axes: data_axes = [self.figure.add_subplot(111)]
+            for axes in data_axes:
+                axes._grim_engineering_axis = True
             self.owner.plot_ax = data_axes[0]
             self.owner.plot_axes = data_axes if len(data_axes) > 1 else None
             self._rendering = False
@@ -694,7 +752,9 @@ class InlineEngineeringAnalysis(QWidget):
                 markers = getattr(self.owner, "_clear_plot_markers", None)
                 if callable(markers): markers(redraw=False)
                 self.figure.clear(); self.figure.set_layout_engine("constrained")
+                self.figure._grim_engineering_layout = True
                 ax = self.figure.add_subplot(111)
+                ax._grim_engineering_axis = True
                 self.owner.plot_ax, self.owner.plot_axes = ax, None
                 self.figure._grim_independent_y = False
                 self.figure._grim_independent_x = False

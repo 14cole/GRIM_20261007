@@ -9,6 +9,11 @@ self-contained tools under `tools/`; GRIM embeds their authoritative user
 interfaces instead of copying their numerical implementations into the
 plotting code.
 
+The **Plots**, **Plot Manipulation**, and ISAR buttons wrap to fit the available
+width. Widening the workspace reduces button rows and gives the plot more
+height. Legend, Auto Plot, Auto Scale, Hold, and Clear remain available above
+either Plotting control page.
+
 The [vehicle assembly guide](ASSEMBLY_WORKFLOW.md) describes the Body, Points,
 Line features, and Build workflow, including direct feature authoring and reusable
 assembly recipes.
@@ -45,6 +50,11 @@ guides. Both stay collapsed until requested. The coordinate box and slider snap
 to native samples; clicking the I/Q curve or a linked plot selects the same
 coordinate. The default colormap is Turbo and follows the sweep coordinate.
 Start/end symbols and arrows show acquisition order, not elapsed time.
+
+Use **Hide settings** / **Show settings** in the analysis header to toggle its controls while
+keeping the current plot and I/Q cursor active. Expanded controls scroll when
+needed so the plot retains usable space. Hiding settings preserves your
+selected view and option values.
 
 - **I/Q trajectory** shows real versus imaginary complex field. Radius is
   amplitude; squared radius is the dataset's linear RCS, scattering width, or

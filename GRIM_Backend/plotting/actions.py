@@ -868,7 +868,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _ensure_axes(self, projection: str) -> None:
         desired = "polar" if projection == "polar" else "rectilinear"
-        if self.plot_ax.name == desired and self.plot_axes is None and not hasattr(self.plot_ax, "_grim_delta_map"):
+        # Axes.clear() retains equal aspect, anchors, and colorbar geometry.
+        # A single I/Q panel therefore needs new axes just like a multi-panel diagnostic.
+        if (self.plot_ax.name == desired and self.plot_axes is None
+                and not hasattr(self.plot_ax, "_grim_delta_map")
+                and not getattr(self.plot_ax, "_grim_engineering_axis", False)):
             return
         self._release_native_plot_samples()
         self._remove_colorbar()
@@ -888,6 +892,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self.plot_figure._grim_independent_x = False
         self.plot_figure._grim_engineering_signature = None
         self.plot_figure._grim_iq_held = None
+        # Clear starts a blank canvas independent of the previous plot's layout.
+        self.plot_figure.set_layout_engine(None)
+        self.plot_figure._grim_engineering_layout = False
         self._release_native_plot_samples()
         overlays = getattr(self, "spatial_overlays", None)
         if overlays is not None:
@@ -1096,6 +1103,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if panel is not None and not panel._rendering:
             panel.deactivate()
         if not str(self.last_plot_mode).startswith("engineering_"):
+            if getattr(self.plot_figure, "_grim_engineering_layout", False):
+                self.plot_figure.set_layout_engine(None)
+                self.plot_figure._grim_engineering_layout = False
             self.plot_figure._grim_independent_y = False
             self.plot_figure._grim_independent_x = False
             self.plot_figure._grim_engineering_signature = None

@@ -28,7 +28,7 @@ class _NumberSpin(QDoubleSpinBox):
 
 
 class IQControls(QWidget):
-    """Advanced options and a separately placeable, always-visible sample row."""
+    """Advanced options and a separately placeable sample row."""
     changed = Signal()
 
     def __init__(self, parent=None):
@@ -244,6 +244,9 @@ class IQController:
     def _build(self):
         self.figure.clear()
         linked = self.controls.linked_checkbox.isChecked() and self.mode != "iq_repeat"
+        # Keep the equal-scale I/Q axes and its colorbar centered together.
+        # Linked sweep axes need their independent rectangular layout.
+        self.figure.set_layout_engine("constrained" if linked else "compressed")
         self.figure._grim_independent_x = linked
         if linked:
             grid = self.figure.add_gridspec(2, 2, width_ratios=(1.35, 1))
@@ -265,7 +268,7 @@ class IQController:
             self._finish_iq_axes()
             mappable = ScalarMappable(norm=self.norm, cmap=self.cmap)
             mappable._grim_colormap = True
-            colorbar = self.figure.colorbar(mappable, ax=self.iq_axes, pad=.03, fraction=.04)
+            colorbar = self.figure.colorbar(mappable, ax=self.iq_axes, pad=.03, fraction=.04, panchor=False)
             colorbar.set_label(f"{self.cut.axis.capitalize()} ({self.cut.x_unit})")
             self.colorbar = colorbar
             if hasattr(self.owner, "plot_colorbars"): self.owner.plot_colorbars.append(colorbar)
