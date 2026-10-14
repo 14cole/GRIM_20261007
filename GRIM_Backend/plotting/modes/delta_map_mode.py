@@ -109,7 +109,7 @@ def prepare(datasets, *, reference, selections, polarization,
             key[AXES.index(x_axis)] = xi[None, :]
             key[AXES.index(y_axis)] = yi[:, None]
             key[AXES.index(fixed_axis)] = int(matched[fixed_axis][1][0])
-            power = np.asarray(dataset.rcs_power[tuple(key)], dtype=float)
+            power = np.asarray(dataset.power[tuple(key)], dtype=float)
             if x_axis == "frequency":
                 frequency = np.asarray(dataset.frequencies)[xi][None, :]
             elif y_axis == "frequency":

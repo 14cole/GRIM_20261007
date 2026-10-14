@@ -23,6 +23,7 @@ from GRIM_Backend.datasets.coordinates import (
 )
 from GRIM_Backend.datasets.memory import _bounded_grid_selections, _real_storage_dtype
 from GRIM_Backend.datasets.metadata import GridMetadataMixin
+from GRIM_Backend.datasets.storage import GridStorageMixin
 from GRIM_Backend.io.cst import CstFormatMixin
 from GRIM_Backend.io.native import NativeFormatMixin
 from GRIM_Backend.io.out import OutFormatMixin
@@ -33,6 +34,7 @@ from GRIM_Backend.io.xpatch import XpatchFormatMixin
 
 
 class RcsGrid(
+    GridStorageMixin,
     GridAxesMixin,
     GridCoordinatesMixin,
     GridMetadataMixin,
@@ -58,6 +60,7 @@ class RcsGrid(
         rcs=None,
         rcs_power=None,
         rcs_phase=None,
+        rcs_storage_domain="physical",
         rcs_domain: str | None = None,
         source_path: str | None = None,
         history: str | None = None,
@@ -65,7 +68,7 @@ class RcsGrid(
         extra: dict | None = None,
         _adopt_clean_arrays=None,
     ):
-        """Build a grid from axis arrays and power/phase-backed RCS samples.
+        """Build a grid with canonical complex or power-only RCS samples.
 
         Use when loading data from files or constructing an in-memory grid.
 
@@ -78,6 +81,8 @@ class RcsGrid(
             rcs_power: Optional linear-power samples shaped (az, el, f, pol).
             rcs_phase: Optional phase samples (radians) shaped (az, el, f, pol).
                 Use NaN where phase is unknown.
+            rcs_storage_domain: ``physical`` for normalized complex response;
+                ``raw_field`` for an explicitly normalized solver field.
             rcs_domain: Optional domain tag metadata.
             source_path: Optional source path for provenance.
             history: Optional history string.
@@ -97,6 +102,78 @@ class RcsGrid(
         self.polarizations = self._canonical_polarization_axis(polarizations)
 
         expected = (len(self.azimuths), len(self.elevations), len(self.frequencies), len(self.polarizations))
+
+        self._complex = None
+        self._power = self._phase = None
+        self._legacy_samples = False
+        self._legacy_fingerprint = None
+        self._storage_kind = "power_phase"
+        self._storage_domain = "physical"
+        if (_adopt_clean_arrays is not None and _adopt_clean_arrays is not False
+                and _adopt_clean_arrays is not _ADOPT_CLEAN_ARRAYS_TOKEN):
+            raise ValueError("_adopt_clean_arrays is reserved for internal operations")
+        if rcs_storage_domain not in {"physical", "raw_field"}:
+            raise ValueError("rcs_storage_domain must be physical or raw_field")
+        direct = np.asarray(rcs) if rcs is not None else None
+        direct_physical = (
+            rcs_storage_domain == "physical" and direct is not None
+            and rcs_power is None and rcs_phase is None
+            and ((direct.shape == expected and np.iscomplexobj(direct))
+                 or direct.shape == expected + (2,))
+            and not any(key in (extra or {}) for key in ("rcs_amp_real", "rcs_amp_imag"))
+        )
+        if (rcs is None and rcs_power is not None and rcs_phase is None
+                and rcs_storage_domain == "physical"
+                and not any(key in (extra or {}) for key in ("rcs_amp_real", "rcs_amp_imag"))):
+            power = np.asarray(rcs_power, dtype=_real_storage_dtype(rcs_power))
+            if power.shape != expected:
+                raise ValueError(f"rcs_power shape {power.shape} != {expected}")
+            self._power = power if _adopt_clean_arrays is _ADOPT_CLEAN_ARRAYS_TOKEN else self._clean_power(power)
+            self._power.flags.writeable = False
+            self._storage_kind = "power"
+            self.units, self.extra = dict(units or {}), dict(extra or {})
+            self.rcs_domain = str(rcs_domain or "power_phase").strip().lower()
+            if self.rcs_domain not in {"complex_amplitude", "linear_rcs", "power_phase"}:
+                self.rcs_domain = "power_phase"
+            self.power_domain = "linear_rcs"
+            self.source_path, self.history = source_path, history
+            phase_wrap = str(self.units.get("phase_wrap", "")).strip()
+            if phase_wrap and phase_wrap not in {"0_360", "-180_180"}:
+                raise ValueError("phase_wrap must be '0_360' or '-180_180' when declared")
+            self._apply_solver_amplitude_annotation()
+            strip_angular_coordinate_declarations(self.units, self.extra)
+            return
+        if rcs_storage_domain == "raw_field" or direct_physical:
+            if rcs_power is not None or rcs_phase is not None:
+                raise ValueError("raw complex storage must not include redundant power/phase samples")
+            raw = direct
+            if direct_physical and raw.shape == expected + (2,):
+                dtype = np.complex128 if _real_storage_dtype(raw) == np.float64 else np.complex64
+                field = np.empty(expected, dtype=dtype)
+                field.real, field.imag = raw[..., 0], raw[..., 1]
+                raw = field
+            if raw is None or raw.shape != expected or not np.iscomplexobj(raw):
+                raise ValueError("raw complex samples must have the dataset shape")
+            self.units = dict(units or {})
+            self.extra = dict(extra or {})
+            self.rcs_domain = str(rcs_domain or "complex_amplitude").strip().lower()
+            if self.rcs_domain not in {"complex_amplitude", "linear_rcs", "power_phase"}:
+                self.rcs_domain = "complex_amplitude"
+            self.power_domain = "linear_rcs"
+            self.source_path, self.history = source_path, history
+            dtype = np.complex128 if _real_storage_dtype(raw) == np.float64 else np.complex64
+            field = np.array(raw, dtype=dtype, copy=True)
+            invalid = ~np.isfinite(field.real) | ~np.isfinite(field.imag)
+            field[invalid] = np.nan + 1j * np.nan
+            self._install_complex(field, domain=rcs_storage_domain, copy=False)
+            if rcs_storage_domain == "raw_field" and self._authoritative_raw_amplitude_from_pair((self._complex.real, self._complex.imag), (0, 0, 0, 0)) is None:
+                raise ValueError("raw complex normalization is not defined for this dataset")
+            phase_wrap = str(self.units.get("phase_wrap", "")).strip()
+            if phase_wrap and phase_wrap not in {"0_360", "-180_180"}:
+                raise ValueError("phase_wrap must be '0_360' or '-180_180' when declared")
+            self._apply_solver_amplitude_annotation()
+            strip_angular_coordinate_declarations(self.units, self.extra)
+            return
 
         complex_arr = None
         real_dtype = _real_storage_dtype(rcs, rcs_power, rcs_phase)
@@ -150,8 +227,8 @@ class RcsGrid(
             phase_clean = self._clean_phase(phase_arr)
             phase_clean[~np.isfinite(power_clean)] = np.nan
 
-        self.rcs_power = power_clean
-        self.rcs_phase = phase_clean
+        self._power = power_clean
+        self._phase = phase_clean
         domain = str(rcs_domain or "").strip().lower()
         if domain not in {"complex_amplitude", "linear_rcs", "power_phase"}:
             domain = "power_phase"
@@ -163,17 +240,7 @@ class RcsGrid(
         self.extra = dict(extra or {})
 
 
-        envelope = self.extra.get("solver_metadata_json")
-        if envelope is not None and self.linear_quantity() == "sigma_2d":
-            try:
-                parsed = json.loads(str(np.asarray(envelope).reshape(()).item()))
-                version = parsed.get("amplitude_version")
-                if version is not None and "amplitude_version" not in self.extra:
-                    self.extra["amplitude_version"] = version
-                elif version is not None and str(self.extra["amplitude_version"]) != str(version):
-                    self.extra["solver_metadata_advisory"] = "Conflicting amplitude-version annotations; supplied samples retained."
-            except (ValueError, TypeError, AttributeError):
-                self.extra["solver_metadata_advisory"] = "Unreadable solver annotation; supplied samples retained."
+        self._apply_solver_amplitude_annotation()
 
 
         phase_wrap = str(self.units.get("phase_wrap", "")).strip()
@@ -187,11 +254,11 @@ class RcsGrid(
             # Keep phases already in range unchanged: adding and subtracting
             # pi can erase small, physically meaningful phase differences.
             # Bound the masks and temporary values even for a large grid.
-            if self.rcs_phase.size:
+            if phase_clean.size:
                 for selection in _bounded_grid_selections(
-                    self.rcs_phase.shape, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS
+                    phase_clean.shape, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS
                 ):
-                    phase_block = self.rcs_phase[selection]
+                    phase_block = phase_clean[selection]
                     finite = np.isfinite(phase_block)
                     if phase_wrap == "0_360":
                         needs_wrap = finite & (
@@ -213,6 +280,23 @@ class RcsGrid(
         # declarations from files or older sessions are dropped; the user is
         # responsible for only overlaying data that share a coordinate system.
         strip_angular_coordinate_declarations(self.units, self.extra)
+        self._canonicalize_samples(
+            complex_arr,
+            prefer_complex=(complex_arr is not None and rcs_power is None and rcs_phase is None),
+        )
+
+    def _apply_solver_amplitude_annotation(self):
+        envelope = self.extra.get("solver_metadata_json")
+        if envelope is not None and self.linear_quantity() == "sigma_2d":
+            try:
+                parsed = json.loads(str(np.asarray(envelope).reshape(()).item()))
+                version = parsed.get("amplitude_version")
+                if version is not None and "amplitude_version" not in self.extra:
+                    self.extra["amplitude_version"] = version
+                elif version is not None and str(self.extra["amplitude_version"]) != str(version):
+                    self.extra["solver_metadata_advisory"] = "Conflicting amplitude-version annotations; supplied samples retained."
+            except (ValueError, TypeError, AttributeError):
+                self.extra["solver_metadata_advisory"] = "Unreadable solver annotation; supplied samples retained."
 
     @staticmethod
     def _clean_power(power_value):
@@ -254,26 +338,50 @@ class RcsGrid(
     def _complete_authoritative_raw_arrays(self):
         """Return a complete raw pair, or ``None`` for malformed/partial data."""
 
+        self._ensure_legacy_source_current()
+        if self._complex is not None and self._storage_domain == "raw_field":
+            stored = (self._complex.real, self._complex.imag)
+            for name, expected in zip(("rcs_amp_real", "rcs_amp_imag"), stored):
+                supplied = self.extra.get(name)
+                if supplied is None:
+                    return None
+                supplied = np.asarray(supplied)
+                if supplied.shape != expected.shape:
+                    return None
+                if supplied.strides == expected.strides and supplied.ctypes.data == expected.ctypes.data:
+                    continue
+                for first in range(0, expected.size, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS):
+                    last = first + _RAW_COMPLEX_VALIDATION_BLOCK_CELLS
+                    if not np.array_equal(supplied.flat[first:last], expected.flat[first:last], equal_nan=True):
+                        return None
+            return stored
+
         real = self.extra.get("rcs_amp_real")
         imag = self.extra.get("rcs_amp_imag")
         if real is None or imag is None:
             return None
         real = np.asarray(real)
         imag = np.asarray(imag)
-        if real.shape != self.rcs_power.shape or imag.shape != self.rcs_power.shape:
+        if real.shape != self.power.shape or imag.shape != self.power.shape:
             return None
 
 
         for start in range(
-            0, self.rcs_power.size, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS
+            0, self.power.size, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS
         ):
             stop = min(
-                self.rcs_power.size,
+                self.power.size,
                 start + _RAW_COMPLEX_VALIDATION_BLOCK_CELLS,
             )
 
 
-            modeled = np.isfinite(self.rcs_power.flat[start:stop])
+            if self._complex is not None and not self._legacy_samples:
+                # A late raw pair may replace the physical source. Inspect
+                # coverage directly to avoid power -> rcs_slice recursion.
+                with np.errstate(over="ignore", invalid="ignore"):
+                    modeled = np.isfinite(np.abs(self._complex.flat[start:stop]) ** 2)
+            else:
+                modeled = np.isfinite(self._power.flat[start:stop])
             raw_finite = np.isfinite(real.flat[start:stop])
             raw_finite &= np.isfinite(imag.flat[start:stop])
             if np.any(modeled != raw_finite):
@@ -298,12 +406,11 @@ class RcsGrid(
         real, imag = pair
         quantity = self.linear_quantity()
         if selection is None:
-            real_values = real.astype(np.float64, copy=False)
-            imag_values = imag.astype(np.float64, copy=False)
+            real_values, imag_values = real, imag
         else:
-            real_values = real[selection].astype(np.float64, copy=False)
-            imag_values = imag[selection].astype(np.float64, copy=False)
-        raw = real_values + 1j * imag_values
+            real_values, imag_values = real[selection], imag[selection]
+        raw = np.empty(np.shape(real_values), dtype=np.complex128)
+        raw.real, raw.imag = real_values, imag_values
         if quantity == "sigma_2d":
             freq_hz = self._frequency_value_to_hz(self.frequencies)
             k0 = (2.0 * np.pi * np.asarray(freq_hz, dtype=float)) / C0
@@ -316,11 +423,13 @@ class RcsGrid(
 
 
                 scale = np.broadcast_to(
-                    scale[None, None, :, None], self.rcs_power.shape
+                    scale[None, None, :, None], self.power.shape
                 )[selection]
-            return raw * scale
+            raw *= scale
+            return raw
         if quantity == "sigma_3d":
-            return raw * np.sqrt(4.0 * np.pi)
+            raw *= np.sqrt(4.0 * np.pi)
+            return raw
         return None
 
     def _authoritative_raw_amplitude(self, selection=None):
@@ -345,6 +454,16 @@ class RcsGrid(
         reconstruction, without validating the raw pair a second time.
         """
 
+        self._ensure_legacy_source_current()
+        if (self._complex is not None and self._storage_domain == "physical"
+                and ("rcs_amp_real" in self.extra or "rcs_amp_imag" in self.extra)):
+            pair = self._complete_authoritative_raw_arrays()
+            if pair is not None and self._authoritative_raw_amplitude_from_pair(pair, (0, 0, 0, 0)) is not None:
+                result = (lambda selection: self._authoritative_raw_amplitude_from_pair(pair, selection), np.dtype(np.float64))
+                return (*result, True) if include_authority else result
+        if self._complex is not None:
+            result = (self.rcs_slice, np.dtype(np.float64) if self._storage_domain == "raw_field" else self._complex.real.dtype)
+            return (*result, self._storage_domain == "raw_field") if include_authority else result
         pair = self._complete_authoritative_raw_arrays()
         quantity = self.linear_quantity()
         if pair is not None and quantity in {"sigma_2d", "sigma_3d"}:
@@ -362,11 +481,11 @@ class RcsGrid(
                 )
                 return (*result, True) if include_authority else result
         real_dtype = np.dtype(
-            _real_storage_dtype(self.rcs_power, self.rcs_phase)
+            _real_storage_dtype(self.power, self.phase)
         )
         result = (
             lambda selection: self._complex_from_power_phase(
-                self.rcs_power[selection], self.rcs_phase[selection]
+                self.power[selection], self.phase[selection]
             ),
             real_dtype,
         )
@@ -374,24 +493,30 @@ class RcsGrid(
 
     @property
     def rcs(self):
-        """Complex RCS values derived from stored linear power and phase."""
-        authoritative = self._authoritative_raw_amplitude()
-        if authoritative is not None:
-            return authoritative
-        return self._complex_from_power_phase(self.rcs_power, self.rcs_phase)
+        """Return a writable copy of the physical complex response."""
+        return self.rcs_slice(Ellipsis)
 
     def rcs_slice(self, selection):
-        """Reconstruct only a requested complex slice, avoiding a whole-grid allocation."""
+        """Copy/normalize the selected complex field without a whole-grid allocation."""
+        self._ensure_legacy_source_current()
+        if self._complex is not None:
+            if self._storage_domain == "raw_field":
+                return self._authoritative_raw_amplitude_from_pair((self._complex.real, self._complex.imag), selection)
+            if "rcs_amp_real" in self.extra or "rcs_amp_imag" in self.extra:
+                authoritative = self._authoritative_raw_amplitude(selection)
+                if authoritative is not None:
+                    return authoritative
+            return np.array(self._complex[selection], copy=True)
         authoritative = self._authoritative_raw_amplitude(selection)
         if authoritative is not None:
             return authoritative
         return self._complex_from_power_phase(
-            self.rcs_power[selection], self.rcs_phase[selection]
+            self.power[selection], self.phase[selection]
         )
 
     def __len__(self):
         """Return total number of complex samples in the grid."""
-        return self.rcs_power.size
+        return self.power.size
 
     def get(self, az_idx, el_idx, f_idx, p_idx):
         """Fetch a single sample by axis indices.
@@ -652,12 +777,12 @@ class RcsGrid(
 
     def get_dbsm(self, az_idx, el_idx, f_idx, p_idx, eps=1e-12):
         """Fetch a sample by indices and return dBsm."""
-        return self.linear_to_dbsm(self.rcs_power[az_idx, el_idx, f_idx, p_idx], eps=eps)
+        return self.linear_to_dbsm(self.power[az_idx, el_idx, f_idx, p_idx], eps=eps)
 
     def get_dbke(self, az_idx, el_idx, f_idx, p_idx, eps=1e-12):
         """Fetch a sample by indices and return dBke."""
         freq_value = self.frequencies[f_idx]
-        return self.linear_to_dbke(self.rcs_power[az_idx, el_idx, f_idx, p_idx], freq_value, eps=eps)
+        return self.linear_to_dbke(self.power[az_idx, el_idx, f_idx, p_idx], freq_value, eps=eps)
 
     def get_dbsm_by_value(self, azimuth, elevation, frequency, polarization, tol=0.0, eps=1e-12):
         """Fetch a sample by axis values and return dBsm."""
@@ -667,7 +792,7 @@ class RcsGrid(
         p_idx = self._index_for_value(
             self.polarizations, str(polarization).strip().upper(), tol=tol
         )
-        return self.linear_to_dbsm(self.rcs_power[az_idx, el_idx, f_idx, p_idx], eps=eps)
+        return self.linear_to_dbsm(self.power[az_idx, el_idx, f_idx, p_idx], eps=eps)
 
     def get_dbke_by_value(self, azimuth, elevation, frequency, polarization, tol=0.0, eps=1e-12):
         """Fetch a sample by axis values and return dBke."""
@@ -677,4 +802,4 @@ class RcsGrid(
         p_idx = self._index_for_value(
             self.polarizations, str(polarization).strip().upper(), tol=tol
         )
-        return self.linear_to_dbke(self.rcs_power[az_idx, el_idx, f_idx, p_idx], self.frequencies[f_idx], eps=eps)
+        return self.linear_to_dbke(self.power[az_idx, el_idx, f_idx, p_idx], self.frequencies[f_idx], eps=eps)

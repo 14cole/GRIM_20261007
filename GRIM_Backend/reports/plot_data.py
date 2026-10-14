@@ -385,7 +385,7 @@ def _phase_capability(datasets: tuple[NamedGrid, ...]) -> tuple[bool, str, str]:
     missing_phase = [
         dataset.name
         for dataset in datasets
-        if not np.any(np.isfinite(np.asarray(dataset.grid.rcs_phase, dtype=float)))
+        if not np.any(np.isfinite(np.asarray(dataset.grid.phase, dtype=float)))
     ]
     if missing_phase:
         return (
@@ -613,7 +613,7 @@ def build_azimuth_specs(
             float(value)
             for value in _convert_angles(native_x, native_angle_unit, target_angle_unit)
         )
-        source = grid.rcs_phase if plot_quantity == "phase" else grid.rcs_power
+        source = grid.phase if plot_quantity == "phase" else grid.power
         frequency_indices = _exact_numeric_indices(
             grid.frequencies,
             requested_frequencies,
@@ -818,7 +818,7 @@ def build_elevation_specs(
                 angle_unit,
             )
         )
-        source = grid.rcs_phase if plot_quantity == "phase" else grid.rcs_power
+        source = grid.phase if plot_quantity == "phase" else grid.power
         frequency_indices = _exact_numeric_indices(
             grid.frequencies,
             requested_frequencies,
@@ -1138,7 +1138,7 @@ def build_frequency_spec(
         order = np.argsort(np.asarray(grid.frequencies, dtype=float), kind="stable")
         native_frequencies = np.asarray(grid.frequencies, dtype=float)[order]
         x = _convert_frequencies(native_frequencies, native_frequency_unit, frequency_unit)
-        source = grid.rcs_phase if plot_quantity == "phase" else grid.rcs_power
+        source = grid.phase if plot_quantity == "phase" else grid.power
         if band_request is None:
             azimuth_index = _exact_index(
                 grid.azimuths,

@@ -421,8 +421,8 @@ def _write_flat_csv_direct(
     if include_phase:
         header.append("phase_deg")
 
-    power_array = np.asarray(grid.rcs_power)
-    phase_array = np.asarray(grid.rcs_phase)
+    power_array = np.asarray(grid.power)
+    phase_array = np.asarray(grid.phase)
     expected_shape = (
         len(grid.azimuths), len(grid.elevations), len(grid.frequencies),
         len(grid.polarizations),

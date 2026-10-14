@@ -167,8 +167,8 @@ def _selected_polarization_axis_availability(
     transient is one bounded Boolean block.
     """
 
-    shape = tuple(int(value) for value in dataset.rcs_power.shape)
-    if len(shape) != 4 or tuple(dataset.rcs_phase.shape) != shape:
+    shape = tuple(int(value) for value in dataset.power.shape)
+    if len(shape) != 4 or tuple(dataset.phase.shape) != shape:
         raise ValueError("dataset power and phase grids must have matching 4-D shapes")
     selected = sorted({int(value) for value in polarization_indices})
     if not selected:
@@ -200,9 +200,9 @@ def _selected_polarization_axis_availability(
         for start in range(0, shape[0], azimuth_block):
             stop = min(shape[0], start + azimuth_block)
             selection = (slice(start, stop), slice(None), slice(None), pol_index)
-            valid = np.isfinite(dataset.rcs_power[selection])
+            valid = np.isfinite(dataset.power[selection])
             if require_phase:
-                valid &= np.isfinite(dataset.rcs_phase[selection])
+                valid &= np.isfinite(dataset.phase[selection])
             azimuth_available[start:stop] |= valid.any(axis=(1, 2))
             elevation_available |= valid.any(axis=(0, 2))
             frequency_available |= valid.any(axis=(0, 1))

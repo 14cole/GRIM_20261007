@@ -463,6 +463,8 @@ def _load_base(path):
 
     with np.load(path, allow_pickle=False) as stored:
         payload = {key: np.array(stored[key], copy=True) for key in stored.files}
+    from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples
+    payload = decode_native_samples(payload, label=str(path))
     for key in ("azimuths", "elevations", "frequencies", "polarizations"):
         if key not in payload:
             raise ValueError(f"{path}: the base dataset has no {key} axis.")

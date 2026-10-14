@@ -480,7 +480,7 @@ def build_isar_manifest(
         "source": {
             "path": str(getattr(dataset, "source_path", "") or ""),
             "history": str(getattr(dataset, "history", "") or ""),
-            "shape": list(np.asarray(dataset.rcs_power).shape),
+            "shape": list(dataset.power.shape),
             "units": _small_metadata(getattr(dataset, "units", {})),
             "metadata": _small_metadata(getattr(dataset, "extra", {})),
             "selected_azimuth_indices": azimuth_indices,

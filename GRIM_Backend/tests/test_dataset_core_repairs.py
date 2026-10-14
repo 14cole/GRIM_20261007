@@ -476,7 +476,8 @@ class CoreOperationTests(unittest.TestCase):
 
         np.testing.assert_array_equal(lower.polarizations, ["VV"])
         np.testing.assert_array_equal(joined.polarizations, ["VV"])
-        np.testing.assert_array_equal(joined.rcs_power.ravel(), [1.0, 2.0])
+        np.testing.assert_allclose(joined.power.ravel(), [1.0, 2.0],
+                                   rtol=8 * np.finfo(joined.power.dtype).eps, atol=0)
         with self.assertRaisesRegex(ValueError, "unique after case normalization"):
             RcsGrid(
                 [0.0],
@@ -657,7 +658,8 @@ class CoreOperationTests(unittest.TestCase):
             assumptions_attested=True
         )
         np.testing.assert_array_equal(combined.azimuths, [0.0, 180.0, 360.0])
-        np.testing.assert_array_equal(combined.rcs_power.ravel(), [1.0, 2.0, 4.0])
+        np.testing.assert_allclose(combined.power.ravel(), [1.0, 2.0, 4.0],
+                                   rtol=8 * np.finfo(combined.power.dtype).eps, atol=0)
 
         radian_grid = _grid(
             power,
@@ -723,8 +725,11 @@ class CoreOperationTests(unittest.TestCase):
         np.testing.assert_allclose(converted.azimuths, [0.0, np.pi])
         np.testing.assert_allclose(converted.elevations, [np.pi / 6.0])
         np.testing.assert_allclose(converted.frequencies, [1000.0, 2000.0])
-        np.testing.assert_array_equal(converted.rcs_power, power)
-        np.testing.assert_array_equal(converted.rcs_phase, phase)
+        # A complex source derives polar coordinates to floating precision.
+        np.testing.assert_allclose(converted.power, power,
+                                   rtol=8 * np.finfo(converted.power.dtype).eps, atol=0)
+        np.testing.assert_allclose(converted.phase, phase,
+                                   rtol=8 * np.finfo(converted.phase.dtype).eps, atol=0)
         self.assertEqual(converted.units["frequency"], "MHz")
 
     def test_db_difference_preserves_undefined_zero_ratios(self):
@@ -779,7 +784,8 @@ class CoreOperationTests(unittest.TestCase):
             azimuths=(0.6e-6, 1.4e-6),
         )
         aligned = source.align_to(target, mode="intersect")
-        np.testing.assert_array_equal(aligned.rcs_power.ravel(), [10.0, 20.0])
+        np.testing.assert_allclose(aligned.power.ravel(), [10.0, 20.0],
+                                   rtol=8 * np.finfo(aligned.power.dtype).eps, atol=0)
         np.testing.assert_array_equal(aligned.azimuths, target.azimuths)
 
     def test_align_intersect_preserves_unsorted_target_order(self):
@@ -795,7 +801,8 @@ class CoreOperationTests(unittest.TestCase):
         )
         aligned = source.align_to(target, mode="intersect")
         np.testing.assert_array_equal(aligned.azimuths, target.azimuths)
-        np.testing.assert_array_equal(aligned.rcs_power.ravel(), [20.0, 10.0])
+        np.testing.assert_allclose(aligned.power.ravel(), [20.0, 10.0],
+                                   rtol=8 * np.finfo(aligned.power.dtype).eps, atol=0)
 
     def test_align_only_requires_coordinate_metadata_compatibility(self):
         source = _grid(

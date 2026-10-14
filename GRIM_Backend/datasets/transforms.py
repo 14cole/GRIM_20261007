@@ -30,7 +30,7 @@ def _derived_response_extra(dataset: RcsGrid) -> dict:
         "rcs_amp_real",
         "rcs_amp_imag",
     }
-    original_shape = tuple(dataset.rcs_power.shape)
+    original_shape = tuple(dataset.power.shape)
     extra = {}
     for key, value in (dataset.extra or {}).items():
         if key in stale:
@@ -53,7 +53,7 @@ def _copy_grid(
     dataset: RcsGrid,
     *,
     rcs=None,
-    rcs_power,
+    rcs_power=None,
     rcs_phase=None,
     rcs_domain=None,
     units=None,
@@ -68,7 +68,7 @@ def _copy_grid(
         rcs_phase=(
             None
             if rcs is not None
-            else dataset.rcs_phase if rcs_phase is None else rcs_phase
+            else dataset.phase if rcs_phase is None else rcs_phase
         ),
         rcs_domain=rcs_domain or dataset.rcs_domain,
         source_path=dataset.source_path,
@@ -86,9 +86,9 @@ def _authoritative_response_phase(dataset: RcsGrid) -> np.ndarray:
 
     raw_pair = dataset._complete_authoritative_raw_arrays()
     if raw_pair is None:
-        return dataset.rcs_phase
+        return dataset.phase
     real, imag = raw_pair
-    phase = np.empty(dataset.rcs_power.shape, dtype=np.float64)
+    phase = np.empty(dataset.power.shape, dtype=np.float64)
     np.arctan2(
         np.asarray(imag, dtype=np.float64),
         np.asarray(real, dtype=np.float64),
@@ -117,8 +117,7 @@ def duplicate_dataset(dataset: RcsGrid) -> RcsGrid:
         dataset.elevations.copy(),
         dataset.frequencies.copy(),
         dataset.polarizations.copy(),
-        rcs_power=dataset.rcs_power.copy(),
-        rcs_phase=dataset.rcs_phase.copy(),
+        **dataset._sample_kwargs(),
         rcs_domain=dataset.rcs_domain,
         source_path=dataset.source_path,
         history=dataset.history,
@@ -318,6 +317,18 @@ def shift_dataset(
         delta = float(phase_degrees)
         if np.isfinite(delta) and delta % 360.0 == 0.0:
             return result
+        if result.storage_kind == "complex":
+            rotation = np.exp(1j * np.deg2rad(delta))
+            field = np.empty(result.shape, dtype=(
+                np.complex128 if result.real_dtype.itemsize > 4 else np.complex64
+            ))
+            read_field, _dtype = result._bounded_complex_slice_reader()
+            for selection in _bounded_grid_selections(result.shape, (16 * 1024**2) // 48):
+                field[selection] = read_field(selection) * rotation
+            return _copy_grid(
+                result, rcs=field,
+                rcs_domain="complex_amplitude",
+            )
         raw_pair = result._complete_authoritative_raw_arrays()
         if raw_pair is not None and result.linear_quantity() in {"sigma_2d", "sigma_3d"}:
             # Retain authoritative precision without materializing a complex
@@ -337,7 +348,7 @@ def shift_dataset(
             )
         result = _copy_grid(
             result,
-            rcs_power=result.rcs_power,
+            rcs_power=result.power,
             rcs_phase=_phase_shifted_response(result, float(phase_degrees)),
             rcs_domain="complex_amplitude",
         )
@@ -357,11 +368,19 @@ def offset_db(dataset: RcsGrid, value_db: float) -> RcsGrid:
     """Shift all displayed RCS values by a constant number of decibels."""
 
     scale = 10.0 ** (float(value_db) / 10.0)
+    if dataset.storage_kind == "complex":
+        field = np.empty(dataset.shape, dtype=(
+            np.complex128 if dataset.real_dtype.itemsize > 4 else np.complex64
+        ))
+        read_field, _dtype = dataset._bounded_complex_slice_reader()
+        for selection in _bounded_grid_selections(dataset.shape, (16 * 1024**2) // 48):
+            field[selection] = read_field(selection) * np.sqrt(scale)
+        return _copy_grid(dataset, rcs=field, rcs_domain=dataset.rcs_domain)
     raw_pair = dataset._complete_authoritative_raw_arrays()
     quantity = dataset.linear_quantity()
     use_raw = (
         raw_pair is not None and quantity in {"sigma_2d", "sigma_3d"}
-        and dataset.rcs_power.size > 0
+        and dataset.power.size > 0
     )
     if use_raw and quantity == "sigma_2d":
         frequency_hz = dataset._frequency_value_to_hz(dataset.frequencies)
@@ -372,7 +391,7 @@ def offset_db(dataset: RcsGrid, value_db: float) -> RcsGrid:
         # The display cache may be float32 even when solver quadratures are
         # float64. Normalize those authoritative fields before scaling, keeping
         # the derived response in float64 for later coherent residuals.
-        shape = dataset.rcs_power.shape
+        shape = dataset.power.shape
         power = np.empty(shape, dtype=np.float64)
         phase = np.empty(shape, dtype=np.float64)
         for selection in _bounded_grid_selections(shape, (16 * 1024**2) // 48):
@@ -390,7 +409,7 @@ def offset_db(dataset: RcsGrid, value_db: float) -> RcsGrid:
         )
     return _copy_grid(
         dataset,
-        rcs_power=dataset.rcs_power * scale,
+        rcs_power=dataset.power * scale,
         rcs_phase=_authoritative_response_phase(dataset),
         rcs_domain=dataset.rcs_domain,
     )
@@ -412,7 +431,7 @@ def coherent_divide(
         coherent_metadata_attested=metadata_attested,
         _scan_phase_samples=False,
     )
-    shape = tuple(int(value) for value in numerator.rcs_power.shape)
+    shape = tuple(int(value) for value in numerator.power.shape)
     raw_response = (
         numerator._complete_authoritative_raw_arrays() is not None
         or denominator._complete_authoritative_raw_arrays() is not None
@@ -421,10 +440,10 @@ def coherent_divide(
         np.dtype(np.float64)
         if raw_response
         else np.result_type(
-            numerator.rcs_power.dtype,
-            numerator.rcs_phase.dtype,
-            denominator.rcs_power.dtype,
-            denominator.rcs_phase.dtype,
+            numerator.power.dtype,
+            numerator.phase.dtype,
+            denominator.power.dtype,
+            denominator.phase.dtype,
         )
     )
     complex_dtype = (
@@ -432,8 +451,7 @@ def coherent_divide(
         if real_dtype.itemsize > np.dtype(np.float32).itemsize
         else np.dtype(np.complex64)
     )
-    result_power = np.full(shape, np.nan, dtype=real_dtype)
-    result_phase = np.full(shape, np.nan, dtype=real_dtype)
+    result_field = np.full(shape, np.nan + 1j * np.nan, dtype=complex_dtype)
 
 
     cells_per_azimuth = max(1, int(np.prod(shape[1:], dtype=np.int64)))
@@ -452,20 +470,13 @@ def coherent_divide(
         quotient = np.full(left.shape, np.nan + 1j * np.nan, dtype=complex_dtype)
         valid = np.isfinite(left) & np.isfinite(right) & (right != 0)
         np.divide(left, right, out=quotient, where=valid)
-        power_block = result_power[selection]
+        power_block = np.empty(quotient.shape, dtype=real_dtype)
         np.multiply(quotient.real, quotient.real, out=power_block)
         power_block += quotient.imag * quotient.imag
-        np.arctan2(
-            quotient.imag,
-            quotient.real,
-            out=result_phase[selection],
-        )
-        finite_result = np.isfinite(power_block) & np.isfinite(
-            result_phase[selection]
-        )
-        power_block[~finite_result] = np.nan
-        result_phase[selection][~finite_result] = np.nan
-    usable_count = int(np.count_nonzero(np.isfinite(result_power)))
+        finite_result = np.isfinite(power_block) & np.isfinite(quotient)
+        quotient[~finite_result] = np.nan + 1j * np.nan
+        result_field[selection] = quotient
+    usable_count = int(np.count_nonzero(np.isfinite(result_field)))
     if usable_count == 0:
         raise ValueError(
             "coherent division has no common usable complex samples with a "
@@ -498,9 +509,9 @@ def coherent_divide(
         {
             "schema": "grim.coherent-sample-qa.v1",
             "operation": "coherent-divide",
-            "total_sample_count": int(result_power.size),
+            "total_sample_count": int(result_field.size),
             "usable_sample_count": usable_count,
-            "masked_sample_count": int(result_power.size - usable_count),
+            "masked_sample_count": int(result_field.size - usable_count),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -511,8 +522,7 @@ def coherent_divide(
         numerator.elevations,
         numerator.frequencies,
         numerator.polarizations,
-        rcs_power=result_power,
-        rcs_phase=result_phase,
+        rcs=result_field,
         rcs_domain="complex_amplitude",
         source_path=numerator.source_path,
         history=history,
@@ -553,11 +563,11 @@ def convert_extrusion(dataset: RcsGrid, *, to: str, length_m: float) -> RcsGrid:
         quantity = "sigma_3d"
     scale = np.where(np.isfinite(frequency_hz) & (frequency_hz > 0.0), scale, np.nan)
     scale_4d = scale.reshape(1, 1, -1, 1)
-    power = dataset.rcs_power * scale_4d
+    power = dataset.power * scale_4d
     units = dict(dataset.units or {})
     units["rcs_log_unit"] = "dBke" if destination == "dbke" else "dBsm"
     units["rcs_linear_quantity"] = quantity
-    if dataset.rcs_domain == "complex_amplitude":
+    if dataset.storage_kind == "complex":
         rcs = dataset.rcs * np.sqrt(np.maximum(scale_4d, 0.0))
         return RcsGrid(
             dataset.azimuths,
@@ -565,7 +575,7 @@ def convert_extrusion(dataset: RcsGrid, *, to: str, length_m: float) -> RcsGrid:
             dataset.frequencies,
             dataset.polarizations,
             rcs,
-            rcs_power=power,
+            rcs_power=None,
             rcs_domain=dataset.rcs_domain,
             source_path=dataset.source_path,
             history=dataset.history,
@@ -579,7 +589,7 @@ def convert_extrusion(dataset: RcsGrid, *, to: str, length_m: float) -> RcsGrid:
         dataset.polarizations,
         rcs=None,
         rcs_power=power,
-        rcs_phase=dataset.rcs_phase,
+        rcs_phase=dataset.phase,
         rcs_domain=dataset.rcs_domain,
         source_path=dataset.source_path,
         history=dataset.history,
@@ -671,16 +681,18 @@ def decimate_axis(
     output_axis, sampling_report = decimation_axis_plan(source_axis, factor, partial)
     source_count = int(source_axis.size)
     full_bin_count, remainder = divmod(source_count, factor)
-    output_shape = list(dataset.rcs_power.shape)
+    output_shape = list(dataset.power.shape)
     output_shape[axis_index] = int(output_axis.size)
     output_shape = tuple(output_shape)
-    output_power = np.full(output_shape, np.nan, dtype=np.float64)
-    output_phase = np.full(output_shape, np.nan, dtype=np.float64)
-    output_power_by_bin = np.moveaxis(output_power, axis_index, 0)
-    output_phase_by_bin = np.moveaxis(output_phase, axis_index, 0)
+    coherent = mode_key == "coherent"
+    output = np.full(
+        output_shape, np.nan + 1j * np.nan if coherent else np.nan,
+        dtype=np.complex128 if coherent else np.float64,
+    )
+    output_by_bin = np.moveaxis(output, axis_index, 0)
     other_cell_count = max(
         1,
-        int(np.prod(dataset.rcs_power.shape, dtype=np.int64)) // source_count,
+        int(np.prod(dataset.power.shape, dtype=np.int64)) // source_count,
     )
     transient_bytes_per_cell = 64 if mode_key == "coherent" else 24
     bins_per_block = max(
@@ -722,11 +734,9 @@ def decimate_axis(
                 np.abs(mean_field) <= cancellation_floor
             )
             mean_field[near_zero] = 0.0 + 0.0j
-            power = mean_field.real * mean_field.real + mean_field.imag * mean_field.imag
-            phase = np.angle(mean_field)
-            phase[(count == 0) | (power == 0.0)] = np.nan
+            return mean_field
         else:
-            power_block = np.asarray(dataset.rcs_power[source_selection], dtype=np.float64)
+            power_block = np.asarray(dataset.power[source_selection], dtype=np.float64)
             power_block = np.moveaxis(power_block, axis_index, 0)
             power_block = power_block.reshape(
                 (bin_count, samples_per_bin) + power_block.shape[1:]
@@ -738,26 +748,21 @@ def decimate_axis(
             count = np.sum(valid, axis=1)
             power = np.full(power_sum.shape, np.nan, dtype=np.float64)
             np.divide(power_sum, count, out=power, where=count > 0)
-            phase = np.full(power.shape, np.nan, dtype=np.float64)
-        return power, phase
+            return power
 
     for output_start in range(0, full_bin_count, bins_per_block):
         output_stop = min(full_bin_count, output_start + bins_per_block)
-        power, phase = aggregate_bins(
+        output_by_bin[output_start:output_stop] = aggregate_bins(
             output_start * factor,
             output_stop - output_start,
             factor,
         )
-        output_power_by_bin[output_start:output_stop] = power
-        output_phase_by_bin[output_start:output_stop] = phase
     if remainder and partial == "keep":
-        power, phase = aggregate_bins(
+        output_by_bin[full_bin_count:] = aggregate_bins(
             full_bin_count * factor,
             1,
             remainder,
         )
-        output_power_by_bin[full_bin_count:] = power
-        output_phase_by_bin[full_bin_count:] = phase
 
     axes = [
         np.array(dataset.azimuths, copy=True),
@@ -814,13 +819,20 @@ def decimate_axis(
     history = (
         f"{prior_history}\n{history_entry}" if prior_history else history_entry
     )
+    samples = {"rcs": output} if coherent else {"rcs_power": output}
+    if coherent and np.any(output == 0.0):
+        # Exact cancellation has undefined phase. Preserve that distinction
+        # instead of exposing atan2(0, 0) as an observed phase.
+        output_power = output.real * output.real + output.imag * output.imag
+        output_phase = np.angle(output)
+        output_phase[output_power == 0.0] = np.nan
+        samples = {"rcs_power": output_power, "rcs_phase": output_phase}
     return RcsGrid(
         axes[0],
         axes[1],
         axes[2],
         axes[3],
-        rcs_power=output_power,
-        rcs_phase=output_phase,
+        **samples,
         rcs_domain="power_phase",
         source_path=dataset.source_path,
         history=history,
@@ -887,15 +899,15 @@ def medianize_azimuth(
     if periodic and np.isclose(span, 360.0, rtol=0.0, atol=1.0e-7):
 
 
-        merged_seam_power = np.array(dataset.rcs_power[0], copy=True)
-        merged_seam_phase = np.array(dataset.rcs_phase[0], copy=True)
+        merged_seam_power = np.array(dataset.power[0], copy=True)
+        merged_seam_phase = np.array(dataset.phase[0], copy=True)
         # The closing endpoint re-measures the opening direction; it only
         # fills cells the opening sample left missing.
         seam_conflict_mask = RcsGrid._merge_equivalent_sample_blocks(
             merged_seam_power,
             merged_seam_phase,
-            dataset.rcs_power[-1],
-            dataset.rcs_phase[-1],
+            dataset.power[-1],
+            dataset.phase[-1],
             context="medianize periodic endpoint",
             keep_existing_on_conflict=policy == "first",
         )
@@ -928,8 +940,8 @@ def medianize_azimuth(
                     f"the safety limit is {_MAX_EXPLICIT_AXIS_POINTS:,}"
                 )
             centers = first + np.arange(int(count_float), dtype=float) * slide
-    shape = (centers.size,) + dataset.rcs_power.shape[1:]
-    power = np.full(shape, np.nan, dtype=dataset.rcs_power.dtype)
+    shape = (centers.size,) + dataset.power.shape[1:]
+    power = np.full(shape, np.nan, dtype=dataset.power.dtype)
     for index, center in enumerate(centers):
         if periodic:
             left = int(np.searchsorted(augmented_azimuth, center - half, side="left"))
@@ -941,10 +953,9 @@ def medianize_azimuth(
             samples = np.arange(left, right, dtype=np.int64)
         if samples.size == 0:
             continue
-        sample_power = dataset.rcs_power[samples]
+        sample_power = dataset.power[samples]
         if merged_seam_power is not None and np.any(samples == 0):
-
-
+            sample_power = np.array(sample_power, copy=True)
             sample_power[np.flatnonzero(samples == 0)] = merged_seam_power
         power[index] = np.nanmedian(sample_power, axis=0)
     output_centers = np.deg2rad(centers) if angle_unit == "rad" else centers
@@ -1168,9 +1179,8 @@ def time_gate(
     start_m, stop_m, taper = _validate_gate(dataset, start_m, stop_m, taper, mode)
     frequencies = _uniform_frequencies_hz(dataset)
     conjugate = _declared_time_sign(dataset) == "-jwt"
-    shape = tuple(int(value) for value in dataset.rcs_power.shape)
-    power = np.full(shape, np.nan, dtype=np.float64)
-    phase = np.full(shape, np.nan, dtype=np.float64)
+    shape = tuple(int(value) for value in dataset.power.shape)
+    result_field = np.full(shape, np.nan + 1j * np.nan, dtype=np.complex128)
     sweeps_per_azimuth = max(1, shape[1] * shape[3])
     bytes_per_azimuth = sweeps_per_azimuth * _gate_fft_size(shape[2]) * 16 * 3
     rows = max(1, _GATE_WORK_BYTES // bytes_per_azimuth)
@@ -1190,8 +1200,7 @@ def time_gate(
         if conjugate:
             gated = np.conj(gated)
         gated = np.moveaxis(np.where(complete[..., None], gated, np.nan), -1, 2)
-        power[block] = np.abs(gated) ** 2
-        phase[block] = np.angle(gated)
+        result_field[block] = gated
         usable += int(np.count_nonzero(complete))
     if usable == 0:
         raise ValueError(
@@ -1218,8 +1227,7 @@ def time_gate(
         dataset.elevations,
         dataset.frequencies,
         dataset.polarizations,
-        rcs_power=power,
-        rcs_phase=phase,
+        rcs=result_field,
         rcs_domain="complex_amplitude",
         source_path=dataset.source_path,
         history=dataset.history,
@@ -1248,7 +1256,7 @@ def down_range_profile(
     frequencies = _uniform_frequencies_hz(dataset)
     count = frequencies.size
     azimuths = np.unique(np.linspace(
-        0, dataset.rcs_power.shape[0] - 1, min(max_sweeps, dataset.rcs_power.shape[0])
+        0, dataset.power.shape[0] - 1, min(max_sweeps, dataset.power.shape[0])
     ).round().astype(int))
     field = np.asarray(
         dataset.rcs_slice((azimuths, int(elevation_index), slice(None), int(polarization_index))),
@@ -1309,7 +1317,7 @@ def translate_phase_center(
         raise ValueError("the phase-center offset must be finite")
     if not np.any(offset):
         raise ValueError("the phase-center offset is zero")
-    power = dataset.rcs_power
+    power = dataset.power
     phase_in = _authoritative_response_phase(dataset)
     if not np.any(np.isfinite(power) & np.isfinite(phase_in)):
         raise ValueError("moving the phase center needs complex (phase) data")
@@ -1338,13 +1346,19 @@ def translate_phase_center(
         + np.sin(elevation)[None, :] * offset[2]
     )
     sign = 1.0 if _declared_time_sign(dataset) == "-jwt" else -1.0
-    phase = np.empty(power.shape, dtype=np.float64)
+    complex_storage = dataset.storage_kind == "complex"
+    shifted_response = np.empty(
+        power.shape, dtype=np.complex128 if complex_storage else np.float64
+    )
     rows = max(1, _GATE_WORK_BYTES // max(1, 8 * int(np.prod(power.shape[1:]))))
     for first in range(0, power.shape[0], rows):
         block = slice(first, min(power.shape[0], first + rows))
         ramp = sign * 2.0 * projection[block, :, None] * wavenumber[None, None, :]
-        shifted = np.asarray(phase_in[block], dtype=np.float64) + ramp[..., None] + np.pi
-        phase[block] = np.remainder(shifted, 2.0 * np.pi) - np.pi
+        if complex_storage:
+            shifted_response[block] = dataset.rcs_slice(block) * np.exp(1j * ramp[..., None])
+        else:
+            shifted = np.asarray(phase_in[block], dtype=np.float64) + ramp[..., None] + np.pi
+            shifted_response[block] = np.remainder(shifted, 2.0 * np.pi) - np.pi
 
     units = dict(dataset.units or {})
     extra = _derived_response_extra(dataset)
@@ -1398,8 +1412,8 @@ def translate_phase_center(
         dataset.elevations,
         dataset.frequencies,
         dataset.polarizations,
-        rcs_power=power,
-        rcs_phase=phase,
+        **({"rcs": shifted_response} if complex_storage else
+           {"rcs_power": power, "rcs_phase": shifted_response}),
         rcs_domain="complex_amplitude",
         source_path=dataset.source_path,
         history=dataset.history,

@@ -758,8 +758,8 @@ class GridMetadataMixin:
         from GRIM_Backend.datasets.grid import RcsGrid
         if not isinstance(other, RcsGrid):
             raise TypeError("other must be an RcsGrid")
-        if self.rcs_power.shape != other.rcs_power.shape:
-            raise ValueError(f"rcs shape {other.rcs_power.shape} != {self.rcs_power.shape}")
+        if self.power.shape != other.power.shape:
+            raise ValueError(f"rcs shape {other.power.shape} != {self.power.shape}")
         if not np.array_equal(self.azimuths, other.azimuths):
             raise ValueError("azimuth axis mismatch")
         if not np.array_equal(self.elevations, other.elevations):
@@ -774,7 +774,7 @@ class GridMetadataMixin:
                 raise TypeError("_scan_phase_samples must be True or False")
             if _scan_phase_samples:
                 for label, grid in (("left", self), ("right", other)):
-                    missing = np.isfinite(grid.rcs_power) & ~np.isfinite(grid.rcs_phase)
+                    missing = np.isfinite(grid.power) & ~np.isfinite(grid.phase)
                     if np.any(missing):
                         raise ValueError(
                             f"coherent operation requires phase; {label} grid has "

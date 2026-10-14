@@ -318,7 +318,7 @@ class GridCoordinatesMixin:
         if np.any(np.diff(tau_sorted) <= 1.0e-9):
             raise ValueError("Wedge tilt axis contains duplicate coordinates")
         if np.any(
-            np.isfinite(self.rcs_power) & ~np.isfinite(self.rcs_phase)
+            np.isfinite(self.power) & ~np.isfinite(self.phase)
         ):
             raise ValueError(
                 "Wedge-to-Conic Jones rotation requires finite phase for every "
@@ -381,7 +381,7 @@ class GridCoordinatesMixin:
         output_lat = np.deg2rad(target_lat) if el_unit == "rad" else target_lat
 
         converted_extra = {}
-        original_shape = tuple(self.rcs_power.shape)
+        original_shape = tuple(self.power.shape)
         stale = {
             "solver_metadata_json",
             "production_mesh_certification_json",
@@ -459,9 +459,8 @@ class GridCoordinatesMixin:
 
         # At tau=0 the range and conic polarization bases coincide. Going
         # through complex amplitudes would discard valid power-only samples.
-        power = np.take(self.rcs_power, order, axis=0)
-        phase = np.take(self.rcs_phase, order, axis=0)
-        original_shape = tuple(self.rcs_power.shape)
+        samples = self._sample_kwargs(transform=lambda values: np.take(values, order, axis=0))
+        original_shape = tuple(self.power.shape)
         stale_grid_metadata = {
             "solver_metadata_json",
             "production_mesh_certification_json",
@@ -516,8 +515,7 @@ class GridCoordinatesMixin:
             np.array(self.elevations, copy=True),
             np.array(self.frequencies, copy=True),
             np.array(self.polarizations, copy=True),
-            rcs_power=power,
-            rcs_phase=phase,
+            **samples,
             rcs_domain=self.rcs_domain,
             source_path=self.source_path,
             history=history,
@@ -629,11 +627,9 @@ class GridCoordinatesMixin:
                 "resolve the duplicate first"
             )
 
-        power = np.take(self.rcs_power, azimuth_order, axis=0)
-        power = np.take(power, order, axis=1)
-        phase = np.take(self.rcs_phase, azimuth_order, axis=0)
-        phase = np.take(phase, order, axis=1)
-        original_shape = tuple(self.rcs_power.shape)
+        samples = self._sample_kwargs(transform=lambda values:
+            np.take(np.take(values, azimuth_order, axis=0), order, axis=1))
+        original_shape = tuple(self.power.shape)
         stale_grid_metadata = {
             "solver_metadata_json",
             "production_mesh_certification_json",
@@ -698,8 +694,7 @@ class GridCoordinatesMixin:
             converted_elevation,
             np.array(self.frequencies, copy=True),
             np.array(self.polarizations, copy=True),
-            rcs_power=power,
-            rcs_phase=phase,
+            **samples,
             rcs_domain=self.rcs_domain,
             source_path=self.source_path,
             history=history,
@@ -824,8 +819,8 @@ class GridCoordinatesMixin:
             raise ValueError("combined azimuth axis is empty")
 
         out_shape = (len(az_merged), 1, len(self.frequencies), len(self.polarizations))
-        out_power = np.full(out_shape, np.nan, dtype=self.rcs_power.dtype)
-        out_phase = np.full(out_shape, np.nan, dtype=self.rcs_phase.dtype)
+        out_power = np.full(out_shape, np.nan, dtype=self.power.dtype)
+        out_phase = np.full(out_shape, np.nan, dtype=self.phase.dtype)
         raw_pair = self._complete_authoritative_raw_arrays()
         preserve_raw = raw_pair is not None
         if preserve_raw:
@@ -853,10 +848,10 @@ class GridCoordinatesMixin:
                 "deduplicate the azimuth axis or use a smaller tolerance"
             )
 
-        lo_power = self.rcs_power[:, lo_idx, :, :]
-        lo_phase = self.rcs_phase[:, lo_idx, :, :]
-        hi_power = self.rcs_power[:, hi_idx, :, :]
-        hi_phase = self.rcs_phase[:, hi_idx, :, :]
+        lo_power = self.power[:, lo_idx, :, :]
+        lo_phase = self.phase[:, lo_idx, :, :]
+        hi_power = self.power[:, hi_idx, :, :]
+        hi_phase = self.phase[:, hi_idx, :, :]
         if preserve_raw:
             lo_raw_real = raw_real[:, lo_idx, :, :]
             lo_raw_imag = raw_imag[:, lo_idx, :, :]

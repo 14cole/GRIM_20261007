@@ -1462,29 +1462,25 @@ def _selected_data_token(
         digest.update(len(encoded).to_bytes(8, "little") + encoded)
     if _cancel_requested(cancel_check):
         return None
-    raw_pair_getter = getattr(dataset, "_complete_authoritative_raw_arrays", None)
-    raw_pair = raw_pair_getter() if callable(raw_pair_getter) else None
-    if raw_pair is None:
-        sources = (
-            (b"power", dataset.rcs_power),
-            (b"phase", dataset.rcs_phase),
-        )
-        digest.update(b"power-phase")
+    sample_payload = dataset.native_sample_payload()
+    if sample_payload["storage_kind"] == "complex":
+        sources = ((b"complex", sample_payload["rcs_complex"]),)
+        digest.update(str(sample_payload["storage_domain"]).encode("ascii"))
+        digest.update(str(dataset.linear_quantity()).encode("utf-8"))
     else:
-        sources = (
-            (b"raw-real", raw_pair[0]),
-            (b"raw-imag", raw_pair[1]),
-        )
-        digest.update(b"authoritative-raw")
-        linear_quantity = getattr(dataset, "linear_quantity", None)
-        digest.update(str(
-            linear_quantity() if callable(linear_quantity) else ""
-        ).encode("utf-8"))
+        raw_pair = dataset._complete_authoritative_raw_arrays()
+        if raw_pair is not None:
+            sources = ((b"raw-real", raw_pair[0]), (b"raw-imag", raw_pair[1]))
+            digest.update(b"authoritative-raw")
+            digest.update(str(dataset.linear_quantity()).encode("utf-8"))
+        else:
+            sources = ((b"power", dataset.power), (b"phase", dataset.phase))
+            digest.update(b"power-phase")
 
     for label, values in sources:
         if _cancel_requested(cancel_check):
             return None
-        source = np.asarray(values)
+        source = values
         digest.update(label)
         digest.update(source.dtype.str.encode("ascii"))
         digest.update(
@@ -2795,7 +2791,8 @@ def compute_bands(params: dict):
         result["accuracy_plan"] = plan
         result["resolved_reconstruction"] = recon
         result["memory_budget"] = {
-            "source_power_phase_bytes": _result_array_bytes([{"power": params["dataset"].rcs_power, "phase": params["dataset"].rcs_phase}]),
+            # Keep the report key readable by older replay/report consumers.
+            "source_power_phase_bytes": _result_array_bytes([params["dataset"].native_sample_payload()]),
             "retained_previous_results_bytes": resident_bytes,
             "preparation_cache_bytes": _PREPROCESS_CACHE_BYTES, "preparation_cache_limit_bytes": _PREPROCESS_CACHE_LIMIT,
             "geometry_plan_cache_bytes": plan_cache_bytes(), "geometry_plan_cache_limit_bytes": 8 * 1024**2,

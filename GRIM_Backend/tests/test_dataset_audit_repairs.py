@@ -34,7 +34,7 @@ def test_round_frequency_preserves_normalized_raw_response(unit, frequencies, de
     before = source.rcs.copy()
     result = source.round_frequencies(decimals)
     np.testing.assert_allclose(result.rcs, before, rtol=3e-15, atol=0)
-    np.testing.assert_array_equal(result.rcs_power, source.rcs_power)
+    np.testing.assert_allclose(result.rcs_power, source.rcs_power, rtol=8 * np.finfo(float).eps)
     assert result.audit()["errors"] == []
     assert "rescaled" in result.extra["frequency_relabel_normalization"]
     assert "solver_certification" not in result.extra
@@ -46,7 +46,7 @@ def test_inline_frequency_relabel_reorders_without_changing_physical_field():
     before = source.rcs.copy()
     result = source.edit_axis_value("frequency", 0, 10.3)
     np.testing.assert_allclose(result.rcs, before[:, :, [1, 0], :], rtol=3e-15, atol=0)
-    np.testing.assert_array_equal(result.rcs_power, source.rcs_power[:, :, [1, 0], :])
+    np.testing.assert_allclose(result.rcs_power, source.rcs_power[:, :, [1, 0], :], rtol=8 * np.finfo(float).eps)
     assert result.audit()["errors"] == []
     assert "solver_certification" not in result.extra
 

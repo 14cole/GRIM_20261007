@@ -50,7 +50,7 @@ def quadrature_weights(coordinates):
 def population(dataset, selection, *, scale="dbsm", weighting="samples"):
     ai, ei, fi, pi = selection
     pi = int(np.asarray(pi).ravel()[0])
-    power = np.asarray(dataset.rcs_power[np.ix_(ai, ei, fi, [pi])][..., 0], dtype=float)
+    power = np.asarray(dataset.power[np.ix_(ai, ei, fi, [pi])][..., 0], dtype=float)
     valid = np.isfinite(power) & (power >= 0.)
     zero = valid & (power == 0.)
     if scale == "linear":

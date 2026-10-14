@@ -38,7 +38,7 @@ def _series(self, reference, dataset, name, selection, polarization):
             if self._button_checked(self.btn_phase):
                 raw = dataset.rcs_slice((az_indices, elev_idx, freq_idx, pol_indices[0]))
             else:
-                raw = dataset.rcs_power[az_indices, elev_idx, freq_idx, pol_indices[0]]
+                raw = dataset.power[az_indices, elev_idx, freq_idx, pol_indices[0]]
             display = self._display_from_values(
                 dataset, raw, frequency_value=native_frequency,
                 preserve_zeros=self._button_checked(self.btn_pbp)

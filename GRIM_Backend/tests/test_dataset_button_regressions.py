@@ -69,7 +69,7 @@ class NumericalButtonRegressions(unittest.TestCase):
                     moved = translate_phase_center(grid, x_m=point[0], y_m=point[1], z_m=point[2])
                     np.testing.assert_allclose(moved.rcs, 1.0, atol=2e-12)
                     np.testing.assert_array_equal(moved.elevations, grid.elevations)
-                    np.testing.assert_array_equal(moved.rcs_power, grid.rcs_power)
+                    np.testing.assert_allclose(moved.rcs_power, grid.rcs_power, rtol=8 * np.finfo(float).eps)
         grid.extra['sentri_elevation_convention'] = 'grim_elevation_waterline_zero_top_positive'
         with self.assertRaisesRegex(ValueError, 'contradictory elevation'):
             translate_phase_center(grid, x_m=1., y_m=0., z_m=0.)

@@ -174,13 +174,13 @@ class GridArithmeticMixin:
             raw_imag = (grid.extra or {}).get("rcs_amp_imag")
             if raw_real is not None and raw_imag is not None:
                 if (
-                    np.asarray(raw_real).shape == grid.rcs_power.shape
-                    and np.asarray(raw_imag).shape == grid.rcs_power.shape
+                    np.asarray(raw_real).shape == grid.power.shape
+                    and np.asarray(raw_imag).shape == grid.power.shape
                 ):
 
 
                     return np.dtype(np.float64)
-            return np.dtype(_real_storage_dtype(grid.rcs_power, grid.rcs_phase))
+            return np.dtype(_real_storage_dtype(grid.power, grid.phase))
 
         left_real_dtype = response_precision_upper_bound(self)
         right_real_dtype = response_precision_upper_bound(other)
@@ -192,7 +192,7 @@ class GridArithmeticMixin:
         complex_dtype = np.dtype(
             np.complex128 if real_dtype == np.dtype(np.float64) else np.complex64
         )
-        cell_count = int(self.rcs_power.size)
+        cell_count = int(self.power.size)
         block_cells = min(cell_count, _COHERENT_OPERATION_BLOCK_CELLS)
         retained_bytes = 2 * real_dtype.itemsize * cell_count
 
@@ -225,28 +225,25 @@ class GridArithmeticMixin:
 
         read_left, _left_reader_dtype = self._bounded_complex_slice_reader()
         read_right, _right_reader_dtype = other._bounded_complex_slice_reader()
-        power_out = np.empty(self.rcs_power.shape, dtype=real_dtype)
-        phase_out = np.empty(self.rcs_power.shape, dtype=real_dtype)
+        field_out = np.empty(self.power.shape, dtype=complex_dtype)
         usable_count = 0
         for selection in _bounded_grid_selections(
-            self.rcs_power.shape, _COHERENT_OPERATION_BLOCK_CELLS
+            self.power.shape, _COHERENT_OPERATION_BLOCK_CELLS
         ):
             left = np.asarray(read_left(selection), dtype=complex_dtype)
             if not left.flags.writeable or not left.flags.owndata:
                 left = np.array(left, dtype=complex_dtype, copy=True)
             right = np.asarray(read_right(selection), dtype=complex_dtype)
             np.subtract(left, right, out=left)
-            power_block = power_out[selection]
-            phase_block = phase_out[selection]
+            power_block = np.empty(left.shape, dtype=real_dtype)
             with np.errstate(invalid="ignore", over="ignore"):
                 np.hypot(left.real, left.imag, out=power_block)
                 np.multiply(power_block, power_block, out=power_block)
-                np.arctan2(left.imag, left.real, out=phase_block)
             invalid = ~np.isfinite(left.real)
             invalid |= ~np.isfinite(left.imag)
             invalid |= ~np.isfinite(power_block)
-            power_block[invalid] = np.nan
-            phase_block[invalid] = np.nan
+            left[invalid] = np.nan + 1j * np.nan
+            field_out[selection] = left
             usable_count += int(np.count_nonzero(~invalid))
 
         if usable_count == 0:
@@ -281,8 +278,7 @@ class GridArithmeticMixin:
             self.elevations,
             self.frequencies,
             self.polarizations,
-            rcs_power=power_out,
-            rcs_phase=phase_out,
+            rcs=field_out,
             rcs_domain="power_phase",
             history=history,
             extra=extra,
@@ -437,17 +433,16 @@ class GridArithmeticMixin:
             other: Another RcsGrid with identical axes.
 
         Returns:
-            New RcsGrid with linear power = self.rcs_power + other.rcs_power.
+            New RcsGrid with linear power = self.power + other.power.
         """
         self._assert_compatible(other)
-        power_sum = self.rcs_power + other.rcs_power
+        power_sum = self.power + other.power
         return self._new_grid(
             self.azimuths,
             self.elevations,
             self.frequencies,
             self.polarizations,
             rcs_power=power_sum,
-            rcs_phase=np.full(power_sum.shape, np.nan, dtype=power_sum.dtype),
             rcs_domain="power_phase",
             extra=self._derived_response_extra(
                 (other,), operation="incoherent-add", coherent=False
@@ -463,21 +458,20 @@ class GridArithmeticMixin:
             *grids: One or more RcsGrid instances.
 
         Returns:
-            New RcsGrid with linear power = self.rcs_power + sum(grid.rcs_power).
+            New RcsGrid with linear power = self.power + sum(grid.power).
         """
         if not grids:
             return self
-        total = np.array(self.rcs_power, copy=True)
+        total = np.array(self.power, copy=True)
         for grid in grids:
             self._assert_compatible(grid)
-            total = total + grid.rcs_power
+            total = total + grid.power
         return self._new_grid(
             self.azimuths,
             self.elevations,
             self.frequencies,
             self.polarizations,
             rcs_power=total,
-            rcs_phase=np.full(total.shape, np.nan, dtype=total.dtype),
             rcs_domain="power_phase",
             extra=self._derived_response_extra(
                 grids, operation="incoherent-add-many", coherent=False
@@ -493,7 +487,7 @@ class GridArithmeticMixin:
             other: Another RcsGrid with identical axes.
 
         Returns:
-            New RcsGrid with linear power = self.rcs_power - other.rcs_power.
+            New RcsGrid with linear power = self.power - other.power.
 
         A physically negative power result is rejected.  Only a negative
         residual consistent with floating-point subtraction roundoff is
@@ -501,8 +495,8 @@ class GridArithmeticMixin:
         subtraction from being silently clipped into a plausible dataset.
         """
         self._assert_compatible(other)
-        left = np.asarray(self.rcs_power)
-        right = np.asarray(other.rcs_power)
+        left = np.asarray(self.power)
+        right = np.asarray(other.power)
         calculation_dtype = np.result_type(left.dtype, right.dtype, np.float64)
         left_calc = left.astype(calculation_dtype, copy=False)
         right_calc = right.astype(calculation_dtype, copy=False)
@@ -534,7 +528,6 @@ class GridArithmeticMixin:
             self.frequencies,
             self.polarizations,
             rcs_power=power_diff,
-            rcs_phase=np.full(power_diff.shape, np.nan, dtype=power_diff.dtype),
             rcs_domain="power_phase",
             extra=self._derived_response_extra(
                 (other,), operation="incoherent-subtract", coherent=False
@@ -559,8 +552,8 @@ class GridArithmeticMixin:
             )
 
 
-        numerator = np.asarray(self.rcs_power)
-        denominator = np.asarray(other.rcs_power)
+        numerator = np.asarray(self.power)
+        denominator = np.asarray(other.power)
 
 
         output_dtype = np.result_type(
@@ -587,7 +580,6 @@ class GridArithmeticMixin:
             self.frequencies,
             self.polarizations,
             rcs_power=output_power,
-            rcs_phase=np.full(output_power.shape, np.nan, dtype=output_power.dtype),
             rcs_domain="power_phase",
             units=ratio_units,
             extra=self._derived_response_extra(
@@ -636,14 +628,14 @@ class GridArithmeticMixin:
         if domain == "complex":
             values = self.rcs
         elif domain == "magnitude":
-            values = self.rcs_power
+            values = self.power
         elif domain in ("db", "dbsm"):
-            values = self.linear_to_dbsm(self.rcs_power)
+            values = self.linear_to_dbsm(self.power)
         elif domain == "dbke":
 
 
             freq_grid = np.asarray(self.frequencies, dtype=float).reshape(1, 1, -1, 1)
-            values = self.linear_to_dbke(self.rcs_power, freq_grid)
+            values = self.linear_to_dbke(self.power, freq_grid)
         else:
             raise ValueError("domain must be 'complex', 'magnitude', 'dbsm', or 'dbke'")
 
@@ -783,8 +775,7 @@ class GridArithmeticMixin:
                 axis_values[1],
                 axis_values[2],
                 axis_values[3],
-                rcs_power=np.asarray(reduced, dtype=self.rcs_power.dtype),
-                rcs_phase=np.full(reduced.shape, np.nan, dtype=self.rcs_phase.dtype),
+                rcs_power=np.asarray(reduced, dtype=self.power.dtype),
                 rcs_domain="power_phase",
                 extra=statistics_extra,
             )
@@ -793,12 +784,12 @@ class GridArithmeticMixin:
             freq_grid = np.asarray(axis_values[2], dtype=float).reshape(1, 1, -1, 1)
             reduced_linear = np.asarray(
                 self.dbke_to_linear(np.asarray(reduced, dtype=float), freq_grid),
-                dtype=self.rcs_power.dtype,
+                dtype=self.power.dtype,
             )
         else:
             reduced_linear = np.asarray(
                 10.0 ** (np.asarray(reduced, dtype=float) / 10.0),
-                dtype=self.rcs_power.dtype,
+                dtype=self.power.dtype,
             )
         return self._new_grid(
             axis_values[0],
@@ -806,7 +797,6 @@ class GridArithmeticMixin:
             axis_values[2],
             axis_values[3],
             rcs_power=reduced_linear,
-            rcs_phase=np.full(reduced_linear.shape, np.nan, dtype=self.rcs_phase.dtype),
             rcs_domain="power_phase",
             extra=statistics_extra,
         )

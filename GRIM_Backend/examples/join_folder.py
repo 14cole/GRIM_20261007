@@ -186,7 +186,7 @@ def main() -> int:
     for path in paths:
         print(f"  {path}")
     print(f"Overlap policy: {OVERLAP_POLICY}")
-    print(f"Joined shape: {joined.rcs_power.shape}")
+    print(f"Joined shape: {joined.power.shape}")
     print(f"Wrote: {written}")
     return 0
 

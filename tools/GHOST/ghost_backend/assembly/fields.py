@@ -246,6 +246,8 @@ def _validate_grim_axes(d, path):
 
 def _decode_grim_fields(d, path):
     """Validate and normalize stored fields, including power/phase exports."""
+    from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples
+    d = decode_native_samples(d, label=str(path))
     axes, pols = _validate_grim_axes(d, path)
 
     shape = (
@@ -351,9 +353,10 @@ def _load_grim_sample(path, frequency, azimuth, elevation, cancel_check=lambda: 
     with np.load(path, allow_pickle=False) as data:
         metadata_keys = ("azimuths", "elevations", "frequencies", "polarizations",
                          "units", "power_domain", "rcs_domain",
+                         "grim_format_version", "storage_kind", "storage_domain",
                          "raw_complex_amplitude_preserved", "polarization_alias_primary")
         d = {key: data[key] for key in metadata_keys if key in data.files}
-        fields = [key for key in ("rcs_power", "rcs_phase", "rcs_amp_real", "rcs_amp_imag")
+        fields = [key for key in ("rcs_complex", "rcs_power", "rcs_phase", "rcs_amp_real", "rcs_amp_imag")
                   if key in data.files]
     axes, pols = _validate_grim_axes(d, path)
     original_shape = tuple(len(axis) for axis in axes.values()) + (len(pols),)
@@ -374,13 +377,14 @@ def _load_grim_sample(path, frequency, azimuth, elevation, cancel_check=lambda: 
                 if version not in readers:
                     raise ValueError(f"Unsupported body array format {version}.")
                 shape, fortran, dtype = readers[version](stream)
-                if shape != original_shape or dtype.kind not in "fiu":
+                allowed = "c" if field == "rcs_complex" else "fiu"
+                if shape != original_shape or dtype.kind not in allowed:
                     raise ValueError(f"Body {field} array does not match its numeric axes.")
                 start = stream.tell()
                 positions = [(start + int(np.ravel_multi_index(tuple(fixed) + (channel,), shape,
                               order="F" if fortran else "C")) * dtype.itemsize, channel)
                              for channel in range(len(pols))]
-                values = np.empty(len(pols), dtype=float)
+                values = np.empty(len(pols), dtype=dtype if field == "rcs_complex" else float)
                 for offset, channel in sorted(positions):
                     check_cancelled()
                     while stream.tell() < offset:

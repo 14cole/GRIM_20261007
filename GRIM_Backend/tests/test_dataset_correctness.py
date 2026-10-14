@@ -563,7 +563,7 @@ class DatasetCorrectnessTests(unittest.TestCase):
         )
         with mock.patch.object(grim_dataset, "_JOIN_MERGE_BLOCK_CELLS", 2):
             joined = RcsGrid.join_many(grid, max_output_bytes=10_000)
-        np.testing.assert_array_equal(joined.rcs_power, power)
+        np.testing.assert_allclose(joined.rcs_power, power, rtol=8 * np.finfo(float).eps)
 
         with self.assertRaisesRegex(ValueError, "reserved for internal"):
             RcsGrid(

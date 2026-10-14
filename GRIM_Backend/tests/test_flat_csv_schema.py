@@ -168,7 +168,7 @@ class FlatCsvSchemaTest(unittest.TestCase):
         grid = load_dataset(path)
         self.assertEqual(grid.units["azimuth"], "deg")
         self.assertEqual(grid.units["frequency"], "GHz")
-        self.assertEqual(float(grid.rcs_power.item()), 4.0)
+        self.assertAlmostEqual(float(grid.power.item()), 4.0, delta=8*np.finfo(float).eps*4.0)
         self.assertAlmostEqual(float(np.degrees(grid.rcs_phase.item())), -45.0)
         self.assertEqual(grid.extra["flat_csv_schema"], "legacy_cem_amplitude")
 

@@ -256,10 +256,10 @@ class GridCalibrationMixin:
         )
         dut_amp = np.asarray(self.rcs, dtype=np.complex128)
         measured_power = np.asarray(
-            measured_calibration.rcs_power[..., measured_pol_index]
+            measured_calibration.power[..., measured_pol_index]
         )
-        exact_power = np.asarray(exact_reference.rcs_power[..., exact_pol_index])
-        dut_power = np.asarray(self.rcs_power)
+        exact_power = np.asarray(exact_reference.power[..., exact_pol_index])
+        dut_power = np.asarray(self.power)
 
 
         exact_zero_power = np.isfinite(exact_power) & (exact_power == 0.0)
@@ -389,16 +389,16 @@ class GridCalibrationMixin:
                 np.asarray(grid.azimuths, dtype=np.float64),
                 np.asarray(grid.elevations, dtype=np.float64),
                 np.asarray(grid.frequencies, dtype=np.float64),
-                np.asarray(grid.rcs_power, dtype=np.float64),
-                np.asarray(grid.rcs_phase, dtype=np.float64),
+                np.asarray(grid.power, dtype=np.float64),
+                np.asarray(grid.phase, dtype=np.float64),
             ):
                 _update_array("modeled-array", values)
 
 
-            cells_per_azimuth = int(np.prod(grid.rcs_power.shape[1:]))
+            cells_per_azimuth = int(np.prod(grid.power.shape[1:]))
             azimuth_block = max(1, 262_144 // max(1, cells_per_azimuth))
             digest.update(b"authoritative-complex-field\0")
-            digest.update(str(grid.rcs_power.shape).encode("ascii") + b"\0")
+            digest.update(str(grid.power.shape).encode("ascii") + b"\0")
             for start in range(0, len(grid.azimuths), azimuth_block):
                 field = np.asarray(
                     grid.rcs_slice(
@@ -512,8 +512,6 @@ class GridCalibrationMixin:
             self.frequencies,
             self.polarizations,
             rcs=output_amp,
-            rcs_power=output_power,
-            rcs_phase=np.where(valid_output, np.angle(output_amp), np.nan),
             rcs_domain="complex_amplitude",
             source_path=None,
             history=history,

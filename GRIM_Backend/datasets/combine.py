@@ -227,8 +227,8 @@ class GridCombineMixin:
                 len(polarizations),
             )
             expected_shapes.append(expected)
-            power = np.asarray(grid.rcs_power)
-            phase = np.asarray(grid.rcs_phase)
+            power = np.asarray(grid.power)
+            phase = np.asarray(grid.phase)
             if power.shape != expected or phase.shape != expected:
                 raise ValueError(
                     f"stitch input {input_index} sample shape does not match its axes"
@@ -307,13 +307,13 @@ class GridCombineMixin:
         field_storage_dtypes = [dtype for _reader, dtype, _raw in field_readers]
         if policy in {"power-mean", "coherent-mean"}:
             output_dtype = np.result_type(
-                *[grid.rcs_power.dtype for grid in grids],
+                *[grid.power.dtype for grid in grids],
                 *field_storage_dtypes,
                 np.float64,
             )
         else:
             output_dtype = np.result_type(
-                *[grid.rcs_power.dtype for grid in grids],
+                *[grid.power.dtype for grid in grids],
                 *field_storage_dtypes,
             )
         itemsize = np.dtype(output_dtype).itemsize
@@ -375,8 +375,8 @@ class GridCombineMixin:
             grids, mapped_indices, field_readers
         ):
             az_idx, el_idx, f_idx, p_idx = indices
-            incoming_power = np.asarray(grid.rcs_power)
-            incoming_phase = np.asarray(grid.rcs_phase)
+            incoming_power = np.asarray(grid.power)
+            incoming_phase = np.asarray(grid.phase)
             pol_block = max(1, min(len(p_idx), _JOIN_MERGE_BLOCK_CELLS))
             freq_block = max(
                 1, min(len(f_idx), _JOIN_MERGE_BLOCK_CELLS // pol_block)
@@ -923,14 +923,14 @@ class GridCombineMixin:
                 preserve_raw_amplitude = False
                 break
             if (
-                raw_real.shape != grid.rcs_power.shape
-                or raw_imag.shape != grid.rcs_power.shape
+                raw_real.shape != grid.power.shape
+                or raw_imag.shape != grid.power.shape
             ):
                 preserve_raw_amplitude = False
                 break
 
 
-            modeled = np.isfinite(grid.rcs_power)
+            modeled = np.isfinite(grid.power)
             raw_finite = np.isfinite(raw_real) & np.isfinite(raw_imag)
             if np.any(modeled & ~raw_finite):
                 preserve_raw_amplitude = False
@@ -952,7 +952,7 @@ class GridCombineMixin:
             p_union = cls._axis_union([grid.polarizations for grid in grids], tol=0.0)
 
         shape = (len(az_union), len(el_union), len(f_union), len(p_union))
-        out_dtype = np.result_type(*[g.rcs_power.dtype for g in grids])
+        out_dtype = np.result_type(*[g.power.dtype for g in grids])
         cell_count = 1
         for dimension in shape:
             cell_count *= int(dimension)
@@ -1008,8 +1008,8 @@ class GridCombineMixin:
                     )
 
 
-            incoming_power = np.asarray(grid.rcs_power)
-            incoming_phase = np.asarray(grid.rcs_phase)
+            incoming_power = np.asarray(grid.power)
+            incoming_phase = np.asarray(grid.phase)
 
 
             pol_block = max(1, min(len(p_idx), _JOIN_MERGE_BLOCK_CELLS))
@@ -1255,8 +1255,8 @@ class GridCombineMixin:
             el_idx = el_indices[grid_idx]
             f_idx = f_indices[grid_idx]
             p_idx = p_indices[grid_idx]
-            aligned_power.append(grid.rcs_power[np.ix_(az_idx, el_idx, f_idx, p_idx)].copy())
-            aligned_phase.append(grid.rcs_phase[np.ix_(az_idx, el_idx, f_idx, p_idx)].copy())
+            aligned_power.append(grid.power[np.ix_(az_idx, el_idx, f_idx, p_idx)].copy())
+            aligned_phase.append(grid.phase[np.ix_(az_idx, el_idx, f_idx, p_idx)].copy())
 
         missing_any = np.zeros(aligned_power[0].shape, dtype=bool)
         for power in aligned_power:
@@ -1317,14 +1317,22 @@ class GridCombineMixin:
                     raw = np.asarray(overlap_extra[raw_key]).copy()
                     raw[final_missing] = np.nan
                     overlap_extra[raw_key] = raw
+            if grid.storage_kind == "complex":
+                field = np.array(grid.rcs_slice(source_selection), copy=True)
+                field[final_missing] = np.nan + 1j * np.nan
+                samples = {"rcs": field}
+            else:
+                samples = {
+                    "rcs_power": power[final_common_selection],
+                    "rcs_phase": phase[final_common_selection],
+                }
             overlap_grids.append(
                 cls(
                     az_common,
                     el_common,
                     f_common,
                     p_common,
-                    rcs_power=power[final_common_selection],
-                    rcs_phase=phase[final_common_selection],
+                    **samples,
                     rcs_domain="power_phase",
                     source_path=grid.source_path,
                     history=grid.history,

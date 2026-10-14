@@ -81,7 +81,7 @@ def heatmap_plane(dataset, indices, x_axis, y_axis, *, remaining_index=None, pha
     if remaining_index is not None:
         selected[axis_index] = np.asarray([remaining_index], dtype=int)
     selection = np.ix_(*selected)
-    data = dataset.rcs_slice(selection)[..., 0] if phase else dataset.rcs_power[selection][..., 0]
+    data = dataset.rcs_slice(selection)[..., 0] if phase else dataset.power[selection][..., 0]
     if phase:
         finite = np.isfinite(data) & (np.abs(data)>0)
         data = np.where(finite, np.exp(1j * np.angle(data)), np.nan + 1j * np.nan)

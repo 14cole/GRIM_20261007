@@ -749,8 +749,8 @@ class PtmFormatMixin:
 
         selected_polarity = str(self.polarizations[pol_idx]).strip().upper()
 
-        power_slice = self.rcs_power[:, el_idx, :, pol_idx]
-        phase_slice = self.rcs_phase[:, el_idx, :, pol_idx]
+        power_slice = self.power[:, el_idx, :, pol_idx]
+        phase_slice = self.phase[:, el_idx, :, pol_idx]
         power_missing = ~np.isfinite(power_slice)
         if np.any(power_missing):
             raise ValueError(

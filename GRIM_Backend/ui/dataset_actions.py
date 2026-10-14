@@ -234,8 +234,8 @@ def _hz_to_frequency_axis(dataset: "RcsGrid", values_hz) -> np.ndarray:
 def _derived_grid_peak_bytes(dataset: "RcsGrid", shape) -> int:
     cells = math.prod(int(value) for value in shape)
     itemsize = max(
-        np.dtype(dataset.rcs_power.dtype).itemsize,
-        np.dtype(dataset.rcs_phase.dtype).itemsize,
+        np.dtype(dataset.power.dtype).itemsize,
+        np.dtype(dataset.phase.dtype).itemsize,
     )
     # Retained power+phase plus interpolation/constructor scratch.  This is a
     # deliberately conservative guard, not an exact allocator model.
@@ -568,7 +568,7 @@ class DatasetOpsMixin:
         if not self._preflight_derived_outputs(
             job_name,
             [
-                (dataset, tuple(int(value) for value in dataset.rcs_power.shape))
+                (dataset, tuple(int(value) for value in dataset.power.shape))
                 for _name, dataset in launch_items
             ],
         ):
@@ -1787,12 +1787,12 @@ class DatasetOpsMixin:
         # for ordinary power arithmetic; reserve one more output estimate for
         # complex-field reconstruction.
         combine_extra = (
-            _derived_grid_peak_bytes(base, base.rcs_power.shape)
+            _derived_grid_peak_bytes(base, base.power.shape)
             if coherent else 0
         )
         if not self._preflight_derived_outputs(
             op_label,
-            [(base, base.rcs_power.shape)],
+            [(base, base.power.shape)],
             extra_bytes=combine_extra,
         ):
             return
@@ -1863,12 +1863,12 @@ class DatasetOpsMixin:
             return
         base = datasets[0][1]
         combine_extra = (
-            _derived_grid_peak_bytes(base, base.rcs_power.shape)
+            _derived_grid_peak_bytes(base, base.power.shape)
             if coherent else 0
         )
         if not self._preflight_derived_outputs(
             op_label,
-            [(base, base.rcs_power.shape)],
+            [(base, base.power.shape)],
             extra_bytes=combine_extra,
         ):
             return
@@ -2261,7 +2261,7 @@ class DatasetOpsMixin:
             lines = [
                 f"Operand {operand_index}: {name}",
                 f"Source: {source or 'unsaved / in-memory'}",
-                f"Shape: {tuple(int(value) for value in dataset.rcs_power.shape)!r}",
+                f"Shape: {tuple(int(value) for value in dataset.power.shape)!r}",
                 "Units:",
                 json.dumps(dict(dataset.units or {}), indent=2, sort_keys=True),
                 "History:",
@@ -2790,7 +2790,7 @@ class DatasetOpsMixin:
         retained_output_bytes = 0
         per_dataset_workspace_bytes = 0
         for _name, dataset in datasets:
-            source_shape = tuple(int(value) for value in dataset.rcs_power.shape)
+            source_shape = tuple(int(value) for value in dataset.power.shape)
             output_shape = (
                 source_shape
                 if broadcast_reduced
@@ -2803,8 +2803,8 @@ class DatasetOpsMixin:
             source_cells = math.prod(source_shape)
             working_itemsize = max(
                 8,
-                np.dtype(dataset.rcs_power.dtype).itemsize,
-                np.dtype(dataset.rcs_phase.dtype).itemsize,
+                np.dtype(dataset.power.dtype).itemsize,
+                np.dtype(dataset.phase.dtype).itemsize,
             )
             # Final power and phase arrays from earlier datasets remain in the
             # result list. Median/percentile may partition several input-sized
@@ -3471,7 +3471,7 @@ class DatasetOpsMixin:
         interpolation_extra = 0
         for _name, dataset in others:
             if mode == "interp":
-                output_shape = tuple(int(value) for value in ref_grid.rcs_power.shape)
+                output_shape = tuple(int(value) for value in ref_grid.power.shape)
                 interpolation_extra = max(
                     interpolation_extra,
                     dataset._alignment_interpolation_peak_bytes(ref_grid),
@@ -3480,11 +3480,11 @@ class DatasetOpsMixin:
                 output_shape = tuple(
                     min(int(left), int(right))
                     for left, right in zip(
-                        dataset.rcs_power.shape, ref_grid.rcs_power.shape
+                        dataset.power.shape, ref_grid.power.shape
                     )
                 )
             else:
-                output_shape = tuple(int(value) for value in dataset.rcs_power.shape)
+                output_shape = tuple(int(value) for value in dataset.power.shape)
             align_plans.append((dataset, output_shape))
         if not self._preflight_derived_outputs(
             "Align", align_plans, extra_bytes=interpolation_extra
@@ -3609,7 +3609,7 @@ class DatasetOpsMixin:
         axis_index = {"azimuth": 0, "elevation": 1, "frequency": 2}[axis]
         estimated_peak = 0
         for _name, dataset in datasets:
-            shape = list(dataset.rcs_power.shape)
+            shape = list(dataset.power.shape)
             shape[axis_index] = n
             estimated_peak += _derived_grid_peak_bytes(dataset, shape)
         memory_limit = _derived_grid_memory_limit()
@@ -4005,7 +4005,7 @@ class DatasetOpsMixin:
         )
 
         estimated_peak = sum(
-            _derived_grid_peak_bytes(dataset, dataset.rcs_power.shape)
+            _derived_grid_peak_bytes(dataset, dataset.power.shape)
             for _name, dataset in datasets
         )
         memory_limit = _derived_grid_memory_limit()
@@ -4868,7 +4868,7 @@ class DatasetOpsMixin:
         wedge_workspace = 0
         wedge_plans = []
         for _name, dataset in datasets:
-            shape = tuple(int(value) for value in dataset.rcs_power.shape)
+            shape = tuple(int(value) for value in dataset.power.shape)
             wedge_plans.append((dataset, shape))
             query_frequency_cells = int(
                 shape[0] * shape[1] * shape[2]
@@ -5026,10 +5026,10 @@ class DatasetOpsMixin:
                     len(dataset.polarizations),
                 )
                 peak_estimate += _derived_grid_peak_bytes(dataset, shape)
-                source_cells = int(math.prod(dataset.rcs_power.shape))
+                source_cells = int(math.prod(dataset.power.shape))
                 source_itemsize = max(
-                    np.dtype(dataset.rcs_power.dtype).itemsize,
-                    np.dtype(dataset.rcs_phase.dtype).itemsize,
+                    np.dtype(dataset.power.dtype).itemsize,
+                    np.dtype(dataset.phase.dtype).itemsize,
                 )
                 # A widest-window advanced-index copy and nanmedian partition
                 # scratch can coexist with all previously retained outputs.
@@ -5148,7 +5148,7 @@ class DatasetOpsMixin:
         if not self._preflight_derived_outputs(
             "Duplicate",
             [
-                (dataset, tuple(int(value) for value in dataset.rcs_power.shape))
+                (dataset, tuple(int(value) for value in dataset.power.shape))
                 for _name, dataset in datasets
             ],
             # deepcopy owns another metadata-array set while the source stays
@@ -5170,8 +5170,7 @@ class DatasetOpsMixin:
                     dataset.elevations.copy(),
                     dataset.frequencies.copy(),
                     dataset.polarizations.copy(),
-                    rcs_power=dataset.rcs_power.copy(),
-                    rcs_phase=dataset.rcs_phase.copy(),
+                    **dataset._sample_kwargs(),
                     rcs_domain=dataset.rcs_domain,
                     source_path=dataset.source_path,
                     history=dataset.history,
@@ -5323,7 +5322,7 @@ class DatasetOpsMixin:
             return
 
         prefers_double = any(
-            np.dtype(dataset.rcs_power.dtype).itemsize > 4
+            np.dtype(dataset.power.dtype).itemsize > 4
             or dataset._complete_authoritative_raw_arrays() is not None
             for _name, dataset in datasets
         )
@@ -5654,7 +5653,7 @@ class DatasetOpsMixin:
                 self.status.showMessage("CSV export canceled; no files were changed.")
                 return
 
-        row_counts = [math.prod(dataset.rcs_power.shape) for dataset, _ in entries]
+        row_counts = [math.prod(dataset.power.shape) for dataset, _ in entries]
         total_rows = sum(row_counts)
         # V1 repeats explicit physical metadata per row for robust standalone
         # interchange. This conservative estimate is used only for time/disk UI.
@@ -5761,8 +5760,8 @@ class DatasetOpsMixin:
 
         if not self._preflight_derived_outputs(
             "Coherent ÷",
-            [(ds_a, ds_a.rcs_power.shape)],
-            extra_bytes=_derived_grid_peak_bytes(ds_a, ds_a.rcs_power.shape),
+            [(ds_a, ds_a.power.shape)],
+            extra_bytes=_derived_grid_peak_bytes(ds_a, ds_a.power.shape),
         ):
             return
 

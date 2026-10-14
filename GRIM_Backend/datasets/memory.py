@@ -7,7 +7,10 @@ import zipfile
 
 import numpy as np
 
-from GRIM_Backend.datasets.constants import _DENSE_IMPORT_FALLBACK_LIMIT_BYTES
+from GRIM_Backend.datasets.constants import (
+    _DENSE_IMPORT_FALLBACK_LIMIT_BYTES,
+    _RAW_COMPLEX_VALIDATION_BLOCK_CELLS,
+)
 
 
 def _available_import_memory_bytes():
@@ -232,6 +235,7 @@ def _preflight_native_archive_allocation(
             raise ValueError("native .grim max_output_bytes must be a positive integer")
 
     member_payload_bytes: dict[str, int] = {}
+    member_element_counts: dict[str, int] = {}
     try:
         with zipfile.ZipFile(path, "r") as archive:
             infos = [info for info in archive.infolist() if not info.is_dir()]
@@ -324,6 +328,8 @@ def _preflight_native_archive_allocation(
                             f"in {info.filename}"
                         )
                 member_payload_bytes[info.filename[:-4]] = payload_bytes
+                if not dtype.hasobject:
+                    member_element_counts[info.filename[:-4]] = element_count
     except (zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
         raise ValueError(f"{path} is not a valid native .grim/NPZ archive") from exc
 
@@ -332,8 +338,6 @@ def _preflight_native_archive_allocation(
         "elevations",
         "frequencies",
         "polarizations",
-        "rcs_power",
-        "rcs_phase",
     }
     missing = sorted(required.difference(member_payload_bytes))
     if missing:
@@ -342,14 +346,27 @@ def _preflight_native_archive_allocation(
             + ", ".join(missing)
             + ")"
         )
+    has_version = "grim_format_version" in member_payload_bytes
+    has_complex = "rcs_complex" in member_payload_bytes
+    has_power = "rcs_power" in member_payload_bytes
+    has_phase = "rcs_phase" in member_payload_bytes
+    if not ((has_version and (has_complex or has_power)) or (has_power and has_phase)):
+        raise ValueError(f"{path} is not a supported .grim file (missing sample arrays)")
     retained_bytes = sum(member_payload_bytes.values())
-
-
+    # Current complex archives need one canonical copy, not full-grid power,
+    # phase, and normalized-complex validation copies. Account for masks during
+    # construction and the bounded raw consistency scan's floating work arrays.
+    sample_bytes = sum(member_payload_bytes.get(key, 0) for key in
+                       ("rcs_complex", "rcs_power", "rcs_phase"))
+    if has_complex:
+        cells = member_element_counts.get("rcs_complex", 0)
+        scratch = min(cells, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS) * 128
+        validation_bytes = sample_bytes + max(3 * cells, scratch)
+    else:
+        validation_bytes = 3 * sample_bytes if has_power and not has_phase else sample_bytes
     peak_bytes = max(
         declared_uncompressed,
-        retained_bytes
-        + member_payload_bytes["rcs_power"]
-        + member_payload_bytes["rcs_phase"],
+        retained_bytes + validation_bytes,
     )
     if peak_bytes > limit:
         raise MemoryError(
@@ -370,7 +387,8 @@ def _preflight_native_archive_allocation(
 
 def _real_storage_dtype(*values):
     """Return float32 unless any supplied numeric array carries >32-bit precision."""
-    dtypes = [np.asarray(value).dtype for value in values if value is not None]
+    dtypes = [np.dtype(value.dtype) if hasattr(value, "dtype") else np.asarray(value).dtype
+              for value in values if value is not None]
     if any(
         (dtype.kind == "f" and dtype.itemsize > 4)
         or (dtype.kind == "c" and dtype.itemsize > 8)

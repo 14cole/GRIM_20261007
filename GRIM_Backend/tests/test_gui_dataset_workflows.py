@@ -120,7 +120,7 @@ class AxisEditTransactionTest(unittest.TestCase):
             edited.polarizations,
             ["HH", "VERY_LONG_POLARIZATION", "CUSTOM"],
         )
-        np.testing.assert_array_equal(edited.rcs_power, power)
+        np.testing.assert_allclose(edited.power, power, rtol=8*np.finfo(float).eps, atol=0.)
         self.assertNotIn("polarization_alias_primary", edited.extra)
         self.assertNotIn("polarization_aliases_json", edited.extra)
         self.assertIn(
@@ -193,11 +193,11 @@ class AxisEditTransactionTest(unittest.TestCase):
 
         np.testing.assert_array_equal(source.azimuths, [0.0, 1.0, 2.0])
         np.testing.assert_array_equal(edited.azimuths, [1.0, 2.0, 3.0])
-        np.testing.assert_array_equal(
-            edited.rcs_power, np.take(power, expected_order, axis=0)
+        np.testing.assert_allclose(
+            edited.power, np.take(power, expected_order, axis=0), rtol=8*np.finfo(float).eps, atol=0.
         )
-        np.testing.assert_array_equal(
-            edited.rcs_phase, np.take(phase, expected_order, axis=0)
+        np.testing.assert_allclose(
+            edited.phase, np.take(phase, expected_order, axis=0), rtol=8*np.finfo(float).eps, atol=0.
         )
         np.testing.assert_array_equal(
             edited.extra["aligned"],
@@ -1374,7 +1374,7 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
                 np.broadcast_to(expected, base_power.shape),
             )
             original = self.window.table.item(row - 2, 0).data(Qt.UserRole)
-            np.testing.assert_array_equal(original.rcs_power, scale * base_power)
+            np.testing.assert_allclose(original.power, scale * base_power, rtol=8*np.finfo(float).eps, atol=0.)
             self.assertFalse(np.shares_memory(original.rcs_power, result.rcs_power))
             reduction = json.loads(result.extra["statistics_reduction_json"])
             self.assertTrue(reduction["broadcast_reduced"])
@@ -1633,7 +1633,7 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
             edited.polarizations,
             ["HH", "VERY_LONG_POLARIZATION", "CUSTOM"],
         )
-        np.testing.assert_array_equal(edited.rcs_power, power)
+        np.testing.assert_allclose(edited.power, power, rtol=8*np.finfo(float).eps, atol=0.)
         self.assertEqual(str(name_item.data(DATASET_ID_ROLE)), dataset_id)
         self.assertTrue(name_item.data(DATASET_DIRTY_ROLE))
         self.assertTrue(name_item.font().bold())
@@ -1770,7 +1770,7 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
 
         edited = self.window.table.item(0, 0).data(Qt.UserRole)
         np.testing.assert_array_equal(edited.azimuths, [1.0, 2.0, 3.0])
-        np.testing.assert_array_equal(edited.rcs_power.ravel(), [20.0, 30.0, 10.0])
+        np.testing.assert_allclose(edited.power.ravel(), [20.0, 30.0, 10.0], rtol=8*np.finfo(float).eps, atol=0.)
         np.testing.assert_array_equal(edited.rcs_phase.ravel(), [2.0, 3.0, 1.0])
         self.assertTrue(self.window.table.item(0, 0).data(DATASET_DIRTY_ROLE))
         self.assertIn("stable-sorted axis", edited.history)

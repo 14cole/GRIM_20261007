@@ -775,7 +775,9 @@ def read_unit_grims(results_dir: 'os.PathLike') -> 'List[Dict[str, Any]]':
         dual_match = _DUAL_UNIT_RE.match(p.name)
         if legacy_match is None and dual_match is None:
             continue
-        with np.load(str(p)) as d:
+        with np.load(str(p), allow_pickle=False) as stored:
+            from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples
+            d = decode_native_samples({key: stored[key] for key in stored.files}, label=str(p))
             if not bool(d["raw_complex_amplitude_preserved"]):
                 raise ValueError(f"{p.name}: complex amplitudes were not preserved.")
             amp = (np.asarray(d["rcs_amp_real"], float)
@@ -811,7 +813,7 @@ def read_unit_grims(results_dir: 'os.PathLike') -> 'List[Dict[str, Any]]':
                 amplitude = amp[:, 0, :, :]
                 legacy_pol = ""
             solver_audit = None
-            if "solver_metadata_json" in d.files:
+            if "solver_metadata_json" in d:
                 raw_audit = np.asarray(
                     d["solver_metadata_json"]
                 ).reshape(()).item()

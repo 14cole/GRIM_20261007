@@ -8,7 +8,7 @@ from GRIM_Backend.datasets.grid import RcsGrid
 from GRIM_Backend.datasets.transforms import medianize_azimuth, offset_db
 
 
-def _raw_grid(raw, quantity, frequencies=(1.0,)):
+def _raw_grid(raw, quantity, frequencies=(1.0,), *, blank_phase=False):
     raw = np.asarray(raw, dtype=np.complex128).reshape(-1, 1, len(frequencies), 1)
     if quantity == "sigma_2d":
         k = 2.0 * np.pi * np.asarray(frequencies) * 1.0e9 / C0
@@ -18,7 +18,8 @@ def _raw_grid(raw, quantity, frequencies=(1.0,)):
     return RcsGrid(
         np.arange(raw.shape[0], dtype=float), [0.0], frequencies, ["VV"],
         rcs_power=np.asarray(np.abs(field) ** 2, dtype=np.float32),
-        rcs_phase=np.asarray(np.angle(field), dtype=np.float32),
+        rcs_phase=(np.full(raw.shape, np.nan, dtype=np.float32) if blank_phase
+                   else np.asarray(np.angle(field), dtype=np.float32)),
         units={
             "azimuth": "deg", "elevation": "deg", "frequency": "GHz",
             "rcs_linear_quantity": quantity,
@@ -34,8 +35,12 @@ def test_offset_preserves_small_coherent_residual(quantity, offset):
     epsilon = 1.0e-8
     left, left_field = _raw_grid([1.0 + epsilon], quantity)
     right, right_field = _raw_grid([1.0], quantity)
-    # The cached display values have already rounded away the difference.
-    np.testing.assert_array_equal(left.rcs_power, right.rcs_power)
+    # The imported float32 display values cannot resolve this difference;
+    # canonical raw quadratures and derived power retain their precision.
+    np.testing.assert_array_equal(
+        np.asarray(left.power, dtype=np.float32),
+        np.asarray(right.power, dtype=np.float32),
+    )
     power_before = left.rcs_power.copy()
     raw_before = left.extra["rcs_amp_real"].copy()
 
@@ -69,8 +74,7 @@ def test_offset_preserves_small_phase_residual_across_signed_wrap(reference_phas
 @pytest.mark.parametrize("offset", [-6.0, 0.0, 6.0])
 def test_offset_normalizes_authoritative_field_at_each_frequency(quantity, offset):
     raw = np.asarray([[1.0 + 0.2j, -2.0 + 1.0j], [0.0j, np.nan + 1j * np.nan]])
-    source, field = _raw_grid(raw, quantity, frequencies=(1.0, 4.0))
-    source.rcs_phase[:] = np.nan  # Raw quadratures still provide valid phase.
+    source, field = _raw_grid(raw, quantity, frequencies=(1.0, 4.0), blank_phase=True)
 
     result = offset_db(source, offset)
 
@@ -112,7 +116,7 @@ def test_offset_reads_raw_field_in_bounded_blocks(monkeypatch, raw_shape):
 
     def read(pair, selection=None):
         assert selection is not None, "offset must not allocate a full complex grid"
-        block_sizes.append(source.rcs_power[selection].size)
+        block_sizes.append(pair[0][selection].size)
         return original_reader(pair, selection)
 
     monkeypatch.setattr(source, "_authoritative_raw_amplitude_from_pair", read)

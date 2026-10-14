@@ -489,7 +489,7 @@ def plot_datasets(
                     raw = (
                         dataset.rcs_slice(selection)[:, 0, 0, 0]
                         if phase
-                        else dataset.rcs_power[np.ix_(az_idx, [ei], [fi], [pol_idx])][:, 0, 0, 0]
+                        else dataset.power[np.ix_(az_idx, [ei], [fi], [pol_idx])][:, 0, 0, 0]
                     )
                     y = _display_values(
                         dataset,
@@ -568,7 +568,7 @@ def plot_datasets(
                 raw = (
                     dataset.rcs_slice(selection)
                     if phase
-                    else dataset.rcs_power[selection]
+                    else dataset.power[selection]
                 )[:, 0, 0, 0]
                 frequency = dataset.frequencies[fr_idx[0]]
             elif varying == "elevation":
@@ -577,7 +577,7 @@ def plot_datasets(
                 raw = (
                     dataset.rcs_slice(selection)
                     if phase
-                    else dataset.rcs_power[selection]
+                    else dataset.power[selection]
                 )[0, :, 0, 0]
                 frequency = dataset.frequencies[fr_idx[0]]
             else:
@@ -586,7 +586,7 @@ def plot_datasets(
                 raw = (
                     dataset.rcs_slice(selection)
                     if phase
-                    else dataset.rcs_power[selection]
+                    else dataset.power[selection]
                 )[0, 0, :, 0]
                 frequency = x
             y = _display_values(dataset, raw, frequency=frequency, phase=phase, scale=scale)
@@ -620,7 +620,7 @@ def plot_datasets(
                 raw = (
                     dataset.rcs_slice(selection)
                     if phase
-                    else dataset.rcs_power[selection]
+                    else dataset.power[selection]
                 )[:, 0, :, 0]
                 z = _display_values(dataset, raw, frequency=fr_axis[None, :], phase=phase, scale=scale)
                 if str(waterfall_style).lower().startswith("wire"):

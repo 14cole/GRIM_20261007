@@ -554,7 +554,7 @@ def _assembly_response_physics_sha256(grid) -> str:
         )
     real = np.asarray(real, dtype=np.float64)
     imag = np.asarray(imag, dtype=np.float64)
-    if real.shape != grid.rcs_power.shape or imag.shape != grid.rcs_power.shape:
+    if real.shape != grid.power.shape or imag.shape != grid.power.shape:
         raise ValueError(
             "clean body raw amplitude arrays do not match its response grid"
         )
@@ -1083,24 +1083,7 @@ def _node_icon(node_type: str, expanded: bool = False, has_data: bool = True) ->
 def _grid_to_b64(grid) -> str:
     """Serialize an RcsGrid to a base-64 string."""
     buf = io.BytesIO()
-    units_payload = json.dumps(grid.units) if grid.units else ""
-    payload = dict(grid._extra_to_write())
-    payload.update(
-        azimuths=grid.azimuths,
-        elevations=grid.elevations,
-        frequencies=grid.frequencies,
-        polarizations=grid.polarizations,
-        rcs_power=grid.rcs_power,
-        rcs_phase=grid.rcs_phase,
-        rcs_domain="power_phase",
-        power_domain="linear_rcs",
-        source_path=grid.source_path if grid.source_path is not None else "",
-        history=grid.history if grid.history is not None else "",
-        units=units_payload,
-    )
-    for tag in ("rcs_domain", "power_domain"):
-        if tag in grid.extra:
-            payload[tag] = grid.extra[tag]
+    payload = grid._native_archive_payload(path="embedded .asy dataset", artifact=".asy")
     object_keys = [
         str(key)
         for key, value in payload.items()
@@ -1126,51 +1109,7 @@ def _b64_to_grid(b64: str):
     with io.BytesIO(base64.b64decode(b64)) as buf, np.load(
         buf, allow_pickle=False
     ) as data:
-        units: dict = {}
-        if "units" in data:
-            raw = data["units"]
-            if isinstance(raw, np.ndarray):
-                raw = raw.item()
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            if isinstance(raw, str) and raw:
-                try:
-                    units = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        "embedded dataset contains corrupt units metadata; refusing "
-                        "to guess its physical conventions"
-                    ) from exc
-            if not isinstance(units, dict):
-                raise ValueError(
-                    "embedded dataset units metadata must be a JSON object"
-                )
-
-        source_path_raw = (
-            data["source_path"].item() if "source_path" in data else None
-        )
-        source_path = source_path_raw if source_path_raw else None
-        history_raw = data["history"].item() if "history" in data else None
-        history = history_raw if history_raw else None
-        extra = {
-            key: data[key]
-            for key in getattr(data, "files", [])
-            if key not in RcsGrid._RESERVED_KEYS
-        }
-
-        return RcsGrid(
-            data["azimuths"],
-            data["elevations"],
-            data["frequencies"],
-            data["polarizations"],
-            rcs_power=data["rcs_power"],
-            rcs_phase=data["rcs_phase"],
-            rcs_domain="power_phase",
-            source_path=source_path,
-            history=history,
-            units=units,
-            extra=extra,
-        )
+        return RcsGrid._from_native_arrays(data, path="embedded .asy dataset")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3138,12 +3077,6 @@ def _align_coherent_grid(grid, target, *, mode: str):
         rcs=np.asarray(field, dtype=np.complex128),
         units=copy.deepcopy(grid.units or {}),
     )
-    # RcsGrid stores its public interchange representation as power/phase.
-    # Keep the exact aligned field out-of-band for this one in-memory build so
-    # a near-null does not round-trip through angle/square-root reconstruction.
-    aligned._assembly_authoritative_complex = np.asarray(
-        field, dtype=np.complex128
-    )
     return aligned
 
 
@@ -3624,23 +3557,17 @@ def _combine_children(
         for g in coh_grids:
             if cancel_check is not None and cancel_check():
                 raise InterruptedError("Assembly build canceled.")
-            missing = np.isfinite(g.rcs_power) & ~np.isfinite(g.rcs_phase)
+            missing = np.isfinite(g.power) & ~np.isfinite(g.phase)
             if np.any(missing):
                 raise ValueError(
                     "a branch containing incoherent or phase-unknown data cannot "
                     "be used as a coherent assembly child"
                 )
-        def _field(grid):
-            aligned_field = getattr(
-                grid, "_assembly_authoritative_complex", None
-            )
-            return grid.rcs if aligned_field is None else aligned_field
-
-        C_coh = np.array(_field(coh_grids[0]), copy=True)
+        C_coh = coh_grids[0].rcs
         for g in coh_grids[1:]:
             if cancel_check is not None and cancel_check():
                 raise InterruptedError("Assembly build canceled.")
-            next_field = _field(g)
+            next_field = g.rcs
             result_dtype = np.result_type(C_coh.dtype, next_field.dtype)
             if C_coh.dtype != result_dtype:
                 C_coh = C_coh.astype(result_dtype)
@@ -3648,14 +3575,14 @@ def _combine_children(
 
     P_incoh = None
     if incoh_grids:
-        P_incoh = np.array(incoh_grids[0].rcs_power, copy=True)
+        P_incoh = np.array(incoh_grids[0].power, copy=True)
         for g in incoh_grids[1:]:
             if cancel_check is not None and cancel_check():
                 raise InterruptedError("Assembly build canceled.")
-            result_dtype = np.result_type(P_incoh.dtype, g.rcs_power.dtype)
+            result_dtype = np.result_type(P_incoh.dtype, g.power.dtype)
             if P_incoh.dtype != result_dtype:
                 P_incoh = P_incoh.astype(result_dtype)
-            np.add(P_incoh, g.rcs_power, out=P_incoh)
+            np.add(P_incoh, g.power, out=P_incoh)
 
     if C_coh is not None and P_incoh is not None:
         total_power = np.empty(C_coh.shape, dtype=C_coh.real.dtype)
@@ -3668,15 +3595,11 @@ def _combine_children(
         # No single field phase exists for a coherent-field plus statistically
         # independent power sum. Mark it unknown so an ancestor cannot silently
         # reinterpret the incoherent contribution as a coherent field.
-        total_phase = np.full(total_power.shape, np.nan, dtype=total_power.dtype)
+        sample_kwargs = {"rcs_power": total_power}
     elif C_coh is not None:
-        total_power = np.empty(C_coh.shape, dtype=C_coh.real.dtype)
-        np.absolute(C_coh, out=total_power)
-        np.square(total_power, out=total_power)
-        total_phase = np.angle(C_coh)
+        sample_kwargs = {"rcs": C_coh}
     else:
-        total_power = np.array(P_incoh, copy=True)
-        total_phase = np.full(total_power.shape, np.nan, dtype=total_power.dtype)
+        sample_kwargs = {"rcs_power": P_incoh}
 
     extra = _combined_semantic_extra(
         source_grids,
@@ -3715,17 +3638,11 @@ def _combine_children(
 
     result = RcsGrid(
         ref.azimuths, ref.elevations, ref.frequencies, ref.polarizations,
-        rcs=None,
-        rcs_power=total_power,
-        rcs_phase=total_phase,
+        **sample_kwargs,
         rcs_domain="power_phase",
         units=result_units,
         extra=extra,
     )
-    if C_coh is not None and P_incoh is None:
-        result._assembly_authoritative_complex = np.asarray(
-            C_coh, dtype=np.complex128
-        )
     return result
 
 
@@ -3750,7 +3667,7 @@ class _BuildNode:
         return Qt.Checked if self._included else Qt.Unchecked
     def cells(self):
         grid = self._data.get(_ROLE_GRID)
-        return int(grid.rcs_power.size) if grid is not None else max((c.cells() for c in self._children), default=0)
+        return int(grid.power.size) if grid is not None else max((c.cells() for c in self._children), default=0)
     def working_bytes(self):
         return self.cells()*256+sum(c.working_bytes() for c in self._children)
 
@@ -3889,7 +3806,7 @@ def build_assembly_grid(
         parts.append("incoh[" + " + ".join(h for h, _ in incoh) + "]")
     history = f"Σ {node.text(0)} ({axis_mode}): " + " ⊕ ".join(parts)
     if axis_mode == "intersect":
-        losses = [int(source.rcs_power.size-aligned_grid.rcs_power.size) for source, aligned_grid in zip(grids_in_order, aligned)]
+        losses = [int(source.power.size-aligned_grid.power.size) for source, aligned_grid in zip(grids_in_order, aligned)]
         history += " | Exact intersection discarded samples per input: " + ", ".join(map(str, losses))
     if cancel_check is not None and cancel_check():
         raise InterruptedError("Assembly build canceled.")

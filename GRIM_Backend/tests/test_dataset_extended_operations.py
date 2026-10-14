@@ -301,12 +301,15 @@ class CropDatasetReplayTests(unittest.TestCase):
         np.testing.assert_array_equal(cropped.frequencies, [8.0, 10.0])
         np.testing.assert_array_equal(cropped.polarizations, ["HH"])
         selection = np.ix_([0, 2], [1], [0, 2], [1])
-        np.testing.assert_array_equal(cropped.rcs_power, power[selection])
-        np.testing.assert_array_equal(cropped.rcs_phase, phase[selection])
+        # Coordinates and quadratures are copied exactly; derived polar values
+        # can differ from imported values by floating-point roundoff.
+        np.testing.assert_array_equal(cropped.rcs, source.rcs[selection])
+        np.testing.assert_allclose(cropped.rcs_power, power[selection], rtol=8 * np.finfo(float).eps)
+        np.testing.assert_allclose(cropped.rcs_phase, phase[selection], rtol=8 * np.finfo(float).eps)
         self.assertEqual(cropped.units["phase_wrap"], "0_360")
         self.assertEqual(cropped.extra["phase_reference"], "vehicle origin")
         self.assertEqual(cropped.source_path, "measured.grim")
-        np.testing.assert_array_equal(source.rcs_power, power)
+        np.testing.assert_allclose(source.rcs_power, power, rtol=8 * np.finfo(float).eps)
 
 
 class DatasetAuditTests(unittest.TestCase):

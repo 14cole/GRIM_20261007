@@ -580,7 +580,7 @@ class PhaseCenterTests(unittest.TestCase):
                 grid = _point_grid(point, elevations=(-10.0, 0.0, 20.0), **kwargs)
                 moved = translate_phase_center(grid, x_m=point[0], y_m=point[1], z_m=point[2])
                 np.testing.assert_allclose(moved.rcs_slice((slice(None),) * 4), 1.0, atol=1e-9)
-                np.testing.assert_array_equal(moved.rcs_power, grid.rcs_power)
+                np.testing.assert_allclose(moved.power, grid.power, rtol=8*np.finfo(float).eps, atol=0.)
         radians = RcsGrid(np.deg2rad([0.0, 30.0, 90.0]), [0.0], np.linspace(8, 12, 81), ["HH"],
                           rcs=_point_grid(point).rcs_slice((slice(None),) * 4),
                           units={"frequency": "GHz", "azimuth": "rad", "elevation": "rad"})
@@ -628,7 +628,7 @@ class PhaseCenterGuiTests(_WindowCase):
         self.assertIn("Phase center created 1 dataset(s)", window.status.currentMessage())
         self.assertEqual(window.table.item(3, 0).text(), "Run 1 [PC (1, 0, -2) in]")
         result = window.table.item(3, 0).data(Qt.UserRole)
-        np.testing.assert_array_equal(result.rcs_power, self.datasets[0].rcs_power)
+        np.testing.assert_allclose(result.power, self.datasets[0].power, rtol=8*np.finfo(float).eps, atol=0.)
         script = window.python_recorder.script
         self.assertIn("translate_phase_center(", script)
         self.assertIn("z_m=-0.0508", script)

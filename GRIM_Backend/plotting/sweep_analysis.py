@@ -129,7 +129,7 @@ def iter_series(name, dataset, reference, selection, *, sweep_axis, config=None,
         az_groups = [(index, [native_index]) for index, native_index in enumerate(az_idx)] if individual else [(None, az_idx)]
         for az_position, group in az_groups:
             selection_key = np.ix_(group, [fixed_index], fr_idx, [pol_idx]) if sweep_axis == "frequency" else np.ix_(group, el_idx, [fixed_index], [pol_idx])
-            raw = dataset.rcs_slice(selection_key) if phase else dataset.rcs_power[selection_key]
+            raw = dataset.rcs_slice(selection_key) if phase else dataset.power[selection_key]
             block = raw[:, 0, :, 0] if sweep_axis == "frequency" else raw[:, :, 0, 0]
             if individual:
                 if phase:

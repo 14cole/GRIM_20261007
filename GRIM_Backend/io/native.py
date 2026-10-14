@@ -7,6 +7,7 @@ import tempfile
 import warnings
 
 import numpy as np
+from GRIM_Backend.datasets.memory import _bounded_grid_selections
 
 from GRIM_Backend.datasets.constants import (
     C0,
@@ -20,7 +21,9 @@ class NativeFormatMixin:
     """Native .grim archive loading, saving, and payload validation."""
 
     _RESERVED_KEYS = ("azimuths", "elevations", "frequencies", "polarizations",
-                      "rcs_power", "rcs_phase", "source_path", "history", "units")
+                      "rcs_power", "rcs_phase", "rcs_complex", "source_path",
+                      "history", "units", "grim_format_version", "storage_kind",
+                      "storage_domain")
 
     def _extra_to_write(self):
         """Return metadata and ancillary arrays for native archive export.
@@ -40,12 +43,56 @@ class NativeFormatMixin:
             out[key] = value
         return out
 
+    def _native_archive_payload(self, *, path="native dataset", artifact=".grim"):
+        """Build the shared, pickle-free payload for .grim and embedded grids."""
+        self._ensure_legacy_source_current()
+        extra = self._extra_to_write()
+        self._validate_native_payload(
+            path=path, azimuths=self.azimuths, elevations=self.elevations,
+            frequencies=self.frequencies, polarizations=self.polarizations,
+            rcs_power=self.power, rcs_phase=self.phase, units=self.units,
+            extra=extra,
+        )
+        samples = dict(self.native_sample_payload())
+        if samples.get("storage_domain") == "raw_field":
+            extra.pop("rcs_amp_real", None)
+            extra.pop("rcs_amp_imag", None)
+        payload = dict(extra)
+        payload.update(
+            azimuths=self.azimuths, elevations=self.elevations,
+            frequencies=self.frequencies, polarizations=self.polarizations,
+            grim_format_version=np.asarray(2, dtype=np.int16),
+            rcs_domain=("complex_amplitude" if samples["storage_kind"] == "complex"
+                        else "linear_rcs" if samples["storage_kind"] == "power"
+                        else "power_phase"),
+            power_domain=self.power_domain,
+            source_path=self.source_path if self.source_path is not None else "",
+            history=self.history if self.history is not None else "",
+            units=json.dumps(self.units) if self.units else "",
+        )
+        payload.update(samples)
+        # Producer response semantics (for example a feature delta) are
+        # independent of the array representation described by storage_kind.
+        for tag in ("rcs_domain", "power_domain"):
+            if tag in self.extra:
+                payload[tag] = self.extra[tag]
+        object_keys = [str(key) for key, value in payload.items()
+                       if np.asarray(value).dtype.hasobject]
+        if object_keys:
+            raise ValueError(
+                f"cannot save a pickle-free {artifact} archive because metadata "
+                "contains object-typed value(s): " + ", ".join(sorted(object_keys))
+                + ". Convert those values to numeric/string arrays or JSON text."
+            )
+        return payload
+
     def save(self, path, *, compressed=True):
         """Save the grid to a .grim (npz) file.
 
-        Passthrough metadata from ``extra`` is written first (so the grid's own
-        axes and samples always win on a name clash), which is what lets a file
-        carrying a raw complex amplitude survive a load/save round-trip.
+        Version 2 stores one authoritative sample representation: a complex
+        field, power alone, or power/phase for samples whose phase is only
+        partly known. Raw solver fields retain their normalization metadata.
+        Existing version 1 archives remain readable.
         The archive is fully written and flushed to a same-directory staging
         file before ``os.replace`` publishes it, so a failed save leaves an
         existing artifact intact.
@@ -64,18 +111,7 @@ class NativeFormatMixin:
         path = os.fspath(path)
         if not path.casefold().endswith(".grim"):
             path = f"{path}.grim"
-        extra_to_write = self._extra_to_write()
-        self._validate_native_payload(
-            path=path,
-            azimuths=self.azimuths,
-            elevations=self.elevations,
-            frequencies=self.frequencies,
-            polarizations=self.polarizations,
-            rcs_power=self.rcs_power,
-            rcs_phase=self.rcs_phase,
-            units=self.units,
-            extra=extra_to_write,
-        )
+        payload = self._native_archive_payload(path=path)
         directory = os.path.dirname(os.path.abspath(path)) or os.curdir
         fd, stage_path = tempfile.mkstemp(
             prefix=".grim-write-",
@@ -85,38 +121,6 @@ class NativeFormatMixin:
         try:
             with os.fdopen(fd, "wb") as f:
                 fd = -1
-                units_payload = json.dumps(self.units) if self.units else ""
-                payload = dict(extra_to_write)
-                payload.update(
-                    azimuths=self.azimuths,
-                    elevations=self.elevations,
-                    frequencies=self.frequencies,
-                    polarizations=self.polarizations,
-                    rcs_power=self.rcs_power,
-                    rcs_phase=self.rcs_phase,
-                    rcs_domain="power_phase",
-                    power_domain=self.power_domain,
-                    source_path=self.source_path if self.source_path is not None else "",
-                    history=self.history if self.history is not None else "",
-                    units=units_payload,
-                )
-
-
-                for tag in ("rcs_domain", "power_domain"):
-                    if tag in self.extra:
-                        payload[tag] = self.extra[tag]
-                object_keys = [
-                    str(key)
-                    for key, value in payload.items()
-                    if np.asarray(value).dtype.hasobject
-                ]
-                if object_keys:
-                    raise ValueError(
-                        "cannot save a pickle-free .grim archive because metadata "
-                        "contains object-typed value(s): "
-                        + ", ".join(sorted(object_keys))
-                        + ". Convert those values to numeric/string arrays or JSON text."
-                    )
                 writer = np.savez_compressed if bool(compressed) else np.savez
                 writer(f, **payload)
                 f.flush()
@@ -239,8 +243,8 @@ class NativeFormatMixin:
         if any(item["code"] != "invalid_raw_complex_preserved_flag" for item in report["issues"]):
             return report
 
-        power = np.asarray(rcs_power)
-        phase = np.asarray(rcs_phase)
+        power = rcs_power if hasattr(rcs_power, "dtype") else np.asarray(rcs_power)
+        phase = rcs_phase if hasattr(rcs_phase, "dtype") else np.asarray(rcs_phase)
         if power.shape != tuple(expected_shape) or phase.shape != tuple(expected_shape):
             return report
         if power.dtype.kind not in "iuf" or phase.dtype.kind not in "iuf":
@@ -306,19 +310,12 @@ class NativeFormatMixin:
             else:
                 power_scale = 4.0 * np.pi
 
-            iterator = np.nditer(
-                (
-                    power[:, :, frequency_index, :],
-                    phase[:, :, frequency_index, :],
-                    raw_real[:, :, frequency_index, :],
-                    raw_imag[:, :, frequency_index, :],
-                ),
-                flags=["external_loop", "buffered", "zerosize_ok"],
-                op_flags=[["readonly"], ["readonly"], ["readonly"], ["readonly"]],
-                order="K",
-                buffersize=_RAW_COMPLEX_VALIDATION_BLOCK_CELLS,
-            )
-            for power_block, phase_block, real_block, imag_block in iterator:
+            plane_shape = (expected_shape[0], expected_shape[1], 1, expected_shape[3])
+            for selection in _bounded_grid_selections(plane_shape, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS):
+                selection = tuple(selection[:2]) + (slice(frequency_index, frequency_index + 1),) + tuple(selection[3:])
+                power_block, phase_block, real_block, imag_block = (
+                    values[selection] for values in (power, phase, raw_real, raw_imag)
+                )
                 power_block = np.asarray(power_block, dtype=np.float64)
                 phase_block = np.asarray(phase_block, dtype=np.float64)
                 real_block = np.asarray(real_block, dtype=np.float64)
@@ -528,8 +525,8 @@ class NativeFormatMixin:
             len(numeric_axes["frequency"]),
             len(labels),
         )
-        power = np.asarray(rcs_power)
-        phase = np.asarray(rcs_phase)
+        power = rcs_power if hasattr(rcs_power, "dtype") else np.asarray(rcs_power)
+        phase = rcs_phase if hasattr(rcs_phase, "dtype") else np.asarray(rcs_phase)
         for name, values in (("rcs_power", power), ("rcs_phase", phase)):
             if values.shape != expected:
                 raise ValueError(
@@ -537,12 +534,12 @@ class NativeFormatMixin:
                 )
             if values.dtype.kind not in "iuf":
                 raise ValueError(f"{path} contains non-real-numeric {name}")
-            if np.any(np.isinf(values)):
-                raise ValueError(f"{path} contains infinite {name} samples")
-
-
-        if np.any(power < 0.0):
-            raise ValueError(f"{path} contains negative finite rcs_power samples")
+            for selection in _bounded_grid_selections(expected, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS):
+                block = values[selection]
+                if np.any(np.isinf(block)):
+                    raise ValueError(f"{path} contains infinite {name} samples")
+                if name == "rcs_power" and np.any(block < 0.0):
+                    raise ValueError(f"{path} contains negative finite rcs_power samples")
 
         normalized_units = dict(units or {})
         for key, aliases, default in (
@@ -585,6 +582,111 @@ class NativeFormatMixin:
         )
 
     @classmethod
+    def _from_native_arrays(cls, data, *, path="native dataset", source_path_override=None):
+        """Decode old or current native samples, also used by embedded assemblies."""
+        keys = set(getattr(data, "files", data.keys() if hasattr(data, "keys") else ()))
+
+        def scalar(name, default=None):
+            if name not in keys:
+                return default
+            value = np.asarray(data[name])
+            if value.size != 1:
+                raise ValueError(f"{path} contains nonscalar {name} metadata")
+            value = value.reshape(-1)[0]
+            if isinstance(value, np.generic):
+                value = value.item()
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            return value
+
+        raw_units = scalar("units", "")
+        if isinstance(raw_units, str):
+            try:
+                units = json.loads(raw_units) if raw_units else {}
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{path} contains corrupt units metadata; refusing to "
+                    "guess frequency, RCS, or angular conventions"
+                ) from exc
+        else:
+            units = raw_units
+        if not isinstance(units, dict):
+            raise ValueError(f"{path} contains invalid units metadata (expected a JSON object)")
+
+        version = scalar("grim_format_version", 1)
+        if isinstance(version, bool) or not isinstance(version, (int, np.integer)) or version not in (1, 2):
+            raise ValueError(f"{path} contains unsupported grim_format_version {version!r}")
+        required = {"azimuths", "elevations", "frequencies", "polarizations"}
+        if version == 1:
+            required.update(("rcs_power", "rcs_phase"))
+        missing = sorted(required - keys)
+        if missing:
+            raise ValueError(f"{path} is not a supported .grim file (missing keys: {', '.join(missing)})")
+        extra = {key: data[key] for key in keys if key not in cls._RESERVED_KEYS}
+        constructor_samples = {}
+        candidate = None
+        if version == 1:
+            power, phase = data["rcs_power"], data["rcs_phase"]
+        else:
+            kind = scalar("storage_kind")
+            domain = scalar("storage_domain")
+            if kind not in {"complex", "power", "power_phase"}:
+                raise ValueError(f"{path} contains unsupported storage_kind {kind!r}")
+            if domain not in {"physical", "raw_field"} or (domain == "raw_field" and kind != "complex"):
+                raise ValueError(f"{path} contains unsupported storage_domain {domain!r}")
+            expected_samples = ({"rcs_complex"} if kind == "complex" else
+                                {"rcs_power"} if kind == "power" else {"rcs_power", "rcs_phase"})
+            actual_samples = keys & {"rcs_complex", "rcs_power", "rcs_phase"}
+            if actual_samples != expected_samples:
+                raise ValueError(f"{path} contains inconsistent samples for {kind} storage")
+            if kind == "complex":
+                field = np.asarray(data["rcs_complex"])
+                expected_shape = tuple(np.asarray(data[name]).size for name in
+                                       ("azimuths", "elevations", "frequencies", "polarizations"))
+                if field.dtype.kind != "c" or field.shape != expected_shape:
+                    raise ValueError(f"{path} contains invalid rcs_complex dtype or shape; expected {expected_shape}")
+                for selection in _bounded_grid_selections(expected_shape, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS):
+                    block = field[selection]
+                    finite = np.isfinite(block.real) & np.isfinite(block.imag)
+                    missing_field = np.isnan(block.real) & np.isnan(block.imag)
+                    if np.any(~(finite | missing_field)):
+                        raise ValueError(f"{path} contains one-sided NaN or infinite rcs_complex samples")
+                if domain == "raw_field":
+                    if "rcs_amp_real" in extra or "rcs_amp_imag" in extra:
+                        raise ValueError(f"{path} redundantly declares raw complex samples")
+                # Validate through bounded derived views rather than allocating
+                # complete normalized-field, power, and phase copies on load.
+                candidate = cls(data["azimuths"], data["elevations"], data["frequencies"],
+                                data["polarizations"], rcs=field, rcs_storage_domain=domain,
+                                units=units, extra=extra)
+                power, phase, extra = candidate.power, candidate.phase, candidate.extra
+            else:
+                power = np.asarray(data["rcs_power"])
+                phase = (np.asarray(data["rcs_phase"]) if kind == "power_phase" else
+                         np.broadcast_to(np.asarray(np.nan, dtype=power.dtype if power.dtype.kind == "f" else np.float64), power.shape))
+
+        (azimuths, elevations, frequencies, polarizations, power, phase, units) = cls._validate_native_payload(
+            path=path, azimuths=data["azimuths"], elevations=data["elevations"],
+            frequencies=data["frequencies"], polarizations=data["polarizations"],
+            rcs_power=power, rcs_phase=phase, units=units, extra=extra,
+        )
+        source_path = scalar("source_path") or None
+        if source_path_override is not None:
+            source_path = source_path_override
+        if candidate is not None:
+            candidate.units = units
+            candidate.source_path = source_path
+            candidate.history = scalar("history") or None
+            return candidate
+        if version == 2 and kind == "power":
+            constructor_samples = {"rcs_power": power}
+        else:
+            constructor_samples = {"rcs_power": power, "rcs_phase": phase}
+        return cls(azimuths, elevations, frequencies, polarizations,
+                   **constructor_samples, source_path=source_path,
+                   history=scalar("history") or None, units=units, extra=extra)
+
+    @classmethod
     def load(
         cls,
         path,
@@ -601,8 +703,8 @@ class NativeFormatMixin:
                 be memory-mapped; a warning is emitted when this is supplied.
             allow_legacy_pickle: Explicitly opt in to legacy object-array files.
                 Never enable this for an untrusted file.
-            max_output_bytes: Optional reviewed cap for the exact native NPZ
-                payload plus the power/phase sanitation copies. By default one
+            max_output_bytes: Optional reviewed cap for the native NPZ payload
+                plus temporary sample validation and constructor arrays. By default one
                 load may use at most half of currently available memory (or
                 the conservative 2 GiB fallback when memory is unknown).
 
@@ -629,92 +731,4 @@ class NativeFormatMixin:
         with open(path, "rb") as f, np.load(
             f, allow_pickle=bool(allow_legacy_pickle)
         ) as data:
-
-            units = {}
-            if "units" in data:
-                raw_units = data["units"]
-                if isinstance(raw_units, np.ndarray):
-                    raw_units = raw_units.item()
-                if isinstance(raw_units, bytes):
-                    raw_units = raw_units.decode("utf-8")
-                if isinstance(raw_units, str) and raw_units:
-                    try:
-                        units = json.loads(raw_units)
-                    except json.JSONDecodeError as exc:
-                        raise ValueError(
-                            f"{path} contains corrupt units metadata; refusing to "
-                            "guess frequency, RCS, or angular conventions"
-                        ) from exc
-                elif isinstance(raw_units, dict):
-                    units = raw_units
-                if not isinstance(units, dict):
-                    raise ValueError(
-                        f"{path} contains invalid units metadata (expected a JSON object)"
-                    )
-
-            source_path_raw = data["source_path"].item() if "source_path" in data else None
-            source_path = source_path_raw if source_path_raw else None
-            history_raw = data["history"].item() if "history" in data else None
-            history = history_raw if history_raw else None
-            required = ("azimuths", "elevations", "frequencies", "polarizations", "rcs_power", "rcs_phase")
-            missing = [key for key in required if key not in data]
-            if missing:
-                raise ValueError(
-                    f"{path} is not a supported .grim file (missing keys: {', '.join(missing)})"
-                )
-
-
-            raw_extra = {
-                key: data[key]
-                for key in (
-                    "rcs_amp_real",
-                    "rcs_amp_imag",
-                    "raw_complex_amplitude_preserved",
-                )
-                if key in data
-            }
-
-            (
-                azimuths,
-                elevations,
-                frequencies,
-                polarizations,
-                rcs_power,
-                rcs_phase,
-                units,
-            ) = cls._validate_native_payload(
-                path=path,
-                azimuths=data["azimuths"],
-                elevations=data["elevations"],
-                frequencies=data["frequencies"],
-                polarizations=data["polarizations"],
-                rcs_power=data["rcs_power"],
-                rcs_phase=data["rcs_phase"],
-                units=units,
-                extra=raw_extra,
-            )
-
-
-            extra = {
-                key: (
-                    raw_extra[key]
-                    if key in raw_extra
-                    else data[key]
-                )
-                for key in getattr(data, "files", [])
-                if key not in cls._RESERVED_KEYS
-            }
-
-            return cls(
-                azimuths,
-                elevations,
-                frequencies,
-                polarizations,
-                rcs_power=rcs_power,
-                rcs_phase=rcs_phase,
-                rcs_domain="power_phase",
-                source_path=source_path,
-                history=history,
-                units=units,
-                extra=extra,
-            )
+            return cls._from_native_arrays(data, path=path)

@@ -135,7 +135,7 @@ def render(self) -> None:
                 # negative real inputs to zero, which would make invalid
                 # samples indistinguishable from valid physical zeros here.
                 linear = np.asarray(
-                    dataset.rcs_power[az_indices, elev_idx, freq_idx, pol_indices[0]],
+                    dataset.power[az_indices, elev_idx, freq_idx, pol_indices[0]],
                     dtype=float,
                 )
                 x_points, y_points = [], []

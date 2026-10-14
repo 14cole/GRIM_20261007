@@ -81,18 +81,25 @@ def _representative_contiguous_bytes(
 def _grim_save_compression_decision(dataset: RcsGrid) -> dict[str, object]:
     """Choose compact versus fast NPZ storage from a bounded byte sample."""
 
-    arrays: list[np.ndarray] = [dataset.rcs_power, dataset.rcs_phase]
+    samples = dataset.native_sample_payload()
+    arrays: list[np.ndarray] = [
+        value for value in samples.values()
+        if isinstance(value, np.ndarray) and value.ndim > 0
+    ]
+    core_count = len(arrays)
     arrays.extend(
         np.asarray(value)
-        for value in dataset._extra_to_write().values()
+        for key, value in dataset._extra_to_write().items()
+        if not (samples.get("storage_domain") == "raw_field"
+                and key in {"rcs_amp_real", "rcs_amp_imag"})
         if isinstance(value, np.ndarray)
         and not np.asarray(value).dtype.hasobject
         and np.asarray(value).ndim > 0
     )
 
 
-    core = arrays[:2]
-    ancillary = sorted(arrays[2:], key=lambda value: value.nbytes, reverse=True)[:6]
+    core = arrays[:core_count]
+    ancillary = sorted(arrays[core_count:], key=lambda value: value.nbytes, reverse=True)[:6]
     sampled_arrays = [
         value
         for value in core + ancillary

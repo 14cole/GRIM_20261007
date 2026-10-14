@@ -206,8 +206,8 @@ def query_sample(
         int(pol_match["index"]),
     )
 
-    power = float(dataset.rcs_power[indices])
-    phase_rad = float(dataset.rcs_phase[indices])
+    power = float(dataset.power[indices])
+    phase_rad = float(dataset.phase[indices])
     complex_value = complex(dataset.rcs_slice(indices))
     native_frequency = float(dataset.frequencies[indices[2]])
     display_db = (

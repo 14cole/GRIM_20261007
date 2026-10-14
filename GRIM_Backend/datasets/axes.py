@@ -74,7 +74,7 @@ class GridAxesMixin:
         vectorized gather/ufunc scratch, and construction of the final grid.
         Python integers avoid overflow on grids too large to allocate.
         """
-        shape = list(self.rcs_power.shape)
+        shape = list(self.power.shape)
         largest = math.prod(shape)
         for axis, _old, new in self._alignment_interpolation_plan(other):
             shape[axis] = len(new)
@@ -182,16 +182,12 @@ class GridAxesMixin:
             old_text = f"{old_value:g}"
             new_text = f"{new_value:g}"
 
-        if reordered:
-            power = np.take(self.rcs_power, order, axis=axis_index)
-            phase = np.take(self.rcs_phase, order, axis=axis_index)
-        else:
+        samples = self._sample_kwargs(
+            transform=(lambda array: np.take(array, order, axis=axis_index))
+            if reordered else None
+        )
 
-
-            power = np.array(self.rcs_power, copy=True)
-            phase = np.array(self.rcs_phase, copy=True)
-
-        original_shape = tuple(self.rcs_power.shape)
+        original_shape = tuple(self.power.shape)
         stale_grid_metadata = {
             "solver_metadata_json",
             "production_mesh_certification_json",
@@ -226,7 +222,7 @@ class GridAxesMixin:
                 edited_extra, np.asarray(self.frequencies)[order], axes[2]
             )
             if canonical is not None:
-                power, phase = canonical
+                samples = dict(zip(("rcs_power", "rcs_phase"), canonical))
         self._invalidate_assembly_sampling_hash(
             edited_extra, f"edit-{str(name).strip().lower()}-axis"
         )
@@ -247,8 +243,7 @@ class GridAxesMixin:
             axes[1],
             axes[2],
             axes[3],
-            rcs_power=power,
-            rcs_phase=phase,
+            **samples,
             rcs_domain=self.rcs_domain,
             source_path=self.source_path,
             history=history,
@@ -308,9 +303,9 @@ class GridAxesMixin:
         self._assert_axis_metadata_compatible(other)
 
         if mode == "exact":
-            if self.rcs_power.shape != other.rcs_power.shape:
+            if self.power.shape != other.power.shape:
                 raise ValueError(
-                    f"rcs shape {other.rcs_power.shape} != {self.rcs_power.shape}"
+                    f"rcs shape {other.power.shape} != {self.power.shape}"
                 )
             for name, left, right in (
                 ("azimuth", self.azimuths, other.azimuths),
@@ -369,8 +364,6 @@ class GridAxesMixin:
                 self.frequencies, other.frequencies, tol=f_tol
             )
             pol_new, pol_idx = _match_axis(self.polarizations, other.polarizations, tol=0.0)
-            pwr_new = self.rcs_power[np.ix_(az_idx, el_idx, f_idx, pol_idx)]
-            phs_new = self.rcs_phase[np.ix_(az_idx, el_idx, f_idx, pol_idx)]
             selection = np.ix_(az_idx, el_idx, f_idx, pol_idx)
             source_axes = (
                 np.asarray(self.azimuths)[az_idx],
@@ -389,8 +382,7 @@ class GridAxesMixin:
                 el_new,
                 f_new,
                 pol_new,
-                rcs_power=pwr_new,
-                rcs_phase=phs_new,
+                **self._sample_kwargs(selection),
                 rcs_domain="power_phase",
                 extra=self._exact_transform_extra(
                     lambda value: value[selection],
@@ -414,22 +406,28 @@ class GridAxesMixin:
         for _axis, old, new in steps:
             if new.min() < old.min() or new.max() > old.max():
                 raise ValueError("interp would require extrapolation")
-        power_interp = np.array(self.rcs_power, copy=True)
+        complex_storage = self.storage_kind == "complex"
+        power_interp = None if complex_storage else np.array(self.power, copy=True)
         complex_interp = np.asarray(self.rcs, dtype=np.complex128)
         for axis, old, new in steps:
-            power_interp = self._interp_real_axis(
-                power_interp, old, new, axis
-            )
+            if power_interp is not None:
+                power_interp = self._interp_real_axis(
+                    power_interp, old, new, axis
+                )
             complex_interp = self._interp_complex_axis(
                 complex_interp, old, new, axis
             )
         complex_valid = np.isfinite(complex_interp.real) & np.isfinite(
             complex_interp.imag
         )
-        phase_interp = np.full(power_interp.shape, np.nan, dtype=np.float64)
-        power_interp = np.asarray(power_interp, dtype=np.float64)
-        power_interp[complex_valid] = np.abs(complex_interp[complex_valid]) ** 2
-        phase_interp[complex_valid] = np.angle(complex_interp[complex_valid])
+        if complex_storage:
+            samples = {"rcs": complex_interp}
+        else:
+            phase_interp = np.full(power_interp.shape, np.nan, dtype=np.float64)
+            power_interp = np.asarray(power_interp, dtype=np.float64)
+            power_interp[complex_valid] = np.abs(complex_interp[complex_valid]) ** 2
+            phase_interp[complex_valid] = np.angle(complex_interp[complex_valid])
+            samples = {"rcs_power": power_interp, "rcs_phase": phase_interp}
         interp_extra = self._derived_response_extra(
             operation="align-interpolate", coherent=True
         )
@@ -441,8 +439,7 @@ class GridAxesMixin:
             other.elevations,
             other.frequencies,
             other.polarizations,
-            rcs_power=power_interp,
-            rcs_phase=phase_interp,
+            **samples,
             rcs_domain="power_phase",
             extra=interp_extra,
         )
@@ -538,16 +535,18 @@ class GridAxesMixin:
         new_axes = list(old_axes)
         new_axes[axis_idx] = new_arr
 
-        power_interp = self._interp_real_axis(
-            self.rcs_power, old_axes[axis_idx], new_arr, axis_idx
-        )
-        power_interp = np.asarray(power_interp, dtype=np.float64)
-        phase_interp = np.full(power_interp.shape, np.nan, dtype=np.float64)
+        complex_storage = self.storage_kind == "complex"
+        if not complex_storage:
+            power_interp = self._interp_real_axis(
+                self.power, old_axes[axis_idx], new_arr, axis_idx
+            )
+            power_interp = np.asarray(power_interp, dtype=np.float64)
+            phase_interp = np.full(power_interp.shape, np.nan, dtype=np.float64)
         # Unknown phase cannot produce usable complex interpolation. Retained
         # raw amplitudes still take precedence even when rcs_phase is unknown.
-        has_phase = any(
-            np.any(np.isfinite(self.rcs_phase.flat[start:start + 262_144]))
-            for start in range(0, self.rcs_phase.size, 262_144)
+        has_phase = complex_storage or any(
+            np.any(np.isfinite(self.phase.flat[start:start + 262_144]))
+            for start in range(0, self.phase.size, 262_144)
         )
         if has_phase or self._complete_authoritative_raw_arrays() is not None:
             complex_interp = self._interp_complex_axis(
@@ -557,13 +556,20 @@ class GridAxesMixin:
             complex_valid = np.isfinite(complex_interp.real) & np.isfinite(
                 complex_interp.imag
             )
-            power_interp[complex_valid] = np.abs(complex_interp[complex_valid]) ** 2
-            phase_interp[complex_valid] = np.angle(complex_interp[complex_valid])
+            if not complex_storage:
+                power_interp[complex_valid] = np.abs(complex_interp[complex_valid]) ** 2
+                phase_interp[complex_valid] = np.angle(complex_interp[complex_valid])
         if np.any(excluded):
             selection = [slice(None)] * 4
             selection[axis_idx] = excluded
-            power_interp[tuple(selection)] = np.nan
-            phase_interp[tuple(selection)] = np.nan
+            if complex_storage:
+                complex_interp[tuple(selection)] = np.nan + 1j * np.nan
+            else:
+                power_interp[tuple(selection)] = np.nan
+                phase_interp[tuple(selection)] = np.nan
+        samples = ({"rcs": complex_interp} if complex_storage else
+                   {"rcs_power": power_interp, "rcs_phase": phase_interp})
+        coverage_values = complex_interp if complex_storage else power_interp
         interp_extra = self._derived_response_extra(
             operation=f"interpolate-{key}", coherent=True
         )
@@ -581,18 +587,17 @@ class GridAxesMixin:
             "interpolated_coordinate_count": int(np.count_nonzero(~exact & ~excluded)),
             "excluded_coordinate_count": int(np.count_nonzero(excluded)),
             "finite_power_sample_count": sum(
-                int(np.count_nonzero(np.isfinite(power_interp.flat[start:start + 262_144])))
-                for start in range(0, power_interp.size, 262_144)
+                int(np.count_nonzero(np.isfinite(coverage_values.flat[start:start + 262_144])))
+                for start in range(0, coverage_values.size, 262_144)
             ),
-            "total_sample_count": int(power_interp.size),
+            "total_sample_count": int(coverage_values.size),
         }, sort_keys=True, separators=(",", ":"))
         return self._new_grid(
             new_axes[0],
             new_axes[1],
             new_axes[2],
             self.polarizations,
-            rcs_power=power_interp,
-            rcs_phase=phase_interp,
+            **samples,
             rcs_domain="power_phase",
             extra=interp_extra,
         )
@@ -959,8 +964,7 @@ class GridAxesMixin:
             self.elevations[el_idx],
             self.frequencies[f_idx],
             self.polarizations[p_idx],
-            rcs_power=self.rcs_power[np.ix_(az_idx, el_idx, f_idx, p_idx)],
-            rcs_phase=self.rcs_phase[np.ix_(az_idx, el_idx, f_idx, p_idx)],
+            **self._sample_kwargs(selection),
             extra=self._exact_transform_extra(
                 lambda value: value[selection]
             ),
@@ -1091,8 +1095,7 @@ class GridAxesMixin:
             np.array(self.elevations, copy=True),
             np.array(self.frequencies, copy=True),
             np.array(self.polarizations, copy=True),
-            rcs_power=self.rcs_power[order, :, :, :],
-            rcs_phase=self.rcs_phase[order, :, :, :],
+            **self._sample_kwargs(transform=lambda value: np.take(value, order, axis=0)),
             rcs_domain="power_phase",
             extra=self._exact_transform_extra(
                 lambda value: np.take(value, order, axis=0),
@@ -1113,8 +1116,7 @@ class GridAxesMixin:
             np.array(self.azimuths, copy=True),
             np.array(self.frequencies, copy=True),
             np.array(self.polarizations, copy=True),
-            rcs_power=np.swapaxes(self.rcs_power, 0, 1).copy(),
-            rcs_phase=np.swapaxes(self.rcs_phase, 0, 1).copy(),
+            **self._sample_kwargs(transform=lambda value: np.swapaxes(value, 0, 1)),
             rcs_domain="power_phase",
             units=swapped_units,
             extra=self._exact_transform_extra(
@@ -1179,8 +1181,7 @@ class GridAxesMixin:
             convert_angle(self.elevations, source_el, target_el),
             converted_frequency,
             np.array(self.polarizations, copy=True),
-            rcs_power=np.array(self.rcs_power, copy=True),
-            rcs_phase=np.array(self.rcs_phase, copy=True),
+            **self._sample_kwargs(),
             rcs_domain="power_phase",
             units=converted_units,
             history=history,
@@ -1198,8 +1199,7 @@ class GridAxesMixin:
             np.array(self.elevations, copy=True),
             np.array(self.frequencies, copy=True),
             np.array(self.polarizations, copy=True),
-            rcs_power=np.array(self.rcs_power, copy=True),
-            rcs_phase=np.array(self.rcs_phase, copy=True),
+            **self._sample_kwargs(),
             rcs_domain="power_phase",
             extra=self._exact_transform_extra(
                 coordinate_change="shift-azimuth",
@@ -1258,9 +1258,9 @@ class GridAxesMixin:
         unique_vals = np.asarray(
             [wrapped[group[0]] for group in groups], dtype=float
         )
-        output_shape = (len(groups),) + self.rcs_power.shape[1:]
-        output_power = np.full(output_shape, np.nan, dtype=self.rcs_power.dtype)
-        output_phase = np.full(output_shape, np.nan, dtype=self.rcs_phase.dtype)
+        output_shape = (len(groups),) + self.power.shape[1:]
+        output_power = np.full(output_shape, np.nan, dtype=self.power.dtype)
+        output_phase = np.full(output_shape, np.nan, dtype=self.phase.dtype)
         raw_pair = self._complete_authoritative_raw_arrays()
         preserve_raw = raw_pair is not None
         if preserve_raw:
@@ -1279,8 +1279,8 @@ class GridAxesMixin:
                 group_conflict |= self._merge_equivalent_sample_blocks(
                     output_power[output_index],
                     output_phase[output_index],
-                    self.rcs_power[source_index],
-                    self.rcs_phase[source_index],
+                    self.power[source_index],
+                    self.phase[source_index],
                     context=context,
                     keep_existing_on_conflict=keep_first,
                 )
@@ -1360,7 +1360,7 @@ class GridAxesMixin:
                 "phase wrap mode must be '0_360' or '-180_180'"
             )
 
-        wrapped_phase = np.array(self.rcs_phase, copy=True)
+        wrapped_phase = np.array(self.phase, copy=True)
         period = 2.0 * np.pi
         with np.errstate(invalid="ignore"):
             if mode == "0_360":
@@ -1379,13 +1379,15 @@ class GridAxesMixin:
         )
         wrapped_units = dict(self.units)
         wrapped_units["phase_wrap"] = mode
+        samples = self._sample_kwargs()
+        if "rcs_phase" in samples:
+            samples["rcs_phase"] = wrapped_phase
         return self._new_grid(
             np.array(self.azimuths, copy=True),
             np.array(self.elevations, copy=True),
             np.array(self.frequencies, copy=True),
             np.array(self.polarizations, copy=True),
-            rcs_power=np.array(self.rcs_power, copy=True),
-            rcs_phase=wrapped_phase,
+            **samples,
             history=history,
             units=wrapped_units,
             extra=self._exact_transform_extra(preserve_all=True),
@@ -1425,12 +1427,14 @@ class GridAxesMixin:
             coordinate_change="round-" + "-".join(changed)
         )
         extra, canonical = self._frequency_relabel_extra(extra, self.frequencies, axes[2])
-        power, phase = canonical if canonical is not None else (self.rcs_power, self.rcs_phase)
+        samples = (
+            dict(zip(("rcs_power", "rcs_phase"), canonical))
+            if canonical is not None else self._sample_kwargs()
+        )
         return self._new_grid(
             *axes,
             np.array(self.polarizations, copy=True),
-            rcs_power=power,
-            rcs_phase=phase,
+            **samples,
             rcs_domain="power_phase",
             extra=extra,
         )
@@ -1456,8 +1460,7 @@ class GridAxesMixin:
             shifted_el,
             np.array(self.frequencies, copy=True),
             np.array(self.polarizations, copy=True),
-            rcs_power=np.array(self.rcs_power, copy=True),
-            rcs_phase=np.array(self.rcs_phase, copy=True),
+            **self._sample_kwargs(),
             rcs_domain="power_phase",
             extra=self._exact_transform_extra(
                 coordinate_change="shift-elevation",

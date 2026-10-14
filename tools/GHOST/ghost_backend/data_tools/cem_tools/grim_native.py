@@ -15,6 +15,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from .errors import CemToolError
+from .native_samples import decode_native_samples
 
 
 C0 = 299_792_458.0
@@ -524,6 +525,7 @@ def load_grim(path: 'str | os.PathLike[str]') -> 'dict[str, np.ndarray]':
     try:
         with np.load(source, allow_pickle=False) as data:
             payload = {key: np.array(data[key], copy=True) for key in data.files}
+        payload = decode_native_samples(payload, label=source.name)
     except (OSError, ValueError, TypeError) as exc:
         raise CemToolError(f"cannot read {source.name}: {exc}") from exc
     missing = [key for key in REQUIRED_KEYS if key not in payload]

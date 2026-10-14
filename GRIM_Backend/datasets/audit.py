@@ -35,10 +35,10 @@ def _physical_grid_content_sha256(grid, *, namespace):
         _update_array(label, values)
 
     digest.update(b"authoritative-complex-field\0")
-    digest.update(str(grid.rcs_power.shape).encode("ascii") + b"\0")
+    digest.update(str(grid.power.shape).encode("ascii") + b"\0")
     read_complex, _real_dtype = grid._bounded_complex_slice_reader()
     for selection in _bounded_grid_selections(
-        grid.rcs_power.shape, _COHERENT_OPERATION_BLOCK_CELLS
+        grid.power.shape, _COHERENT_OPERATION_BLOCK_CELLS
     ):
         field = np.asarray(
             read_complex(selection),
@@ -100,7 +100,7 @@ def _support_reference_qa(target_with_support, support_reference, difference):
     read_support, _support_dtype = support_reference._bounded_complex_slice_reader()
     read_difference, _difference_dtype = difference._bounded_complex_slice_reader()
     for selection in _bounded_grid_selections(
-        target_with_support.rcs_power.shape, _COHERENT_OPERATION_BLOCK_CELLS
+        target_with_support.power.shape, _COHERENT_OPERATION_BLOCK_CELLS
     ):
         target = np.asarray(read_target(selection), dtype=np.complex128)
         support = np.asarray(read_support(selection), dtype=np.complex128)
@@ -181,10 +181,10 @@ def _support_reference_qa(target_with_support, support_reference, difference):
             "unweighted_sum_of_squared_complex_sample_magnitudes_on_common_"
             "finite_support"
         ),
-        "total_sample_count": int(target_with_support.rcs_power.size),
+        "total_sample_count": int(target_with_support.power.size),
         "common_finite_sample_count": int(common_count),
         "excluded_sample_count": int(
-            target_with_support.rcs_power.size - common_count
+            target_with_support.power.size - common_count
         ),
         "energy_sum_linear": {
             key: _finite_or_none(value) for key, value in energies.items()
@@ -241,18 +241,9 @@ def audit_dataset(self):
         return value if np.isfinite(value) else None
 
     def iter_blocks(*arrays):
-        iterator = np.nditer(
-            tuple(np.asarray(array) for array in arrays),
-            flags=["external_loop", "buffered", "zerosize_ok"],
-            op_flags=[["readonly"] for _ in arrays],
-            order="K",
-            buffersize=_JOIN_MERGE_BLOCK_CELLS,
-        )
-        for block in iterator:
-            if len(arrays) == 1:
-                yield (np.asarray(block),)
-            else:
-                yield tuple(np.asarray(value) for value in block)
+        for start in range(0, arrays[0].size, _JOIN_MERGE_BLOCK_CELLS):
+            stop = start + _JOIN_MERGE_BLOCK_CELLS
+            yield tuple(np.asarray(array.flat[start:stop]) for array in arrays)
 
     numeric_axes = {}
     axes_well_formed = True
@@ -380,8 +371,8 @@ def audit_dataset(self):
         int(np.asarray(self.frequencies).size),
         int(np.asarray(self.polarizations).size),
     )
-    power = np.asarray(self.rcs_power)
-    phase = np.asarray(self.rcs_phase)
+    power = self.power
+    phase = self.phase
     grid_metric = metrics["grid"]
     grid_metric.update(
         {

@@ -443,7 +443,7 @@ def _collect_single_series(
         raw = dataset.rcs_slice(raw_selection)
         analysis = None
     else:
-        raw = dataset.rcs_power[raw_selection]
+        raw = dataset.power[raw_selection]
         analysis = np.asarray(raw, dtype=float)
     display = self._display_from_values(
         dataset, raw, frequency_value=frequency_value

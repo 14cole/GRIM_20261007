@@ -187,7 +187,7 @@ class PythonDatasetHelperTest(unittest.TestCase):
         self.assertEqual(radian_result.units["azimuth"], "rad")
         # The first periodic window crosses the 0/360 seam and includes the
         # 270-degree sample exactly once: median([1, 2, 4]) == 2.
-        self.assertEqual(float(degree_result.rcs_power[0, 0, 0, 0]), 2.0)
+        np.testing.assert_allclose(degree_result.rcs_power[0, 0, 0, 0], 2.0, rtol=8 * np.finfo(float).eps)
         self.assertTrue(np.isnan(degree_result.rcs_phase).all())
         self.assertNotIn("phase_reference", degree_result.extra)
 
