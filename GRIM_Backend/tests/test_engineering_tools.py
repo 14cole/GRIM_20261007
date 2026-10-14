@@ -131,6 +131,71 @@ def test_sparse_phase_runs_give_diagnostics_without_a_fabricated_fit():
     assert np.all(np.isnan(result["fitted"]))
 
 
+@pytest.mark.parametrize("time_sign,phase_sign", [("+jwt", -1), ("-jwt", 1)])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_slope_preserves_native_gaps_after_frequency_sorting(time_sign, phase_sign, reverse):
+    native = np.array([0, 1, 2, 50, 51, 52])
+    frequency = 9e9 + native * 10e6
+    field = np.exp(phase_sign * 2j * np.pi * (frequency - 9e9) * 5e-9)
+    # The second group has an independent phase reference. Its slope is still
+    # 5 ns, and neither reference may be inferred through the omitted samples.
+    field[3:] *= np.exp(.73j)
+    if reverse:
+        frequency, field, native = frequency[::-1], field[::-1], native[::-1]
+    snapshots = tuple(value.copy() for value in (frequency, field, native))
+    result = phase_slope_fit(frequency, field, native_indices=native, time_sign=time_sign)
+    assert [fit["samples"] for fit in result["fits"]] == [3, 3]
+    assert [run.tolist() for run in result["runs"]] == [[0, 1, 2], [3, 4, 5]]
+    for fit in result["fits"]:
+        assert fit["apparent_delay_s"] == pytest.approx(5e-9, rel=1e-12)
+        assert fit["r_squared"] == pytest.approx(1.)
+        assert fit["residual_rms_deg"] < 1e-10
+    for actual, before in zip((frequency, field, native), snapshots):
+        np.testing.assert_array_equal(actual, before)
+
+
+def test_phase_unwrap_resets_at_native_gaps_without_discarding_endpoints():
+    native = np.array([0, 1, 2, 50, 51, 52])
+    wrapped_deg = np.array([170, -170, -150, -170, 170, 150])
+    result = phase_trace(native * .01, np.exp(1j * np.deg2rad(wrapped_deg)),
+                         native_indices=native)
+    np.testing.assert_allclose(np.rad2deg(result["unwrapped"]),
+                               [170, 190, 210, -170, -190, -210])
+    assert result["finite_count"] == result["total_count"] == 6
+    assert [run.tolist() for run in result["runs"]] == [[0, 1, 2], [3, 4, 5]]
+
+
+def test_native_gaps_combine_with_region_weak_samples_and_physical_gap_limit():
+    native = np.array([0, 1, 2, 6, 7, 8, 9, 10, 11])
+    frequency = np.array([1, 2, 3, 4, 5, 6, 7, 20, 21.])
+    field = np.ones(len(frequency), complex)
+    field[5] = 1e-6
+    result = phase_trace(frequency, field, native_indices=native, floor_db=-40,
+                         maximum_gap=2, region=(2, 20))
+    assert [run.tolist() for run in result["runs"]] == [[1, 2], [3, 4], [6], [7]]
+    assert result["finite_count"] == 6
+    assert np.isnan(result["unwrapped"][[0, 5, 8]]).all()
+
+
+def test_full_native_sweep_keeps_existing_phase_and_delay_results():
+    frequency = np.linspace(9e9, 10e9, 101)
+    field = np.exp(-2j * np.pi * (frequency - frequency[0]) * 5e-9)
+    before = phase_slope_fit(frequency, field)
+    after = phase_slope_fit(frequency, field, native_indices=np.arange(len(frequency)))
+    assert after["fits"] == before["fits"]
+    for name in ("wrapped", "unwrapped", "fitted", "residual", "valid"):
+        np.testing.assert_array_equal(after[name], before[name])
+
+
+def test_native_singletons_remain_visible_without_a_cross_gap_fit():
+    frequency = np.array([9e9, 9.5e9, 10e9])
+    result = phase_slope_fit(frequency, np.ones(3), native_indices=[0, 50, 100])
+    assert [fit["samples"] for fit in result["fits"]] == [1, 1, 1]
+    assert all("apparent_delay_s" not in fit for fit in result["fits"])
+    assert np.isfinite(result["unwrapped"]).all()
+    assert np.isnan(result["fitted"]).all()
+
+
 def test_phase_residual_matches_physical_units_without_interpolation():
     a = cut(np.exp(1j * np.array([.3, .6, .9])), [9, 10, 11])
     b = cut(np.exp(1j * np.array([.1, .4, .7])), [9000, 10000, 11000], unit="MHz")

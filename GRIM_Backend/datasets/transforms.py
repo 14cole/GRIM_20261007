@@ -841,6 +841,34 @@ def decimate_axis(
     )
 
 
+def _median_window_bounds(coordinates, coordinate_roundoff, center, half, origin):
+    """Include a boundary sample despite angular conversion roundoff.
+
+    The allowance follows the float64 spacing of each coordinate and the
+    arithmetic used to form the window, rather than a fixed degree tolerance.
+    Keep the original-coordinate allowance when a periodic copy crosses zero:
+    subtracting 360 degrees does not undo roundoff in that source coordinate.
+    """
+
+    lower, upper = center - half, center + half
+    arithmetic_roundoff = 4.0 * max(
+        np.spacing(abs(center)), np.spacing(abs(half)), np.spacing(abs(origin))
+    )
+    lower_roundoff = arithmetic_roundoff + 2.0 * np.spacing(abs(lower))
+    upper_roundoff = arithmetic_roundoff + 2.0 * np.spacing(abs(upper))
+    left = int(np.searchsorted(coordinates, lower, side="left"))
+    right = int(np.searchsorted(coordinates, upper, side="right"))
+    while left > 0 and lower - coordinates[left - 1] <= (
+        lower_roundoff + coordinate_roundoff[left - 1]
+    ):
+        left -= 1
+    while right < coordinates.size and coordinates[right] - upper <= (
+        upper_roundoff + coordinate_roundoff[right]
+    ):
+        right += 1
+    return left, right
+
+
 def medianize_azimuth(
     dataset: RcsGrid,
     *,
@@ -894,6 +922,7 @@ def medianize_azimuth(
 
     half = window * 0.5
     sample_azimuth = azimuth
+    sample_roundoff = 2.0 * np.spacing(np.abs(azimuth))
     merged_seam_power = None
     discarded_seam_cells = 0
     if periodic and np.isclose(span, 360.0, rtol=0.0, atol=1.0e-7):
@@ -913,6 +942,7 @@ def medianize_azimuth(
         )
         discarded_seam_cells = int(np.count_nonzero(seam_conflict_mask))
         sample_azimuth = azimuth[:-1]
+        sample_roundoff = sample_roundoff[:-1]
     if periodic:
         count_float = np.ceil(360.0 / slide - 1.0e-12)
         if count_float > _MAX_EXPLICIT_AXIS_POINTS:
@@ -927,13 +957,31 @@ def medianize_azimuth(
             (sample_azimuth - 360.0, sample_azimuth, sample_azimuth + 360.0)
         )
         augmented_indices = np.tile(source_indices, 3)
+        augmented_roundoff = (
+            np.tile(sample_roundoff, 3)
+            + 2.0 * np.spacing(np.abs(augmented_azimuth))
+        )
     else:
         first = float(azimuth[0]) + half
         last = float(azimuth[-1]) - half
         if last < first:
             centers = np.asarray([(float(azimuth[0]) + float(azimuth[-1])) * 0.5])
         else:
-            count_float = np.floor((last - first) / slide + 1e-9) + 1.0
+            count_float = np.floor((last - first) / slide) + 1.0
+            # Dividing an endpoint error by a narrow slide can amplify it.
+            # Check the possible final center in coordinate units instead of
+            # adding a fixed tolerance to the dimensionless center count.
+            endpoint_roundoff = 4.0 * max(
+                np.spacing(abs(azimuth[0])), np.spacing(abs(azimuth[-1])),
+                np.spacing(abs(first)), np.spacing(abs(last)), np.spacing(half),
+            )
+            next_center = first + count_float * slide
+            final_center = first + (count_float - 1.0) * slide
+            if (
+                last > first and next_center > final_center
+                and next_center - last <= endpoint_roundoff
+            ):
+                count_float += 1.0
             if count_float > _MAX_EXPLICIT_AXIS_POINTS:
                 raise ValueError(
                     f"medianize would create {int(count_float):,} azimuths; "
@@ -944,12 +992,14 @@ def medianize_azimuth(
     power = np.full(shape, np.nan, dtype=dataset.power.dtype)
     for index, center in enumerate(centers):
         if periodic:
-            left = int(np.searchsorted(augmented_azimuth, center - half, side="left"))
-            right = int(np.searchsorted(augmented_azimuth, center + half, side="right"))
+            left, right = _median_window_bounds(
+                augmented_azimuth, augmented_roundoff, center, half, azimuth[0]
+            )
             samples = np.unique(augmented_indices[left:right])
         else:
-            left = int(np.searchsorted(azimuth, center - half, side="left"))
-            right = int(np.searchsorted(azimuth, center + half, side="right"))
+            left, right = _median_window_bounds(
+                azimuth, sample_roundoff, center, half, azimuth[0]
+            )
             samples = np.arange(left, right, dtype=np.int64)
         if samples.size == 0:
             continue

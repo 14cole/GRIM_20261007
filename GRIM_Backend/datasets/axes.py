@@ -1263,6 +1263,20 @@ class GridAxesMixin:
         output_phase = np.full(output_shape, np.nan, dtype=self.phase.dtype)
         raw_pair = self._complete_authoritative_raw_arrays()
         preserve_raw = raw_pair is not None
+        # Seam equivalence still uses the established power/phase tolerances,
+        # but those derived values must not become the output authority. A
+        # coordinate-only wrap copies the selected physical I/Q unchanged,
+        # including when a client has only read the legacy polar arrays.
+        source_complex = None
+        if not preserve_raw:
+            payload = self.native_sample_payload()
+            if (payload["storage_kind"] == "complex"
+                    and payload["storage_domain"] == "physical"):
+                source_complex = payload["rcs_complex"]
+        output_complex = (
+            np.full(output_shape, complex(np.nan, np.nan), dtype=source_complex.dtype)
+            if source_complex is not None else None
+        )
         if preserve_raw:
             raw_real = np.asarray(raw_pair[0], dtype=np.float64)
             raw_imag = np.asarray(raw_pair[1], dtype=np.float64)
@@ -1276,10 +1290,17 @@ class GridAxesMixin:
             # Source-axis order sets precedence: a later alias only fills
             # cells the earlier sample left missing.
             for source_index in sorted(group):
+                incoming_power = self.power[source_index]
+                if output_complex is not None:
+                    take = (
+                        ~np.isfinite(output_power[output_index])
+                        & np.isfinite(incoming_power)
+                    )
+                    output_complex[output_index][take] = source_complex[source_index][take]
                 group_conflict |= self._merge_equivalent_sample_blocks(
                     output_power[output_index],
                     output_phase[output_index],
-                    self.power[source_index],
+                    incoming_power,
                     self.phase[source_index],
                     context=context,
                     keep_existing_on_conflict=keep_first,
@@ -1328,8 +1349,8 @@ class GridAxesMixin:
             np.array(self.elevations, copy=True),
             np.array(self.frequencies, copy=True),
             np.array(self.polarizations, copy=True),
-            rcs_power=output_power,
-            rcs_phase=output_phase,
+            **({"rcs": output_complex} if output_complex is not None else
+               {"rcs_power": output_power, "rcs_phase": output_phase}),
             rcs_domain="power_phase",
             history=history,
             extra=wrapped_extra,

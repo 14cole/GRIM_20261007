@@ -518,11 +518,10 @@ class XpatchFormatMixin:
         """Load an Xpatch SS signature into an RCS grid.
 
         Each signal supplies one azimuth/elevation look. Frequencies are in GHz, and
-        the polarization axis is VV/VH/HV/HH. Complex samples retain magnitude and
-        phase. Xpatch stores calibrated scattering amplitudes, so |sample|^2 is
-        3-D RCS in square meters and the output quantity is sigma_3d/dBsm.
+        the polarization axis is VV/VH/HV/HH. Complex samples retain the original
+        I/Q components. Xpatch stores calibrated scattering amplitudes, so
+        |sample|^2 is 3-D RCS in square meters and the output quantity is sigma_3d/dBsm.
         """
-        from GRIM_Backend.datasets.constants import _ADOPT_CLEAN_ARRAYS_TOKEN
         from GRIM_Backend.datasets.memory import _checked_dense_import_allocation
 
         data = read_ss(path, verbose=False)
@@ -632,13 +631,13 @@ class XpatchFormatMixin:
         )
         allocation = _checked_dense_import_allocation(
             shape,
-            (np.float32, np.float32),
+            (np.complex64,),
             source=f"SS import {path}",
             max_output_bytes=max_output_bytes,
             resident_bytes=resident_bytes,
         )
-        power = np.full(shape, np.nan, dtype=np.float32)
-        phase = np.full(shape, np.nan, dtype=np.float32)
+        field = np.full(shape, complex(np.nan, np.nan), dtype=np.complex64)
+        has_finite_samples = False
         for s in range(n_sig):
             ai = az_index[float(az[s])]
             ei = el_index[float(el[s])]
@@ -661,12 +660,12 @@ class XpatchFormatMixin:
                             f"SS {pols[pj]} signal {s + 1} magnitude is too "
                             "large for finite RCS power storage"
                         )
-                    power[ai, ei, finite, pj] = sample_power.astype(np.float32)
-                    phase[ai, ei, finite, pj] = np.arctan2(
-                        imag64, real64
-                    ).astype(np.float32)
+                    # Copy source quadratures directly: a float32 phase round
+                    # trip can erase a small component near the negative real axis.
+                    field[ai, ei, finite, pj] = finite_row
+                    has_finite_samples = True
 
-        if not np.isfinite(power).any():
+        if not has_finite_samples:
             raise ValueError("SS parsed, but no finite scattering samples were found")
 
         extra.update(
@@ -684,9 +683,8 @@ class XpatchFormatMixin:
             el_axis,
             freq,
             pols,
-            rcs_power=power,
-            rcs_phase=phase,
-            rcs_domain="power_phase",
+            rcs=field,
+            rcs_domain="complex_amplitude",
             source_path=path,
             history=(f"Loaded Xpatch .ss ({n_sig} signals, {n_freq} freqs, "
                      f"{ss_angle_source} angles, imono={ss_imono}"
@@ -697,7 +695,6 @@ class XpatchFormatMixin:
                 "rcs_log_unit": "dBsm", "rcs_linear_quantity": "sigma_3d",
             },
             extra=extra,
-            _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
         )
 
 

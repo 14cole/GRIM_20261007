@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import csv
+import io
+import tempfile
 import unittest
 from unittest import mock
 
@@ -72,6 +75,140 @@ class InlineEngineeringAnalysisTests(unittest.TestCase):
                 listing.item(index).setSelected(True)
         finally:
             listing.blockSignals(previous)
+
+    def load_delay_sample(self, field=None):
+        frequencies = 9. + np.arange(101) * .01
+        if field is None:
+            field = np.exp(-2j * np.pi * (frequencies - frequencies[0]) * 5.)
+        grid = make_grid(np.asarray(field)[None, None, :, None], frequencies=frequencies,
+                         units={"time_convention": "exp(+j omega t)"})
+        self.window.btn_auto_plot.setChecked(False)
+        self.window._add_dataset_row(grid, "5 ns target", "Loaded", "delay.grim")
+        self.window.table.selectRow(0)
+        for listing in (self.window.list_az, self.window.list_elev,
+                        self.window.list_freq, self.window.list_pol):
+            listing.selectAll()
+        return grid
+
+    def test_phase_slope_preserves_selected_runs_in_plot_copy_and_results_export(self):
+        grid = self.load_delay_sample()
+        before = grid.rcs.copy()
+        selected = [0, 1, 2, 50, 51, 52]
+        self.select_frequencies(selected)
+        panel = self.window._show_engineering_tool("phase")
+        # The ordinary magnitude/phase view also shows the omitted sweep span.
+        for axes in self.window.plot_figure.axes:
+            for line in axes.lines:
+                np.testing.assert_allclose(line.get_xdata(), np.insert(grid.frequencies[selected], 3, np.nan))
+        panel.phase_view.setCurrentIndex(panel.phase_view.findData("slope"))
+        rows = panel._panels["phase"][2].rows
+        delays = [row for row in rows if "apparent delay s" in row[0]]
+        self.assertEqual([row[0] for row in delays], ["Run 1 apparent delay s", "Run 2 apparent delay s"])
+        for row in delays:
+            self.assertAlmostEqual(float(row[1]), 5e-9, delta=1e-18)
+        for axes in self.window.plot_figure.axes:
+            for line in axes.lines:
+                np.testing.assert_allclose(line.get_xdata(), np.insert(grid.frequencies[selected], 3, np.nan))
+                self.assertEqual(np.flatnonzero(np.isnan(line.get_ydata())).tolist(), [3])
+        self.assertEqual(len(self.window.plot_figure.axes[0].get_legend().get_texts()), 2)
+        panel._copy_samples("phase")
+        copied = list(csv.DictReader(io.StringIO(QApplication.clipboard().text()), delimiter="\t"))
+        self.assertEqual(len(copied), 18)
+        for label in ("Fit residual", "Unwrapped phase", "Fitted phase"):
+            for run, indices in enumerate((selected[:3], selected[3:]), 1):
+                branch = [row for row in copied if row["Series"] == f"{label} · Run {run}"]
+                np.testing.assert_allclose([float(row["X"]) for row in branch], grid.frequencies[indices])
+                self.assertTrue(all(np.isfinite(float(row["Value"])) for row in branch))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "phase-results.csv"
+            with mock.patch("GRIM_Backend.ui.engineering_analysis.QFileDialog.getSaveFileName", return_value=(str(path), "CSV (*.csv)")):
+                panel._export_results("phase")
+            with path.open(encoding="utf-8-sig", newline="") as source:
+                exported = list(csv.DictReader(source))
+            delays = [row for row in exported if "apparent delay s" in row["Metric"]]
+            self.assertEqual(len(delays), 2)
+            for row in delays:
+                self.assertAlmostEqual(float(row["Value"]), 5e-9, delta=1e-18)
+        # A full native sweep keeps the ordinary one-fit, one-series contract.
+        panel.selected_sweep.setChecked(False)
+        delays = [row for row in panel._panels["phase"][2].rows if "apparent delay s" in row[0]]
+        self.assertEqual(len(delays), 1)
+        self.assertAlmostEqual(float(delays[0][1]), 5e-9, delta=1e-18)
+        self.assertEqual([sample[0] for sample in panel._samples["phase"]],
+                         ["Fit residual", "Unwrapped phase", "Fitted phase"])
+        np.testing.assert_array_equal(self.window.plot_figure.axes[0].lines[0].get_xdata(), grid.frequencies)
+        np.testing.assert_array_equal(grid.rcs, before)
+
+    def test_measurement_of_decimated_phase_trace_keeps_native_branch_breaks(self):
+        field = np.ones(101, complex)
+        selected = [0, 1, 2, 50, 51, 52]
+        field[selected] = np.exp(1j * np.deg2rad([170, -170, -150, -170, 170, 150]))
+        grid = self.load_delay_sample(field)
+        before = grid.rcs.copy()
+        self.select_frequencies(selected)
+        with mock.patch("GRIM_Backend.plotting.modes.common.MAX_LINE_POINTS", 4):
+            panel = self.window._show_engineering_tool("phase")
+        line = next(line for line in self.window.plot_figure.axes[1].lines
+                    if "Locally unwrapped" in line.get_label())
+        native_x, native_y = self.window._marker_arrays(line)
+        self.assertIsNotNone(getattr(line, "_grim_native_samples", None))
+        np.testing.assert_allclose(native_y, [170, 190, 210, np.nan, -170, -190, -210])
+        np.testing.assert_allclose(native_x, np.insert(grid.frequencies[selected], 3, np.nan))
+        panel = self.window._show_engineering_tool("measure")
+        index = next(i for i in range(panel.trace_combo.count()) if panel.trace_combo.itemData(i) is line)
+        panel.trace_combo.setCurrentIndex(index)
+        panel.crossing_level.setValue(0.)
+        panel._update_current()
+        measured_x, measured_y, result, source, _order = panel._measurement
+        self.assertIs(source, line)
+        np.testing.assert_allclose(measured_x, native_x)
+        np.testing.assert_allclose(measured_y, native_y)
+        self.assertEqual(result["crossings"], [])
+        self.assertEqual(result["finite_count"], 6)
+        self.assertEqual(result["coverage"], 1.)
+        np.testing.assert_array_equal(grid.rcs, before)
+
+    def test_selected_phase_singletons_stay_visible_without_a_cross_gap_fit(self):
+        grid = self.load_delay_sample()
+        self.select_frequencies([0, 50, 100])
+        panel = self.window._show_engineering_tool("phase")
+        panel.phase_view.setCurrentIndex(panel.phase_view.findData("slope"))
+        rows = panel._panels["phase"][2].rows
+        self.assertEqual(len([row for row in rows if row[1] == "no fit"]), 3)
+        self.assertFalse(any("apparent delay s" in row[0] for row in rows))
+        line = self.window.plot_figure.axes[0].lines[0]
+        self.assertEqual(line.get_marker(), ".")
+        self.assertEqual(line.get_markevery(), [0, 2, 4])
+        np.testing.assert_allclose(line.get_xdata(), [9., np.nan, 9.5, np.nan, 10.])
+        panel._copy_samples("phase")
+        copied = QApplication.clipboard().text()
+        self.assertIn("Unwrapped phase · Run 3", copied)
+        self.assertNotIn("unavailable", panel.summary.text().lower())
+
+    def test_phase_copy_keeps_zero_and_weak_samples_between_branches(self):
+        frequencies = 9. + np.arange(101) * .01
+        field = np.exp(-2j * np.pi * (frequencies - frequencies[0]) * 5.)
+        field[1] = 0.
+        field[51] *= 1e-6
+        grid = self.load_delay_sample(field)
+        before = grid.rcs.copy()
+        selected = [0, 1, 2, 50, 51, 52]
+        self.select_frequencies(selected)
+        panel = self.window._show_engineering_tool("phase")
+        panel._copy_samples("phase")
+        copied = list(csv.DictReader(io.StringIO(QApplication.clipboard().text()), delimiter="\t"))
+        self.assertEqual(len(copied), 18)
+        for label in ("Magnitude", "Wrapped phase", "Unwrapped phase"):
+            samples = [row for row in copied if row["Series"].startswith(label)]
+            np.testing.assert_allclose([float(row["X"]) for row in samples], grid.frequencies[selected])
+            values = np.array([float(row["Value"]) for row in samples])
+            if label == "Magnitude":
+                self.assertTrue(np.isneginf(values[1]))
+                self.assertAlmostEqual(values[4], -120.)
+            else:
+                self.assertTrue(np.isnan(values[[1, 4]]).all())
+                self.assertTrue(np.isfinite(values[[0, 2, 3, 5]]).all())
+        np.testing.assert_array_equal(grid.rcs, before)
 
     def test_tool_launchers_use_the_existing_canvas_in_both_workspaces(self):
         self.load_sample()
@@ -371,7 +508,7 @@ class InlineEngineeringAnalysisTests(unittest.TestCase):
         self.assertIsNone(panel.active_key)
         self.assertEqual(self.window.last_plot_mode, "engineering_phase")
         np.testing.assert_allclose(self.window.plot_figure.axes[0].lines[0].get_xdata(),
-                                   dataset.frequencies[[2, 5, 11]])
+                                   np.insert(dataset.frequencies[[2, 5, 11]], [1, 2], np.nan))
         self.assertIsNone(self.window.last_python_plot_spec)
 
     def test_selected_sweep_snapshot_and_reference_matching_use_physical_coordinates(self):

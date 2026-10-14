@@ -78,16 +78,23 @@ def dataset_cut(dataset, axis="frequency", *, azimuth_index=0, elevation_index=0
                           np.arange(len(x), dtype=int))
 
 
-def finite_runs(x, valid, *, maximum_gap=None):
+def finite_runs(x, valid, *, maximum_gap=None, native_indices=None):
     """Index arrays for adjacent finite, increasing samples without bridging gaps."""
     x = np.asarray(x, dtype=float)
     valid = np.asarray(valid, dtype=bool) & np.isfinite(x)
+    if native_indices is not None:
+        native_indices = np.asarray(native_indices)
+        if native_indices.shape != x.shape:
+            raise ValueError("native indices must have one entry per sample")
     if maximum_gap is not None and (not np.isfinite(maximum_gap) or maximum_gap <= 0):
         raise ValueError("maximum gap must be positive and finite")
     start = None
     for index in range(len(x)):
-        boundary = index > 0 and (x[index] <= x[index - 1] or (
-            maximum_gap is not None and x[index] - x[index - 1] > maximum_gap))
+        boundary = index > 0 and (
+            x[index] <= x[index - 1]
+            or (maximum_gap is not None and x[index] - x[index - 1] > maximum_gap)
+            or (native_indices is not None
+                and abs(int(native_indices[index]) - int(native_indices[index - 1])) != 1))
         if start is not None and (not valid[index] or boundary):
             yield np.arange(start, index)
             start = None
@@ -169,8 +176,9 @@ def measure_trace(x, y, *, region=None, level=None, drop=3., maximum_gap=None):
     return out
 
 
-def phase_trace(x, field, *, floor_db=-60., maximum_gap=None, region=None):
-    """Mask weak/unknown fields and unwrap each finite run independently."""
+def phase_trace(x, field, *, floor_db=-60., maximum_gap=None, region=None,
+                native_indices=None):
+    """Unwrap valid runs without joining samples omitted from the native grid."""
     x, field = np.asarray(x, dtype=float), np.asarray(field, dtype=complex)
     magnitude = np.abs(field)
     valid = np.isfinite(x) & np.isfinite(magnitude) & (magnitude > 0)
@@ -183,7 +191,8 @@ def phase_trace(x, field, *, floor_db=-60., maximum_gap=None, region=None):
     wrapped = np.full(x.shape, np.nan)
     wrapped[valid] = np.angle(field[valid])
     unwrapped = np.full(x.shape, np.nan)
-    runs = list(finite_runs(x, valid, maximum_gap=maximum_gap))
+    runs = list(finite_runs(x, valid, maximum_gap=maximum_gap,
+                           native_indices=native_indices))
     for run in runs:
         unwrapped[run] = np.unwrap(wrapped[run])
     return {"wrapped": wrapped, "unwrapped": unwrapped, "valid": valid, "runs": runs,
@@ -191,15 +200,21 @@ def phase_trace(x, field, *, floor_db=-60., maximum_gap=None, region=None):
 
 
 def phase_slope_fit(frequency_hz, field, *, floor_db=-60., region_hz=None,
-                    maximum_gap_hz=None, time_sign="+jwt"):
+                    maximum_gap_hz=None, time_sign="+jwt", native_indices=None):
     """Separate centered least-squares fits; never combine unknown phase branches."""
     if time_sign not in {"+jwt", "-jwt"}:
         raise ValueError("choose +jwt or -jwt to interpret a fitted delay")
     frequency = np.asarray(frequency_hz, dtype=float)
     order = np.argsort(frequency, kind="stable")
+    if native_indices is not None:
+        native_indices = np.asarray(native_indices)
+        if native_indices.shape != frequency.shape:
+            raise ValueError("native indices must have one entry per sample")
+        native_indices = native_indices[order]
     frequency, field = frequency[order], np.asarray(field, dtype=complex)[order]
     phase = phase_trace(frequency, field, floor_db=floor_db,
-                        maximum_gap=maximum_gap_hz, region=region_hz)
+                        maximum_gap=maximum_gap_hz, region=region_hz,
+                        native_indices=native_indices)
     fitted = np.full(frequency.shape, np.nan)
     residual = np.full(frequency.shape, np.nan)
     fits = []

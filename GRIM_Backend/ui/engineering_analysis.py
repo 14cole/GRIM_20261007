@@ -19,7 +19,9 @@ from GRIM_Backend.plotting.engineering_tools import (
     dataset_cut, measure_trace, phase_trace, phase_slope_fit, phase_residual,
     channel_comparison, finite_runs,
 )
-from GRIM_Backend.plotting.modes.common import axis_unit, convert_axis_values, decimate_line
+from GRIM_Backend.plotting.modes.common import (
+    axis_unit, convert_axis_values, decimate_line, insert_plot_breaks, singleton_line_markers,
+)
 from GRIM_Backend.datasets.metadata import canonical_time_convention
 from GRIM_Backend.ui.widgets import CollapsibleSection
 
@@ -50,6 +52,34 @@ class ResultTable(QTableWidget):
 
 def _number(value):
     return "not defined" if value is None else f"{value:.9g}" if isinstance(value, (float, np.floating)) else str(value)
+
+
+def _with_run_breaks(x, y, runs):
+    """Keep native samples and insert display/probe breaks between adjacent runs."""
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    if runs is not None:
+        boundaries = [int(run[0]) for run in runs if len(run) and run[0] > 0
+                      and np.isfinite(x[run[0] - 1]) and np.isfinite(y[run[0] - 1])]
+        x, y = insert_plot_breaks(boundaries, x, y)
+    return x, y
+
+
+def _run_samples(label, x, y, unit, runs):
+    """Name independent branches while retaining masked/missing coordinates."""
+    if len(runs) <= 1:
+        return [(label, x, y, unit)]
+    boundaries = [0, *(int(run[0]) for run in runs[1:]), len(x)]
+    return [(f"{label} · Run {number}", x[start:stop], y[start:stop], unit)
+            for number, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:]), 1)]
+
+
+def _trace_sort_order(x):
+    """Sort within finite coordinate blocks, retaining explicit gap separators."""
+    order = np.arange(len(x))
+    finite = np.flatnonzero(np.isfinite(x))
+    for block in np.split(finite, np.flatnonzero(np.diff(finite) != 1) + 1):
+        order[block] = block[np.argsort(x[block], kind="stable")]
+    return None if np.array_equal(order, np.arange(len(x))) else order
 
 
 class CompactNumberSpin(QDoubleSpinBox):
@@ -470,15 +500,15 @@ class EngineeringAnalysisDialog(QDialog):
         self.analysis_errors[key].show()
         canvas.draw_idle()
 
-    def _display_line(self, axes, x, y, *, label=None, split_gaps=True, **kwargs):
+    def _display_line(self, axes, x, y, *, label=None, split_gaps=True, runs=None, **kwargs):
         # Display-only reduction; all analysis and copied values stay native.
         x, y = np.asarray(x), np.asarray(y)
-        if split_gaps and self._maximum_gap() is not None:
+        if runs is None and split_gaps and self._maximum_gap() is not None:
             runs = list(finite_runs(x, np.isfinite(y), maximum_gap=self._maximum_gap()))
-            if runs:
-                x = np.concatenate([np.r_[x[run], np.nan] for run in runs])
-                y = np.concatenate([np.r_[y[run], np.nan] for run in runs])
+        x, y = _with_run_breaks(x, y, runs)
         xx, yy, _reduced = decimate_line(x, y, max_points=20_000)
+        if "marker" not in kwargs:
+            kwargs.update(singleton_line_markers(xx, yy))
         return axes.plot(xx, yy, label=label, **kwargs)[0]
 
     def _analyze_measure(self):
@@ -505,9 +535,8 @@ class EngineeringAnalysisDialog(QDialog):
             if getattr(line, "_grim_native_probe_unavailable", False):
                 note_text += " Native samples unavailable: these results describe only the displayed samples."
             else: note_text += " Measurements use native trace samples, including those omitted from the overview."
-        order = None
-        if not np.all(np.diff(x) >= 0):
-            order = np.argsort(x, kind="stable")
+        order = _trace_sort_order(x)
+        if order is not None:
             x, y = x[order], y[order]
         result = measure_trace(x, y, region=self._region(), level=self.crossing_level.value(),
                                drop=self.peak_drop.value(), maximum_gap=self._maximum_gap())
@@ -576,7 +605,8 @@ class EngineeringAnalysisDialog(QDialog):
         figure, canvas, table, note = self._panels["phase"]
         figure.clear(); rows = [("Source A", cut.label, f"{cut.axis} ({cut.x_unit})"),
                                 ("Region", str(self._region()) if self._region() else "Full cut", cut.x_unit)]; samples = []
-        phases = phase_trace(cut.x, cut.field, floor_db=self.floor.value(), maximum_gap=self._maximum_gap(), region=self._region())
+        phases = phase_trace(cut.x, cut.field, floor_db=self.floor.value(), maximum_gap=self._maximum_gap(),
+                             region=self._region(), native_indices=cut.native_indices)
         rows.append(("Usable phase samples", f"{phases['finite_count']} / {phases['total_count']}", f"mask: {self.floor.value():g} dB relative to cut peak"))
         notes = list(cut.notes)
         if view == "iq":
@@ -618,12 +648,13 @@ class EngineeringAnalysisDialog(QDialog):
             scale = float(convert_axis_values([1.], "frequency", cut.x_unit, "Hz")[0])
             report = phase_slope_fit(cut.x * scale, cut.field, floor_db=self.floor.value(),
                                      region_hz=tuple(v * scale for v in self._region()) if self._region() else None,
-                                     maximum_gap_hz=self._maximum_gap() * scale if self._maximum_gap() else None, time_sign=sign)
+                                     maximum_gap_hz=self._maximum_gap() * scale if self._maximum_gap() else None,
+                                     time_sign=sign, native_indices=cut.native_indices)
             top, bottom = figure.subplots(2, 1, sharex=True)
             x = report["x_hz"] / scale
-            self._display_line(top, x, np.rad2deg(report["unwrapped"]), label="Local unwrapped phase")
-            self._display_line(top, x, np.rad2deg(report["fitted"]), label="Fit", linestyle="--")
-            self._display_line(bottom, x, np.rad2deg(report["residual"]), label="Fit residual")
+            self._display_line(top, x, np.rad2deg(report["unwrapped"]), label="Local unwrapped phase", runs=report["runs"])
+            self._display_line(top, x, np.rad2deg(report["fitted"]), label="Fit", linestyle="--", runs=report["runs"])
+            self._display_line(bottom, x, np.rad2deg(report["residual"]), label="Fit residual", runs=report["runs"])
             top.set(ylabel="Phase (deg)", title=cut.label); top.legend()
             bottom.set(xlabel=f"Frequency ({cut.x_unit})", ylabel="Residual (deg)")
             for fit in report["fits"]:
@@ -634,20 +665,22 @@ class EngineeringAnalysisDialog(QDialog):
                                      ("residual_rms_deg", "deg"), ("residual_max_deg", "deg"), ("alias_period_s", "s; uniform-grid phase alias period")):
                     rows.append((prefix + " " + metric.replace("_", " "), _number(fit[metric]), unit))
             notes.append(report["note"])
-            samples = [("Fit residual", x, np.rad2deg(report["residual"]), "deg"),
-                       ("Unwrapped phase", x, np.rad2deg(report["unwrapped"]), "deg"),
-                       ("Fitted phase", x, np.rad2deg(report["fitted"]), "deg")]
+            for label, values in (("Fit residual", report["residual"]),
+                                  ("Unwrapped phase", report["unwrapped"]), ("Fitted phase", report["fitted"])):
+                samples.extend(_run_samples(label, x, np.rad2deg(values), "deg", report["runs"]))
         else:
             top, bottom = figure.subplots(2, 1, sharex=True)
-            self._display_line(top, cut.x, cut.db, label=cut.level_unit)
-            self._display_line(bottom, cut.x, np.rad2deg(phases["wrapped"]), label="Wrapped")
-            self._display_line(bottom, cut.x, np.rad2deg(phases["unwrapped"]), label="Locally unwrapped", linestyle="--")
+            magnitude_runs = list(finite_runs(cut.x, np.isfinite(cut.db), maximum_gap=self._maximum_gap(),
+                                              native_indices=cut.native_indices))
+            self._display_line(top, cut.x, cut.db, label=cut.level_unit, runs=magnitude_runs)
+            self._display_line(bottom, cut.x, np.rad2deg(phases["wrapped"]), label="Wrapped", runs=phases["runs"])
+            self._display_line(bottom, cut.x, np.rad2deg(phases["unwrapped"]), label="Locally unwrapped", linestyle="--", runs=phases["runs"])
             top.set(ylabel=cut.level_unit, title=cut.label)
             bottom.set(xlabel=f"{cut.axis} ({cut.x_unit})", ylabel="Phase (deg)"); bottom.legend()
             notes.append("Each finite, magnitude-qualified run is unwrapped independently; no phase continuity is assumed across gaps.")
-            samples = [("Magnitude", cut.x, cut.db, cut.level_unit),
-                       ("Wrapped phase", cut.x, np.rad2deg(phases["wrapped"]), "deg"),
-                       ("Unwrapped phase", cut.x, np.rad2deg(phases["unwrapped"]), "deg")]
+            samples = _run_samples("Magnitude", cut.x, cut.db, cut.level_unit, magnitude_runs)
+            for label, values in (("Wrapped phase", phases["wrapped"]), ("Unwrapped phase", phases["unwrapped"])):
+                samples.extend(_run_samples(label, cut.x, np.rad2deg(values), "deg", phases["runs"]))
         rows.append(("Conventions and interpretation", " ".join(notes), "advisory"))
         table.populate(rows); note.setText(" ".join(notes)); self._samples["phase"] = samples; canvas.draw_idle()
 

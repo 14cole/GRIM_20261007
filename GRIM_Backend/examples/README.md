@@ -5,17 +5,47 @@ are no command-line options. Open the desired script, change the clearly marked
 `EDIT THESE SETTINGS` block near the top, save it, and run the file:
 
 ```powershell
+python GRIM_Backend/examples/simple_data_access.py
 python GRIM_Backend/examples/join_folder.py
 python GRIM_Backend/examples/plot_folder_azimuth_sweeps.py
 python GRIM_Backend/examples/plot_folder_frequency_sweeps.py
 python GRIM_Backend/examples/query_dataset.py
 ```
 
-The functions below each settings block remain importable when a larger Python
-workflow needs to call them directly. Normal example use does not require
-editing those functions.
+Start with `simple_data_access.py` for a short, straight-line script you can
+adapt freely. The other examples also provide importable functions for larger
+Python workflows.
 
-All folder examples recognize the formats supported by `GRIM_Backend.scripting.api`:
+## Simple lists for your own plots
+
+Edit [simple_data_access.py](simple_data_access.py). Set `FOLDER`, `AZIMUTH`,
+`ELEVATION`, `FREQUENCY`, and `POLARIZATION`, then run it. The script uses an
+`os.listdir()` list comprehension to load `.grim` files. To load one file or
+several named files in any supported format, replace `paths` with a list of
+their filenames as shown in the script.
+
+Coordinates are converted to degrees and GHz. The script selects the nearest
+stored coordinate and prints the actual selection; it does not interpolate.
+Each dataset is selected independently, so check `selected_coordinates` when
+comparing files with different sampling grids.
+
+The lists remain available to the rest of your script:
+
+```python
+point_values[0]             # One linear-power value from the first file.
+azimuth_cuts[0]             # Power vs. azimuth from the first file.
+datasets[0].azimuths        # Matching azimuth coordinates in degrees.
+frequency_cuts[0]           # Power vs. frequency from the first file.
+datasets[0].frequencies     # Matching frequency coordinates in GHz.
+```
+
+The same index selects the same file in `paths`, `datasets`, and each result
+list. Cuts may have different lengths across files. Linear power retains the
+dataset's physical quantity (RCS, scattering width, or ratio). Optional lines
+show phase, I/Q, and a plain Matplotlib plot with the correct dB label.
+Magnitude-only data works; unavailable phase remains `NaN`.
+
+The other folder examples recognize the formats supported by `GRIM_Backend.scripting.api`:
 `.grim`, `.csv`, `.cst_data`, `.txt`, `.out`, `.pio`, `.cmplx_di`, `.ptm`, and
 `.ss`. Set `FILE_PATTERN` or `INPUT_PATTERN` to `"*.grim"` (or another glob)
 when only one file type should participate.
@@ -152,8 +182,8 @@ The essential direct-access pattern is:
 
 ```python
 indices = (azimuth_index, elevation_index, frequency_index, polarization_index)
-power = dataset.rcs_power[indices]
-phase_radians = dataset.rcs_phase[indices]
+power = dataset.power[indices]
+phase_radians = dataset.phase[indices]
 display_db = dataset.linear_to_default_db(
     power,
     frequency_value=dataset.frequencies[frequency_index],

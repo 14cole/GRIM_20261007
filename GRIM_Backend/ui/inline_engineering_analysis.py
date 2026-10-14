@@ -13,8 +13,10 @@ from PySide6.QtWidgets import (
 from matplotlib.widgets import SpanSelector
 
 from GRIM_Backend.plotting.engineering_tools import finite_runs, measure_trace
-from GRIM_Backend.plotting.modes.common import NativeSamples, decimate_line
-from GRIM_Backend.ui.engineering_analysis import EngineeringAnalysisDialog, ResultTable, _number
+from GRIM_Backend.plotting.modes.common import NativeSamples, decimate_line, singleton_line_markers
+from GRIM_Backend.ui.engineering_analysis import (
+    EngineeringAnalysisDialog, ResultTable, _number, _trace_sort_order, _with_run_breaks,
+)
 from GRIM_Backend.ui.iq_analysis import IQControls, render_iq
 
 
@@ -670,14 +672,13 @@ class InlineEngineeringAnalysis(QWidget):
             self.owner.plot_axes = data_axes if len(data_axes) > 1 else None
             self._rendering = False
 
-    def _display_line(self, axes, x, y, *, label=None, split_gaps=True, **kwargs):
+    def _display_line(self, axes, x, y, *, label=None, split_gaps=True, runs=None, **kwargs):
         x, y = np.asarray(x), np.asarray(y)
-        native_x, native_y = x, y
-        if split_gaps and self._maximum_gap() is not None:
+        if runs is None and split_gaps and self._maximum_gap() is not None:
             runs = list(finite_runs(x, np.isfinite(y), maximum_gap=self._maximum_gap()))
-            if runs:
-                x = np.concatenate([np.r_[x[run], np.nan] for run in runs])
-                y = np.concatenate([np.r_[y[run], np.nan] for run in runs])
+        x, y = _with_run_breaks(x, y, runs)
+        # Marker and measurement readers must retain the same branch breaks.
+        native_x, native_y = x, y
         dataset_index = self.dataset_combo.currentIndex()
         dataset = self._datasets[dataset_index][1] if 0 <= dataset_index < len(self._datasets) else None
         name = self._datasets[dataset_index][0] if dataset is not None else "Analysis"
@@ -692,6 +693,8 @@ class InlineEngineeringAnalysis(QWidget):
                             native_values=(native_x, native_y), **kwargs)
             return lines[0] if lines else None
         xx, yy, reduced = decimate_line(x, y, max_points=20_000)
+        if "marker" not in kwargs:
+            kwargs.update(singleton_line_markers(xx, yy))
         line = axes.plot(xx, yy, label=displayed_label, **kwargs)[0]
         line._grim_dataset_key = id(dataset); line._grim_trace_key = trace_key
         if reduced or len(native_x) != len(x):
@@ -732,9 +735,9 @@ class InlineEngineeringAnalysis(QWidget):
             note_text += ("Native samples unavailable; results use displayed samples." if
                           getattr(line, "_grim_native_probe_unavailable", False) else
                           "Measurements use native samples, including samples omitted from the overview.")
-        order = None
-        if not np.all(np.diff(x) >= 0):
-            order = np.argsort(x, kind="stable"); x, y = x[order], y[order]
+        order = _trace_sort_order(x)
+        if order is not None:
+            x, y = x[order], y[order]
         result = measure_trace(x, y, region=self._region(), level=self.crossing_level.value(),
                                drop=self.peak_drop.value(), maximum_gap=self._maximum_gap())
         self._remove_overlays()
