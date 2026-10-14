@@ -13,16 +13,19 @@ The [vehicle assembly guide](ASSEMBLY_WORKFLOW.md) describes the Body, Points,
 Line features, and Build workflow, including direct feature authoring and reusable
 assembly recipes.
 
-For the offline Windows distribution, extract your 64-bit embedded Python
-(Python 3.14.6 for the intended release) into `GRIM_Backend/python_env` and
-place matching wheels and their dependencies in
-`GRIM_Backend/offline packages`, and run `Setup_GRIM_Offline.bat` followed by
-`Launch_GRIM_Offline.bat`. Both launchers are inside `GRIM_Backend`.
+For the Windows distribution, extract your 64-bit embedded Python
+(Python 3.14.6 for the intended release) into `GRIM_Backend/python_env`, then
+double-click **Setup_GRIM.bat** in the root folder. It downloads compatible
+wheels and their dependencies into `GRIM_Backend/offline packages`, creates
+an isolated environment, and checks it before activation. Afterward, use the
+root **Launch_GRIM.bat**. No separately installed Python or pip is needed.
+For computers without internet, supply matching wheels and use
+`GRIM_Backend/Setup_GRIM_Offline.bat`. Both setup paths use the same launcher.
 This repository provides the setup skeleton; the runtime and wheels are
 supplied on the release computer. Setup detects the supplied interpreter
 instead of requiring this development computer's Python version.
-The [offline setup instructions](../offline%20packages/README.txt) include
-the wheel download command. Keep the sibling `tools` directory in the
+The [setup instructions](../offline%20packages/README.txt) include
+the optional manual wheel download command. Keep the sibling `tools` directory in the
 distribution for FREDDY and GHOST.
 
 For an existing development checkout, run GRIM from the repository root

@@ -88,7 +88,8 @@ def validate_base(backend: Path) -> Path:
         raise SetupError("Unzip the supplied CPython embedded runtime for Windows x64 into GRIM_Backend\\python_env first "
                          "(python_env\\python.exe must exist).")
     if Path(sys.executable).resolve() != base:
-        raise SetupError("Run Setup_GRIM_Offline.bat so setup uses GRIM_Backend\\python_env\\python.exe.")
+        raise SetupError("Run the root Setup_GRIM.bat, or Setup_GRIM_Offline.bat for local wheels, "
+                         "so setup uses GRIM_Backend\\python_env\\python.exe.")
     if (sys.platform != "win32" or sys.implementation.name != "cpython" or sys.version_info[:2] < (3, 11)
             or struct.calcsize("P") != 8 or sysconfig.get_platform() != "win-amd64"):
         raise SetupError("Use CPython 3.11 or newer for Windows x64 in python_env, with wheels matching that runtime.")
@@ -270,14 +271,16 @@ def active_environment(backend: Path) -> Path:
             raise ValueError("The environment is missing or was moved")
         return target
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise SetupError("No usable offline environment was found. Run Setup_GRIM_Offline.bat first.") from exc
+        raise SetupError("No usable offline environment was found. Run Setup_GRIM.bat in the GRIM root folder, "
+                         "or Setup_GRIM_Offline.bat if wheels are already available.") from exc
 
 
-def setup(backend: Path) -> Path:
+def setup(backend: Path, *, wheelhouse: Path | None = None) -> Path:
+    """Install from local wheels; online setup can supply its fresh download set."""
     backend = backend.resolve()
     base = validate_base(backend)
     requirements = backend / "offline packages" / "requirements.txt"
-    wheelhouse = backend / "offline packages"
+    wheelhouse = (wheelhouse or backend / "offline packages").resolve()
     pip_wheel = pip_bootstrap_wheel(wheelhouse, requirements)
     requested = read_requirements(requirements, pip_wheel)
     env = clean_environment()
@@ -300,7 +303,7 @@ def setup(backend: Path) -> Path:
                 except OSError:
                     print(f"The unfinished environment could not be removed: {target}", file=sys.stderr)
             raise
-    print(f"GRIM is ready. Start Launch_GRIM_Offline.bat.\nEnvironment: {target}")
+    print(f"GRIM is ready. Start the root Launch_GRIM.bat or GRIM_Backend\\Launch_GRIM_Offline.bat.\nEnvironment: {target}")
     return target
 
 

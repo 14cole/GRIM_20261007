@@ -3,7 +3,8 @@
 # Download with dependencies; pip selects compatible versions and wheel tags.
 # Keep the resulting wheel set together for every copy of the distribution.
 # Exact == pins are also supported if you maintain a validated release lock.
-# See README.txt for the download command. Nothing is downloaded during setup.
+# Double-click Setup_GRIM.bat in the GRIM root to download and set up everything.
+# Setup_GRIM_Offline.bat uses only existing wheels. See README.txt for details.
 
 # Offline environment creation and package installation.
 virtualenv>=20.36.1
