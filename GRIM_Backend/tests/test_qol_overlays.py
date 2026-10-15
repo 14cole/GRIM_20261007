@@ -70,8 +70,11 @@ class NativeOverlayTests(unittest.TestCase):
         owner = self.harness([("A", fine), ("B", coarse)], selected_az=[0, .5, 2])
         azimuth_rect_mode.render(owner)
         self.assertEqual(len(owner.plot_ax.lines), 2)
-        np.testing.assert_allclose(owner.plot_ax.lines[0].get_xdata(), [0, .5, 2])
-        np.testing.assert_allclose(owner.plot_ax.lines[1].get_xdata(), [0, 2])
+        # The selected run 0-0.5 and the isolated cut at 2 stay separate: a NaN
+        # break keeps them from being joined by a line, and B contributes no
+        # native sample between them.
+        np.testing.assert_allclose(owner.plot_ax.lines[0].get_xdata(), [0, .5, np.nan, 2])
+        np.testing.assert_allclose(owner.plot_ax.lines[1].get_xdata(), [0, np.nan, 2])
         self.assertIn("9 GHz", owner.plot_ax.lines[1].get_label())
 
     def test_fixed_cuts_are_never_silently_moved(self):

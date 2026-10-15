@@ -93,7 +93,13 @@ class NativeOverlayReplayTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 axis = self._plot(mode)
                 self.assertEqual(len(axis.lines), 3)
-                self.assertIn("fine | VV", axis.lines[-1].get_label())
+                # Azimuth curves are labeled "fine | VV, ...". Frequency and
+                # elevation sweeps share the interactive sweep labels, which
+                # name the polarization, the fixed cut, the statistic, and the
+                # azimuth coverage: "fine | Pol VV, El 0 deg, P50; n9/9".
+                label = axis.lines[-1].get_label()
+                self.assertRegex(label, r"^fine \| (Pol )?VV,")
+                self.assertNotIn("HH", label)
                 self.assertEqual(axis.lines[-1].get_linestyle(), "-")
 
     def test_all_polarizations_default_to_solid(self):
@@ -108,8 +114,15 @@ class NativeOverlayReplayTests(unittest.TestCase):
 
     def test_disconnected_selections_do_not_include_unselected_native_intervals(self):
         axis = self._plot("azimuth_rect", azimuths=[-2.0, 2.0])
+        self.assertEqual(len(axis.lines), 4)
         for line in axis.lines:
-            np.testing.assert_allclose(line.get_xdata(), [-2.0, 2.0])
+            # Two disconnected cuts: neither dataset contributes native samples
+            # between them, a NaN break keeps the cuts from being joined by a
+            # line, and the isolated samples are drawn as markers.
+            np.testing.assert_allclose(line.get_xdata(), [-2.0, np.nan, 2.0])
+            self.assertEqual(np.isnan(line.get_ydata()).tolist(), [False, True, False])
+            self.assertEqual(line.get_marker(), ".")
+            self.assertEqual(list(line.get_markevery()), [0, 2])
 
     def test_singleton_azimuth_and_fixed_cuts_are_not_interpolated(self):
         self.fine.azimuths += np.deg2rad(0.2)
