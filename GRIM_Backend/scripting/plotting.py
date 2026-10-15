@@ -526,12 +526,14 @@ def plot_datasets(
                         draw_y,
                         **plot_common.singleton_line_markers(draw_x, draw_y),
                         linestyle="-",
+                        # Same label as the interactive azimuth modes, so a
+                        # replayed script reproduces the GUI legend.
                         label=(
-                            f"{name} | {polarization}, "
-                            f"{float(plot_common.values_for_display(reference, dataset, 'frequency', [dataset.frequencies[fi]])[0]):g} "
+                            f"{name} | Pol {polarization}, Freq "
+                            f"{float(plot_common.values_for_display(reference, dataset, 'frequency', [dataset.frequencies[fi]])[0]):.12g} "
                             f"{plot_common.axis_unit(reference, 'frequency')}, "
                             f"{plot_common.angular_axis_name(reference, 'elevation')} "
-                            f"{float(plot_common.values_for_display(reference, dataset, 'elevation', [dataset.elevations[ei]])[0]):g} "
+                            f"{float(plot_common.values_for_display(reference, dataset, 'elevation', [dataset.elevations[ei]])[0]):.12g} "
                             f"{plot_common.axis_unit(reference, 'elevation')}"
                         ),
                     )

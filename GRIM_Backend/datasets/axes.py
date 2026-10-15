@@ -1099,6 +1099,43 @@ class GridAxesMixin:
         existing_imag[take] = incoming_imag[take]
         return conflict
 
+    @staticmethod
+    def _merge_equivalent_field_blocks(existing, incoming, *, context, raw):
+        """Merge complementary/equivalent complex samples or reject a conflict.
+
+        ``existing`` is written in place; missing samples are NaN pairs.  A
+        normalized physical field follows the former power/phase rule
+        (1e-6 relative power, 1e-5 rad phase, zero samples never disagree
+        in phase); a raw solver field (``raw=True``) follows the former
+        raw-pair rule (1e-12 relative per component).  Returns the conflict
+        mask.
+        """
+        existing = np.asarray(existing)
+        incoming = np.asarray(incoming)
+        existing_finite = np.isfinite(existing.real) & np.isfinite(existing.imag)
+        incoming_finite = np.isfinite(incoming.real) & np.isfinite(incoming.imag)
+        both = existing_finite & incoming_finite
+        if raw:
+            equivalent = (
+                np.isclose(existing.real, incoming.real, rtol=1.0e-12, atol=1.0e-15)
+                & np.isclose(existing.imag, incoming.imag, rtol=1.0e-12, atol=1.0e-15)
+            )
+            message = "conflicting authoritative raw seam samples would overlap"
+        else:
+            existing_power = existing.real * existing.real + existing.imag * existing.imag
+            incoming_power = incoming.real * incoming.real + incoming.imag * incoming.imag
+            power_equal = np.isclose(existing_power, incoming_power, rtol=1.0e-6, atol=1.0e-12)
+            both_zero = (existing_power == 0.0) & (incoming_power == 0.0)
+            phase_delta = np.abs(np.angle(existing * np.conj(incoming)))
+            equivalent = power_equal & (both_zero | (phase_delta <= 1.0e-5))
+            message = "conflicting finite seam samples would overlap"
+        conflict = both & ~equivalent
+        if np.any(conflict):
+            raise ValueError(f"{context}: {message}")
+        take = ~existing_finite & incoming_finite
+        existing[take] = incoming[take]
+        return conflict
+
     def mirror_about_azimuth(self, azimuth_deg: float):
         """Mirror azimuth axis about a reference angle and return a new grid.
 

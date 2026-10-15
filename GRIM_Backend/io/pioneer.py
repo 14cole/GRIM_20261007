@@ -760,8 +760,9 @@ class PioFormatMixin:
             )
 
 
-        power_slice = self.power[source_azimuth_slice, el_idx, :, pol_idx]
-        phase_slice = self.phase[source_azimuth_slice, el_idx, :, pol_idx]
+        power_slice, phase_slice = self.power_phase_slice(
+            (source_azimuth_slice, el_idx, slice(None), pol_idx)
+        )
         phase_missing = np.isfinite(power_slice) & ~np.isfinite(phase_slice)
         if np.any(phase_missing):
             raise ValueError(

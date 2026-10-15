@@ -245,6 +245,36 @@ def audit_dataset(self):
             stop = start + _JOIN_MERGE_BLOCK_CELLS
             yield tuple(np.asarray(array.flat[start:stop]) for array in arrays)
 
+    def iter_sample_blocks(power, phase, *, want_power, want_phase):
+        """Yield ``(power_block, phase_block)`` pairs; either may be ``None``.
+
+        Canonical complex storage derives both components of a block from
+        one read of the stored field.  Any other storage (legacy writable
+        arrays, power-only grids, mismatched shapes) keeps the former
+        independent passes, one component at a time.
+        """
+        single_read = (
+            want_power and want_phase
+            and not self._legacy_samples and self.storage_kind == "complex"
+            and power.shape == phase.shape
+        )
+        if single_read:
+            for start in range(0, power.size, _JOIN_MERGE_BLOCK_CELLS):
+                stop = min(start + _JOIN_MERGE_BLOCK_CELLS, power.size)
+                coordinates = np.unravel_index(np.arange(start, stop, dtype=np.intp), power.shape)
+                power_block, phase_block = self.power_phase_slice(coordinates)
+                yield np.asarray(power_block), np.asarray(phase_block)
+            return
+        if want_power and want_phase and power.shape == phase.shape:
+            yield from iter_blocks(power, phase)
+            return
+        if want_power:
+            for (power_block,) in iter_blocks(power):
+                yield power_block, None
+        if want_phase:
+            for (phase_block,) in iter_blocks(phase):
+                yield None, phase_block
+
     numeric_axes = {}
     axes_well_formed = True
     axes_strictly_increasing = True
@@ -412,15 +442,28 @@ def audit_dataset(self):
     if not phase_numeric:
         add_issue(errors, "non_numeric_phase", "rcs_phase must be real numeric")
 
-    if power_numeric:
-        finite_power_count = 0
-        missing_power_count = 0
-        infinite_power_count = 0
-        negative_power_count = 0
-        zero_power_count = 0
-        minimum_power = None
-        maximum_power = None
-        for (power_block,) in iter_blocks(power):
+    phase_metric = metrics["phase"]
+    raw_phase_wrap = str((self.units or {}).get("phase_wrap", "")).strip()
+    declared_phase_wrap = raw_phase_wrap or None
+    valid_phase_wrap = declared_phase_wrap in {None, "0_360", "-180_180"}
+    phase_counts = {
+        "finite_phase_count": 0,
+        "missing_phase_count": 0,
+        "infinite_phase_count": 0,
+        "outside_minus_pi_pi_count": 0,
+        "outside_declared_wrap_count": 0,
+    }
+    finite_power_count = 0
+    missing_power_count = 0
+    infinite_power_count = 0
+    negative_power_count = 0
+    zero_power_count = 0
+    minimum_power = None
+    maximum_power = None
+    for power_block, phase_block in iter_sample_blocks(
+        power, phase, want_power=power_numeric, want_phase=phase_numeric
+    ):
+        if power_block is not None:
             finite = np.isfinite(power_block)
             finite_values = power_block[finite]
             finite_power_count += int(finite_values.size)
@@ -433,6 +476,32 @@ def audit_dataset(self):
                 block_max = float(np.max(finite_values))
                 minimum_power = block_min if minimum_power is None else min(minimum_power, block_min)
                 maximum_power = block_max if maximum_power is None else max(maximum_power, block_max)
+        if phase_block is not None:
+            finite_phase = np.isfinite(phase_block)
+            phase_counts["finite_phase_count"] += int(np.count_nonzero(finite_phase))
+            phase_counts["missing_phase_count"] += int(np.count_nonzero(np.isnan(phase_block)))
+            phase_counts["infinite_phase_count"] += int(np.count_nonzero(np.isinf(phase_block)))
+            phase_counts["outside_minus_pi_pi_count"] += int(
+                np.count_nonzero(
+                    finite_phase & ((phase_block < -np.pi) | (phase_block >= np.pi))
+                )
+            )
+            if declared_phase_wrap == "0_360":
+                phase_counts["outside_declared_wrap_count"] += int(
+                    np.count_nonzero(
+                        finite_phase
+                        & ((phase_block < 0.0) | (phase_block >= 2.0 * np.pi))
+                    )
+                )
+            elif declared_phase_wrap == "-180_180":
+                phase_counts["outside_declared_wrap_count"] += int(
+                    np.count_nonzero(
+                        finite_phase
+                        & ((phase_block < -np.pi) | (phase_block >= np.pi))
+                    )
+                )
+
+    if power_numeric:
         grid_metric.update(
             {
                 "finite_power_count": finite_power_count,
@@ -463,10 +532,6 @@ def audit_dataset(self):
                 minimum=grid_metric["minimum_finite_power"],
             )
 
-    phase_metric = metrics["phase"]
-    raw_phase_wrap = str((self.units or {}).get("phase_wrap", "")).strip()
-    declared_phase_wrap = raw_phase_wrap or None
-    valid_phase_wrap = declared_phase_wrap in {None, "0_360", "-180_180"}
     if not valid_phase_wrap:
         add_issue(
             errors,
@@ -477,41 +542,17 @@ def audit_dataset(self):
     phase_metric.update(
         {
             "declared_wrap": declared_phase_wrap,
-            "finite_phase_count": 0,
-            "missing_phase_count": 0,
-            "infinite_phase_count": 0,
+            "finite_phase_count": phase_counts["finite_phase_count"],
+            "missing_phase_count": phase_counts["missing_phase_count"],
+            "infinite_phase_count": phase_counts["infinite_phase_count"],
             "power_without_phase_count": 0,
             "phase_without_power_count": 0,
             "finite_complex_count": 0,
-            "outside_minus_pi_pi_count": 0,
-            "outside_declared_wrap_count": 0,
+            "outside_minus_pi_pi_count": phase_counts["outside_minus_pi_pi_count"],
+            "outside_declared_wrap_count": phase_counts["outside_declared_wrap_count"],
         }
     )
     if phase_numeric:
-        for (phase_block,) in iter_blocks(phase):
-            finite_phase = np.isfinite(phase_block)
-            phase_metric["finite_phase_count"] += int(np.count_nonzero(finite_phase))
-            phase_metric["missing_phase_count"] += int(np.count_nonzero(np.isnan(phase_block)))
-            phase_metric["infinite_phase_count"] += int(np.count_nonzero(np.isinf(phase_block)))
-            phase_metric["outside_minus_pi_pi_count"] += int(
-                np.count_nonzero(
-                    finite_phase & ((phase_block < -np.pi) | (phase_block >= np.pi))
-                )
-            )
-            if declared_phase_wrap == "0_360":
-                phase_metric["outside_declared_wrap_count"] += int(
-                    np.count_nonzero(
-                        finite_phase
-                        & ((phase_block < 0.0) | (phase_block >= 2.0 * np.pi))
-                    )
-                )
-            elif declared_phase_wrap == "-180_180":
-                phase_metric["outside_declared_wrap_count"] += int(
-                    np.count_nonzero(
-                        finite_phase
-                        & ((phase_block < -np.pi) | (phase_block >= np.pi))
-                    )
-                )
         if phase_metric["infinite_phase_count"]:
             add_issue(
                 errors,
@@ -529,7 +570,9 @@ def audit_dataset(self):
             )
 
     if power_numeric and phase_numeric and power.shape == phase.shape:
-        for power_block, phase_block in iter_blocks(power, phase):
+        for power_block, phase_block in iter_sample_blocks(
+            power, phase, want_power=True, want_phase=True
+        ):
             finite_power = np.isfinite(power_block)
             finite_phase = np.isfinite(phase_block)
             phase_metric["power_without_phase_count"] += int(

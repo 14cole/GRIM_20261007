@@ -249,10 +249,15 @@ uses the available selection or defaults and reports the adjustment.
 Ordinary azimuth, frequency, and elevation overlays draw each dataset at its
 own sampled coordinates within the selected spans. Disconnected selections
 remain separate selections; no interpolation or nearest-cut substitution is
-performed. Point-by-point bands and difference calculations still use aligned
-samples. Select several polarizations to draw separate labeled curves in
-azimuth, frequency, elevation, CDF, or Sector Stats plots. All data curves
-default to solid lines; use the line-type controls to choose another style.
+performed. They are drawn as separate runs with a break between them, and a
+selected sample with no neighbor is shown as a point marker. Point-by-point
+bands and difference calculations still use aligned samples. Select several
+polarizations to draw separate labeled curves in azimuth, frequency,
+elevation, CDF, or Sector Stats plots. Frequency and elevation sweep legend
+entries name the polarization, the fixed cut, the azimuth statistic (P50 by
+default), and how many of the selected azimuth samples were finite, for
+example n9/9. All data curves default to solid lines; use the line-type
+controls to choose another style.
 PBP draws a separate band for each selected dataset and polarization, bounding
 that dataset's selected cuts. Bands follow the normal plot color sequence
 (blue first) with transparent fills. With Hold enabled, each Plot adds new

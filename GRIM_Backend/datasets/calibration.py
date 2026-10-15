@@ -372,14 +372,23 @@ class GridCalibrationMixin:
                 np.asarray(grid.azimuths, dtype=np.float64),
                 np.asarray(grid.elevations, dtype=np.float64),
                 np.asarray(grid.frequencies, dtype=np.float64),
-                np.asarray(grid.power, dtype=np.float64),
-                np.asarray(grid.phase, dtype=np.float64),
             ):
                 _update_array("modeled-array", values)
 
-
             cells_per_azimuth = int(np.prod(grid.power.shape[1:]))
             azimuth_block = max(1, 262_144 // max(1, cells_per_azimuth))
+            # Leading-axis slabs of a C-ordered array are consecutive byte
+            # ranges, so streaming them digests exactly the bytes of the
+            # whole derived array without materialising it.
+            for component in (grid.power, grid.phase):
+                digest.update(b"modeled-array\0")
+                digest.update(str(tuple(component.shape)).encode("ascii") + b"\0")
+                for start in range(0, component.shape[0], azimuth_block):
+                    slab = np.ascontiguousarray(
+                        np.asarray(component[start:start + azimuth_block], dtype=np.float64)
+                    )
+                    digest.update(slab.tobytes(order="C"))
+
             digest.update(b"authoritative-complex-field\0")
             digest.update(str(grid.power.shape).encode("ascii") + b"\0")
             for start in range(0, len(grid.azimuths), azimuth_block):

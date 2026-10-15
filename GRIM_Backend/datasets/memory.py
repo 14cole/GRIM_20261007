@@ -353,15 +353,20 @@ def _preflight_native_archive_allocation(
     if not ((has_version and (has_complex or has_power)) or (has_power and has_phase)):
         raise ValueError(f"{path} is not a supported .grim file (missing sample arrays)")
     retained_bytes = sum(member_payload_bytes.values())
-    # Current complex archives need one canonical copy, not full-grid power,
-    # phase, and normalized-complex validation copies. Account for masks during
-    # construction and the bounded raw consistency scan's floating work arrays.
+    # A complex64/complex128 member without a retained raw pair is adopted by
+    # load() as the stored field after its bounded block validation, so only
+    # that scan's scratch is transient.  Any other complex archive still pays
+    # one canonical copy plus full-grid masks during construction.
     sample_bytes = sum(member_payload_bytes.get(key, 0) for key in
                        ("rcs_complex", "rcs_power", "rcs_phase"))
     if has_complex:
         cells = member_element_counts.get("rcs_complex", 0)
         scratch = min(cells, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS) * 128
-        validation_bytes = sample_bytes + max(3 * cells, scratch)
+        adopted = (
+            member_payload_bytes.get("rcs_complex", 0) in (8 * cells, 16 * cells)
+            and not any(key in member_payload_bytes for key in ("rcs_amp_real", "rcs_amp_imag"))
+        )
+        validation_bytes = scratch if adopted else sample_bytes + max(3 * cells, scratch)
     else:
         validation_bytes = 3 * sample_bytes if has_power and not has_phase else sample_bytes
     peak_bytes = max(

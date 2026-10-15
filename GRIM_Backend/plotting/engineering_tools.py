@@ -42,11 +42,16 @@ def dataset_cut(dataset, axis="frequency", *, azimuth_index=0, elevation_index=0
     indices = [int(azimuth_index), int(elevation_index), int(frequency_index), pol_index]
     indices[numeric_axes.index(axis)] = slice(None)
     selection = tuple(indices)
-    power = np.array(dataset.power[selection], dtype=float, copy=True).reshape(-1)
     field = np.array(dataset.rcs_slice(selection), dtype=complex, copy=True).reshape(-1)
     # In particular, sigma_2d raw amplitudes must first receive their native
     # frequency-dependent normalization; rcs_slice owns that contract.
     authoritative = np.isfinite(field.real) & np.isfinite(field.imag)
+    if dataset.storage_kind == "complex":
+        # Canonical complex storage has no power-only sample, so the field
+        # read above already carries every power value.
+        power = np.full(field.shape, np.nan, dtype=float)
+    else:
+        power = np.array(dataset.power[selection], dtype=float, copy=True).reshape(-1)
     power[authoritative] = np.abs(field[authoritative]) ** 2
     x = np.array(dataset.get_axis(axis), dtype=float, copy=True)
     frequencies = x if axis == "frequency" else float(dataset.frequencies[frequency_index])

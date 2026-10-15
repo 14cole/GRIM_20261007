@@ -219,18 +219,37 @@ def export_dataset(
             _available_path(target, overwrite)
             with target.open("w", encoding="utf-8") as stream:
                 stream.write("# frequency_GHz azimuth_deg rcs_dBke phase_deg\n")
-                for iff, frequency in enumerate(grid.frequencies):
-                    wavelength = 299_792_458.0 / (float(frequency) * 1e9)
-                    for ia, azimuth in enumerate(grid.azimuths):
-                        sigma = float(grid.rcs_power[ia, ie, iff, ip])
-                        dbke = 10.0 * np.log10(sigma * 2.0 * np.pi / wavelength)
-                        phase = np.degrees(float(grid.rcs_phase[ia, ie, iff, ip]))
-                        stream.write(
-                            f"{float(frequency):.17g} {float(azimuth):.17g} "
-                            f"{dbke:.17g} {phase:.17g}\n"
-                        )
+                stream.writelines(_out_rows(grid, ie, ip))
             outputs.append(target)
     return tuple(outputs)
+
+
+def _out_rows(grid: 'Any', elevation_index: 'int', polarization_index: 'int'):
+    """Yield the ``.out`` rows of one elevation/polarization cut.
+
+    The text is identical to the former per-cell loop (same float64
+    arithmetic, same ``.17g`` formatting), but the cut's power and phase are
+    read once through the dataset's derived accessors instead of touching
+    the legacy ``rcs_power``/``rcs_phase`` attributes per cell.  Those legacy
+    reads materialise and hash whole-grid arrays, and every later sample
+    read on that dataset re-hashes them.
+    """
+    selection = (slice(None), elevation_index, slice(None), polarization_index)
+    reader = getattr(grid, "power_phase_slice", None)
+    if reader is not None:
+        power, phase = reader(selection)
+    else:
+        power, phase = grid.power[selection], grid.phase[selection]
+    power = np.asarray(power, dtype=np.float64)
+    phase = np.asarray(phase, dtype=np.float64)
+    azimuths = [float(value) for value in np.asarray(grid.azimuths).tolist()]
+    for iff, frequency in enumerate(grid.frequencies):
+        frequency = float(frequency)
+        wavelength = 299_792_458.0 / (frequency * 1e9)
+        dbke = 10.0 * np.log10(power[:, iff] * 2.0 * np.pi / wavelength)
+        degrees = np.degrees(phase[:, iff])
+        for azimuth, level, angle in zip(azimuths, dbke.tolist(), degrees.tolist()):
+            yield f"{frequency:.17g} {azimuth:.17g} {level:.17g} {angle:.17g}\n"
 
 
 def convert_dataset(

@@ -93,12 +93,13 @@ class NativeOverlayReplayTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 axis = self._plot(mode)
                 self.assertEqual(len(axis.lines), 3)
-                # Azimuth curves are labeled "fine | VV, ...". Frequency and
+                # Azimuth curves carry the interactive azimuth label
+                # "fine | Pol VV, Freq 10 GHz, Elevation 0 deg"; frequency and
                 # elevation sweeps share the interactive sweep labels, which
                 # name the polarization, the fixed cut, the statistic, and the
                 # azimuth coverage: "fine | Pol VV, El 0 deg, P50; n9/9".
                 label = axis.lines[-1].get_label()
-                self.assertRegex(label, r"^fine \| (Pol )?VV,")
+                self.assertRegex(label, r"^fine \| Pol VV, ")
                 self.assertNotIn("HH", label)
                 self.assertEqual(axis.lines[-1].get_linestyle(), "-")
 

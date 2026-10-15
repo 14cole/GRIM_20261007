@@ -552,3 +552,294 @@ def test_phase_reads_are_bit_identical_with_one_scratch_mask(dtype, wrap):
     # float64, 1.25x for float32); the former angle/where chain peaked at
     # 2.1x to 3.3x.
     assert _peak_bytes(lambda: np.asarray(ds.phase)) < 1.5 * field.size * real_dtype.itemsize
+
+
+@pytest.mark.parametrize("kind", ["complex", "raw_field", "power_phase", "legacy"])
+def test_power_phase_slice_matches_the_separate_reads_from_one_field_read(kind, monkeypatch):
+    shape = (64, 2, 16, 2)
+    field = _field(shape)
+    if kind == "raw_field":
+        ds = RcsGrid(*_axes(shape), rcs=field, rcs_storage_domain="raw_field",
+                     units=_sigma_units("sigma_2d"))
+    elif kind == "power_phase":
+        power, phase = np.abs(field) ** 2, np.angle(field)
+        phase[2, 0, :, 0] = np.nan  # finite power without a phase
+        power[0, 0, 0, 0] = phase[0, 0, 0, 0] = np.nan
+        ds = RcsGrid(*_axes(shape), rcs_power=power, rcs_phase=phase)
+        assert ds.storage_kind == "power_phase"
+    else:
+        ds = RcsGrid(*_axes(shape), rcs=field)
+        if kind == "legacy":
+            ds.rcs_power  # expose the writable arrays
+            assert ds._legacy_samples
+    for selection in (Ellipsis, (slice(None), 1, slice(None), 0),
+                      np.ix_([1, 5], [0], [0, 3], [1]), (3, 0, 2, 1)):
+        power, phase = ds.power_phase_slice(selection)
+        np.testing.assert_array_equal(power, ds.power_slice(selection))
+        np.testing.assert_array_equal(phase, ds.phase_slice(selection))
+        assert not np.asarray(power).flags.writeable and not np.asarray(phase).flags.writeable
+    if kind in ("complex", "raw_field"):
+        reads = []
+        original = RcsGrid._complex_samples
+
+        def counting(self, selection, *, owned):
+            reads.append(owned)
+            return original(self, selection, owned=owned)
+
+        monkeypatch.setattr(RcsGrid, "_complex_samples", counting)
+        ds.power_phase_slice((slice(None), 0, slice(None), 0))
+        assert reads == [False]
+
+
+def _overlapping_pair(seed, *, raw_field, scale=1.0):
+    """Two 2-D width grids sharing 16 azimuths with identical samples there."""
+    shape = (96, 1, 32, 2)
+    field = _field(shape, seed=seed)
+    azimuths = np.arange(shape[0], dtype=float)
+    frequencies = np.linspace(8.0, 12.0, shape[2])
+    units = _sigma_units("sigma_2d")
+    kwargs = {"rcs_storage_domain": "raw_field"} if raw_field else {}
+    left = RcsGrid(azimuths[:64], [0.0], frequencies, ["VV", "HH"],
+                   rcs=field[:64].copy(), units=units, **kwargs)
+    right = RcsGrid(azimuths[48:], [0.0], frequencies, ["VV", "HH"],
+                    rcs=(field[48:] * scale).copy(), units=units, **kwargs)
+    return left, right
+
+
+def _former_join(left, right, **kwargs):
+    """The power/phase merge, reached by exposing the legacy arrays first."""
+    left.rcs_power
+    right.rcs_power
+    return RcsGrid.join_many(left, right, **kwargs)
+
+
+@pytest.mark.parametrize("raw_field", [True, False])
+def test_join_of_complex_inputs_merges_the_stored_field(raw_field):
+    joined = RcsGrid.join_many(*_overlapping_pair(1, raw_field=raw_field))
+    former = _former_join(*_overlapping_pair(1, raw_field=raw_field))
+    assert joined.storage_kind == "complex"
+    assert joined.storage_domain == ("raw_field" if raw_field else "physical")
+    assert joined.azimuths.size == 96
+    np.testing.assert_allclose(joined.rcs, former.rcs, rtol=1e-12, atol=0)
+    np.testing.assert_array_equal(np.isnan(joined.rcs.real), np.isnan(former.rcs.real))
+    if raw_field:
+        # The raw solver field itself is merged, so the raw pair is exact.
+        np.testing.assert_array_equal(joined.extra["rcs_amp_real"], former.extra["rcs_amp_real"])
+        np.testing.assert_array_equal(joined.extra["rcs_amp_imag"], former.extra["rcs_amp_imag"])
+    else:
+        assert "rcs_amp_real" not in joined.extra
+    for overlap in ("first", "last"):
+        left, right = _overlapping_pair(2, raw_field=raw_field, scale=2.0)
+        policy = RcsGrid.join_many(left, right, overlap=overlap)
+        source = left if overlap == "first" else right
+        np.testing.assert_allclose(policy.rcs[48:64], source.rcs[-16:] if overlap == "first" else source.rcs[:16], rtol=1e-12)
+        former_policy = _former_join(*_overlapping_pair(2, raw_field=raw_field, scale=2.0), overlap=overlap)
+        np.testing.assert_allclose(policy.rcs, former_policy.rcs, rtol=1e-12, atol=0)
+    with pytest.raises(ValueError, match="conflicting finite samples overlap during join"):
+        RcsGrid.join_many(*_overlapping_pair(3, raw_field=raw_field, scale=1.0 + 1e-3))
+
+
+def test_join_of_physical_fields_keeps_the_former_tolerances():
+    left, right = _overlapping_pair(4, raw_field=False)
+    nudged = right.rcs
+    nudged[:16] *= np.exp(1j * 5e-6)  # inside the 1e-5 rad phase rule
+    RcsGrid.join_many(left, RcsGrid(right.azimuths, right.elevations, right.frequencies,
+                                    right.polarizations, rcs=nudged, units=right.units))
+    nudged = right.rcs
+    nudged[:16] *= np.exp(1j * 2e-5)  # outside it
+    with pytest.raises(ValueError, match="conflicting finite samples overlap during join"):
+        RcsGrid.join_many(left, RcsGrid(right.azimuths, right.elevations, right.frequencies,
+                                        right.polarizations, rcs=nudged, units=right.units))
+    nudged = right.rcs
+    nudged[:16] *= 1.0 + 2e-6  # outside the 1e-6 relative power rule (power scales twice)
+    with pytest.raises(ValueError, match="conflicting finite samples overlap during join"):
+        RcsGrid.join_many(left, RcsGrid(right.azimuths, right.elevations, right.frequencies,
+                                        right.polarizations, rcs=nudged, units=right.units))
+
+
+def test_mixed_storage_join_still_uses_the_power_and_phase_merge():
+    def pair():
+        left, _ = _overlapping_pair(5, raw_field=True)
+        whole = RcsGrid(np.arange(96, dtype=float), [0.0], left.frequencies, ["VV", "HH"],
+                        rcs=_field((96, 1, 32, 2), seed=5), rcs_storage_domain="raw_field",
+                        units=left.units)
+        # The same physical response, stored normalized rather than raw.
+        right = RcsGrid(whole.azimuths[48:], [0.0], left.frequencies, ["VV", "HH"],
+                        rcs=whole.rcs[48:], units=left.units)
+        return left, right
+
+    left, right = pair()
+    assert RcsGrid._complex_join_domain([left, right]) is None
+    joined = RcsGrid.join_many(left, right)
+    former = _former_join(*pair())
+    np.testing.assert_allclose(joined.rcs, former.rcs, rtol=1e-12, atol=0)
+    assert "rcs_amp_real" not in joined.extra
+
+
+def test_complex_join_retains_one_field_instead_of_power_phase_and_raw_arrays():
+    shape = (256, 1, 256, 2)
+    field = _field(shape, seed=6)
+    azimuths = np.arange(shape[0], dtype=float)
+    frequencies = np.linspace(8.0, 12.0, shape[2])
+    units = _sigma_units("sigma_2d")
+
+    def pair():
+        return (
+            RcsGrid(azimuths[:160], [0.0], frequencies, ["VV", "HH"], rcs=field[:160].copy(),
+                    rcs_storage_domain="raw_field", units=units),
+            RcsGrid(azimuths[128:], [0.0], frequencies, ["VV", "HH"], rcs=field[128:].copy(),
+                    rcs_storage_domain="raw_field", units=units),
+        )
+
+    left, right = pair()
+    peak = _peak_bytes(lambda: RcsGrid.join_many(left, right))
+    former_left, former_right = pair()
+    former_left.rcs_power
+    former_right.rcs_power
+    former_peak = _peak_bytes(lambda: RcsGrid.join_many(former_left, former_right))
+    # One complex128 output plus bounded block scratch, against power, phase
+    # and two raw float64 arrays plus the constructor's complex conversion.
+    assert peak < 0.6 * former_peak
+    assert peak < 2.5 * field.nbytes
+
+
+def test_overlap_reads_each_input_once(monkeypatch):
+    shape = (40, 1, 8, 2)
+    field = _field(shape, seed=8)
+    axes = _axes(shape)
+    grids = [
+        RcsGrid(*axes, rcs=field),
+        RcsGrid(*axes, rcs=field, rcs_storage_domain="raw_field", units=_sigma_units("sigma_2d")),
+    ]
+    power, phase = np.abs(field) ** 2, np.angle(field)
+    phase[3, 0, :, 1] = np.nan
+    grids.append(RcsGrid(*axes, rcs_power=power, rcs_phase=phase))
+    reads = []
+    for name in ("_sample_kwargs", "power_phase_slice", "rcs_slice", "power_slice", "phase_slice"):
+        original = getattr(RcsGrid, name)
+
+        def counting(self, *args, _name=name, _original=original, **kwargs):
+            reads.append(_name)
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(RcsGrid, name, counting)
+    results = RcsGrid.overlap_many(*grids)
+    # One owned read per complex input (the physical one goes through
+    # rcs_slice inside _sample_kwargs) and one paired read for the polar
+    # input, which copies its two stored arrays once each.
+    assert reads.count("_sample_kwargs") == 2 and reads.count("power_phase_slice") == 1
+    assert reads.count("rcs_slice") == 1
+    assert reads.count("power_slice") == 1 and reads.count("phase_slice") == 1
+    assert results[1].storage_domain == "raw_field"
+    missing = np.isnan(np.asarray(results[2].power))
+    for result in results:
+        np.testing.assert_array_equal(np.isnan(np.asarray(result.power)), missing)
+    # The common polarization axis is sorted; compare in that order.
+    order = [list(axes[3]).index(label) for label in results[0].polarizations]
+    np.testing.assert_allclose(results[0].rcs, field[..., order], rtol=0, atol=0, equal_nan=True)
+
+
+def test_elevation_pair_relabel_merges_the_stored_field():
+    shape = (180, 2, 4, 2)
+    field = _field(shape, seed=9)
+    azimuths = np.arange(shape[0], dtype=float)
+    units = _sigma_units("sigma_2d")
+
+    def grid():
+        return RcsGrid(azimuths, [-5.0, 5.0], np.linspace(8.0, 12.0, 4), ["VV", "HH"],
+                       rcs=field.copy(), rcs_storage_domain="raw_field", units=units)
+
+    merged = grid().combine_elevation_pair_to_azimuth_360(-5.0, 5.0, assumptions_attested=True)
+    former_source = grid()
+    former_source.rcs_power
+    former = former_source.combine_elevation_pair_to_azimuth_360(-5.0, 5.0, assumptions_attested=True)
+    assert merged.storage_kind == "complex" and merged.storage_domain == "raw_field"
+    np.testing.assert_array_equal(merged.azimuths, former.azimuths)
+    np.testing.assert_allclose(merged.rcs, former.rcs, rtol=1e-12, atol=0)
+    np.testing.assert_array_equal(merged.extra["rcs_amp_real"], former.extra["rcs_amp_real"])
+    np.testing.assert_array_equal(merged.extra["rcs_amp_imag"], former.extra["rcs_amp_imag"])
+    assert "elevation_pair_to_azimuth_json" in merged.extra
+
+
+def _former_grid_content_sha256(grid):
+    """The whole-array hash the range-calibration provenance used to compute."""
+    import hashlib
+    import json
+
+    digest = hashlib.sha256()
+    digest.update(b"grim.range-calibration-grid-id.v2\0")
+
+    def _update_array(label, values):
+        contiguous = np.ascontiguousarray(values)
+        digest.update(label.encode("ascii") + b"\0")
+        digest.update(str(contiguous.shape).encode("ascii") + b"\0")
+        digest.update(contiguous.tobytes(order="C"))
+
+    for values in (
+        np.asarray(grid.azimuths, dtype=np.float64),
+        np.asarray(grid.elevations, dtype=np.float64),
+        np.asarray(grid.frequencies, dtype=np.float64),
+        np.asarray(grid.power, dtype=np.float64),
+        np.asarray(grid.phase, dtype=np.float64),
+    ):
+        _update_array("modeled-array", values)
+    cells_per_azimuth = int(np.prod(grid.power.shape[1:]))
+    azimuth_block = max(1, 262_144 // max(1, cells_per_azimuth))
+    digest.update(b"authoritative-complex-field\0")
+    digest.update(str(grid.power.shape).encode("ascii") + b"\0")
+    for start in range(0, len(grid.azimuths), azimuth_block):
+        field = np.asarray(grid.rcs_slice((slice(start, start + azimuth_block), slice(None),
+                                           slice(None), slice(None))), dtype=np.complex128)
+        _update_array("field-real", field.real)
+        _update_array("field-imag", field.imag)
+    digest.update(json.dumps([str(value) for value in grid.polarizations.tolist()],
+                             separators=(",", ":")).encode("utf-8"))
+    digest.update(json.dumps(dict(grid.units or {}), sort_keys=True, separators=(",", ":"),
+                             default=str).encode("utf-8"))
+    convention_metadata = {
+        key: grid._declared_scalar_metadata(key)
+        for key in ("phase_reference", "time_convention", "polarization_basis", "amplitude_convention")
+    }
+    digest.update(json.dumps(convention_metadata, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def test_range_calibration_hash_streams_the_same_bytes_without_whole_arrays():
+    import json
+
+    shape = (70_000, 1, 2, 2)  # 4 cells per azimuth: the hash walks several slabs
+    units = {"azimuth": "deg", "elevation": "deg", "frequency": "GHz",
+             "rcs_log_unit": "dBsm", "rcs_linear_quantity": "sigma_3d",
+             "angular_coordinate_system": "conic"}
+
+    def grid(seed):
+        return RcsGrid(np.linspace(-180.0, 180.0, shape[0], endpoint=False), [0.0], [9.0, 10.0],
+                       ["VV", "HH"], rcs=_field(shape, seed=seed), units=units)
+
+    exact = grid(11)
+    expected = _former_grid_content_sha256(exact)
+    result = grid(12).range_calibrate(grid(13), exact, 0.0, convention_attested=True)
+    provenance = json.loads(result.extra["range_calibration_json"])
+    assert provenance["exact_reference_content_sha256"] == expected
+    assert provenance["measured_calibration_content_sha256"] == _former_grid_content_sha256(grid(13))
+
+
+def test_native_preflight_charges_no_constructor_copy_for_adoptable_archives(tmp_path):
+    from GRIM_Backend.datasets import memory as memory_module
+
+    shape = (64, 1, 64, 2)
+    field = _field(shape, seed=14)
+    cells = field.size
+    scratch = min(cells, memory_module._RAW_COMPLEX_VALIDATION_BLOCK_CELLS) * 128
+    adoptable = RcsGrid(*_axes(shape), rcs=field).save(str(tmp_path / "adoptable.grim"))
+    report = memory_module._preflight_native_archive_allocation(adoptable)
+    assert report["estimated_peak_bytes"] <= report["retained_bytes"] + scratch
+    assert RcsGrid.load(adoptable, max_output_bytes=report["estimated_peak_bytes"]).rcs.shape == shape
+    # A physical field that keeps a raw pair in extra is still copied and masked.
+    retained = RcsGrid(*_axes(shape), rcs=field, units=_sigma_units("sigma_3d"),
+                       extra={"rcs_amp_real": (field / np.sqrt(4 * np.pi)).real,
+                              "rcs_amp_imag": (field / np.sqrt(4 * np.pi)).imag})
+    copied = retained.save(str(tmp_path / "retained.grim"))
+    copied_report = memory_module._preflight_native_archive_allocation(copied)
+    assert copied_report["estimated_peak_bytes"] - copied_report["retained_bytes"] >= field.nbytes + 3 * cells

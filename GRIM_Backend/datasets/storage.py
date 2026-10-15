@@ -359,7 +359,21 @@ class GridStorageMixin:
             return _readonly(np.array(self._phase[selection], copy=True))
         if self._complex is None:
             return _readonly(np.full(np.shape(self._power[selection]), np.nan, dtype=self.real_dtype))
+        return self._phase_from_field(self._complex_samples(selection, owned=False))
+
+    def power_phase_slice(self, selection=Ellipsis):
+        """Return ``(power, phase)`` for one selection from a single sample read.
+
+        Writers and audits that need both components otherwise fetch (and,
+        for a raw solver field, normalize) the same complex slice twice.
+        """
+        if self._legacy_samples or self._complex is None or self._phase is not None:
+            return self.power_slice(selection), self.phase_slice(selection)
         field = self._complex_samples(selection, owned=False)
+        return _readonly(self._squared_magnitude(field)), self._phase_from_field(field)
+
+    def _phase_from_field(self, field):
+        """Derive wrapped phase from a complex slice with two temporaries."""
         wrap = str(self.units.get("phase_wrap", "")).strip()
         # ``arctan2`` on the component views is what ``np.angle`` computes
         # and allocates only the result; one boolean scratch array then

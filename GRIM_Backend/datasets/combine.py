@@ -6,6 +6,7 @@ import json
 import numpy as np
 
 from GRIM_Backend.datasets.constants import _ADOPT_CLEAN_ARRAYS_TOKEN, _JOIN_MERGE_BLOCK_CELLS
+from GRIM_Backend.datasets.memory import _bounded_grid_selections
 
 
 def combine_datasets(
@@ -227,8 +228,12 @@ class GridCombineMixin:
                 len(polarizations),
             )
             expected_shapes.append(expected)
-            power = np.asarray(grid.power)
-            phase = np.asarray(grid.phase)
+            # Shapes and dtypes are properties of the derived components;
+            # the samples themselves are read in bounded blocks below, each
+            # block derived once from the stored field, instead of
+            # materialising the whole power and phase grids per input.
+            power = grid.power
+            phase = grid.phase
             if power.shape != expected or phase.shape != expected:
                 raise ValueError(
                     f"stitch input {input_index} sample shape does not match its axes"
@@ -242,14 +247,8 @@ class GridCombineMixin:
             negative_power_count = 0
             minimum_negative = None
             infinite_phase_count = 0
-            iterator = np.nditer(
-                (power, phase),
-                flags=["external_loop", "buffered", "zerosize_ok"],
-                op_flags=[["readonly"], ["readonly"]],
-                order="K",
-                buffersize=_JOIN_MERGE_BLOCK_CELLS,
-            )
-            for power_block, phase_block in iterator:
+            for selection in _bounded_grid_selections(expected, _JOIN_MERGE_BLOCK_CELLS):
+                power_block, phase_block = grid.power_phase_slice(selection)
                 power_block = np.asarray(power_block)
                 phase_block = np.asarray(phase_block)
                 infinite_power_count += int(np.count_nonzero(np.isinf(power_block)))
@@ -375,8 +374,10 @@ class GridCombineMixin:
             grids, mapped_indices, field_readers
         ):
             az_idx, el_idx, f_idx, p_idx = indices
-            incoming_power = np.asarray(grid.power)
-            incoming_phase = np.asarray(grid.phase)
+            # Derived components: each block slice below reads only that
+            # block of the stored field.
+            incoming_power = grid.power
+            incoming_phase = grid.phase
             pol_block = max(1, min(len(p_idx), _JOIN_MERGE_BLOCK_CELLS))
             freq_block = max(
                 1, min(len(f_idx), _JOIN_MERGE_BLOCK_CELLS // pol_block)
@@ -908,6 +909,85 @@ class GridCombineMixin:
             if len(normalized) == 1:
                 preserved_scalar_extra[key] = nonblank[0]
 
+        if len(grids) == 1:
+            az_union = np.array(ref.azimuths, copy=True)
+            el_union = np.array(ref.elevations, copy=True)
+            f_union = np.array(ref.frequencies, copy=True)
+            p_union = np.array(ref.polarizations, copy=True)
+        else:
+            az_union = cls._axis_union([grid.azimuths for grid in grids], tol=tol)
+            el_union = cls._axis_union([grid.elevations for grid in grids], tol=tol)
+            f_union = cls._axis_union([grid.frequencies for grid in grids], tol=tol)
+            p_union = cls._axis_union([grid.polarizations for grid in grids], tol=0.0)
+        shape = (len(az_union), len(el_union), len(f_union), len(p_union))
+
+        def aligned_indices(grid):
+            az_idx = cls._indices_for_axis_values(az_union, grid.azimuths, tol=tol)
+            el_idx = cls._indices_for_axis_values(el_union, grid.elevations, tol=tol)
+            f_idx = cls._indices_for_axis_values(f_union, grid.frequencies, tol=tol)
+            p_idx = cls._indices_for_axis_values(p_union, grid.polarizations, tol=0.0)
+            if az_idx is None or el_idx is None or f_idx is None or p_idx is None:
+                raise ValueError("failed to align a dataset during join")
+            for axis_name, indices, source_axis, axis_tol in (
+                ("azimuth", az_idx, grid.azimuths, tol),
+                ("elevation", el_idx, grid.elevations, tol),
+                ("frequency", f_idx, grid.frequencies, tol),
+                ("polarization", p_idx, grid.polarizations, 0.0),
+            ):
+                if len(indices) != np.asarray(source_axis).size:
+                    raise ValueError(
+                        f"cannot join: an input {axis_name} axis contains "
+                        "coordinates that collapse within the matching "
+                        f"tolerance ({axis_tol:g}); deduplicate that axis or "
+                        "use a smaller tolerance"
+                    )
+            return az_idx, el_idx, f_idx, p_idx
+
+        def finish(output_extra_items, samples):
+            output_extra = dict(preserved_scalar_extra)
+            if metadata_assumptions:
+                output_extra["merge_metadata_assumption_json"] = json.dumps(
+                    {
+                        "schema": "grim.merge-metadata-assumption.v1",
+                        "operation": "strict-merge",
+                        "input_count": len(grids),
+                        "one_sided_declarations": metadata_assumptions,
+                        "declarations_inferred": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            output_extra.update(output_extra_items)
+            history = str(ref.history or "").strip()
+            if metadata_assumptions:
+                note = (
+                    "Join allowed one-sided metadata as unspecified: "
+                    + ", ".join(sorted(metadata_assumptions))
+                )
+                history = f"{history}\n{note}" if history else note
+            return cls(
+                az_union,
+                el_union,
+                f_union,
+                p_union,
+                **samples,
+                rcs_domain="power_phase",
+                source_path=ref.source_path,
+                history=history,
+                units=dict(ref.units),
+                extra=output_extra,
+                _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
+            )
+
+        complex_domain = cls._complex_join_domain(grids)
+        if complex_domain is not None:
+            joined = cls._join_complex_fields(
+                grids, shape, complex_domain, aligned_indices,
+                overlap=overlap, max_output_bytes=max_output_bytes,
+            )
+            return finish({}, {"rcs": joined, "rcs_storage_domain": complex_domain})
+
         raw_inputs = []
         preserve_raw_amplitude = True
         for grid in grids:
@@ -938,20 +1018,7 @@ class GridCombineMixin:
             raw_inputs.append((raw_real, raw_imag))
         if not preserve_raw_amplitude:
             raw_inputs = []
-        if len(grids) == 1:
 
-
-            az_union = np.array(ref.azimuths, copy=True)
-            el_union = np.array(ref.elevations, copy=True)
-            f_union = np.array(ref.frequencies, copy=True)
-            p_union = np.array(ref.polarizations, copy=True)
-        else:
-            az_union = cls._axis_union([grid.azimuths for grid in grids], tol=tol)
-            el_union = cls._axis_union([grid.elevations for grid in grids], tol=tol)
-            f_union = cls._axis_union([grid.frequencies for grid in grids], tol=tol)
-            p_union = cls._axis_union([grid.polarizations for grid in grids], tol=0.0)
-
-        shape = (len(az_union), len(el_union), len(f_union), len(p_union))
         out_dtype = np.result_type(*[g.power.dtype for g in grids])
         cell_count = 1
         for dimension in shape:
@@ -987,30 +1054,12 @@ class GridCombineMixin:
         )
 
         for grid_index, grid in enumerate(grids):
-            az_idx = cls._indices_for_axis_values(az_union, grid.azimuths, tol=tol)
-            el_idx = cls._indices_for_axis_values(el_union, grid.elevations, tol=tol)
-            f_idx = cls._indices_for_axis_values(f_union, grid.frequencies, tol=tol)
-            p_idx = cls._indices_for_axis_values(p_union, grid.polarizations, tol=0.0)
-            if az_idx is None or el_idx is None or f_idx is None or p_idx is None:
-                raise ValueError("failed to align a dataset during join")
-            for axis_name, indices, source_axis, axis_tol in (
-                ("azimuth", az_idx, grid.azimuths, tol),
-                ("elevation", el_idx, grid.elevations, tol),
-                ("frequency", f_idx, grid.frequencies, tol),
-                ("polarization", p_idx, grid.polarizations, 0.0),
-            ):
-                if len(indices) != np.asarray(source_axis).size:
-                    raise ValueError(
-                        f"cannot join: an input {axis_name} axis contains "
-                        "coordinates that collapse within the matching "
-                        f"tolerance ({axis_tol:g}); deduplicate that axis or "
-                        "use a smaller tolerance"
-                    )
+            az_idx, el_idx, f_idx, p_idx = aligned_indices(grid)
 
-
-            incoming_power = np.asarray(grid.power)
-            incoming_phase = np.asarray(grid.phase)
-
+            # Derived components: each block slice below reads only that
+            # block of the stored field.
+            incoming_power = grid.power
+            incoming_phase = grid.phase
 
             pol_block = max(1, min(len(p_idx), _JOIN_MERGE_BLOCK_CELLS))
             freq_block = max(
@@ -1165,47 +1214,124 @@ class GridCombineMixin:
             joined_raw_imag[finite] = np.nan
         del finite
 
-        output_extra = dict(preserved_scalar_extra)
-        if metadata_assumptions:
-            output_extra["merge_metadata_assumption_json"] = json.dumps(
-                {
-                    "schema": "grim.merge-metadata-assumption.v1",
-                    "operation": "strict-merge",
-                    "input_count": len(grids),
-                    "one_sided_declarations": metadata_assumptions,
-                    "declarations_inferred": False,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
+        raw_extra = {}
         if preserve_raw_amplitude:
-            output_extra["rcs_amp_real"] = joined_raw_real
-            output_extra["rcs_amp_imag"] = joined_raw_imag
-            output_extra["raw_complex_amplitude_preserved"] = True
+            raw_extra["rcs_amp_real"] = joined_raw_real
+            raw_extra["rcs_amp_imag"] = joined_raw_imag
+            raw_extra["raw_complex_amplitude_preserved"] = True
+        return finish(raw_extra, {"rcs_power": joined_power, "rcs_phase": joined_phase})
 
-        history = str(ref.history or "").strip()
-        if metadata_assumptions:
-            note = (
-                "Join allowed one-sided metadata as unspecified: "
-                + ", ".join(sorted(metadata_assumptions))
+    @staticmethod
+    def _complex_join_domain(grids):
+        """Return the storage domain of a complex-native join, or ``None``.
+
+        Every input must hold canonical complex samples (so phase is never
+        unknown and the former power/phase fill rules cannot apply) and the
+        inputs must agree on what the stored field is: all raw solver fields,
+        which share one normalization under the compatible units the join
+        already requires, or all normalized physical fields without a
+        retained raw pair.  Anything else uses the power/phase merge.
+        """
+        domains = set()
+        for grid in grids:
+            grid._ensure_legacy_source_current()
+            if grid.storage_kind != "complex":
+                return None
+            if grid.storage_domain == "physical" and any(
+                key in grid.extra for key in ("rcs_amp_real", "rcs_amp_imag")
+            ):
+                return None
+            domains.add(grid.storage_domain)
+        return domains.pop() if len(domains) == 1 else None
+
+    @classmethod
+    def _join_complex_fields(cls, grids, shape, domain, aligned_indices, *,
+                             overlap, max_output_bytes):
+        """Merge canonical complex inputs into one field without power/phase.
+
+        Conflicts are judged as before: raw solver fields must agree to
+        1e-12 relative (the former raw-pair rule), normalized fields to
+        1e-6 relative in power and 1e-5 rad in phase.  Samples are NaN pairs
+        where no input has data.  One grid-sized complex array is retained
+        instead of power, phase and raw arrays plus a constructor
+        conversion, and each input is read one block at a time.
+        """
+        out_dtype = np.result_type(*[grid._complex.dtype for grid in grids])
+        if domain == "raw_field":
+            out_dtype = np.complex128
+        itemsize = np.dtype(out_dtype).itemsize
+        cell_count = 1
+        for dimension in shape:
+            cell_count *= int(dimension)
+        output_bytes = cell_count * itemsize
+        merge_block_cells = min(cell_count, _JOIN_MERGE_BLOCK_CELLS)
+        merge_scratch_bytes = merge_block_cells * (4 * itemsize + 48)
+        estimated_peak_bytes = output_bytes + merge_scratch_bytes
+        if max_output_bytes is not None and estimated_peak_bytes > int(max_output_bytes):
+            raise MemoryError(
+                f"dense joined grid needs about {estimated_peak_bytes / (1024**3):.2f} GiB peak "
+                f"({output_bytes / (1024**3):.2f} GiB retained), "
+                f"above the configured limit of {int(max_output_bytes) / (1024**3):.2f} GiB"
             )
-            history = f"{history}\n{note}" if history else note
+        joined = np.full(shape, np.nan + 1j * np.nan, dtype=out_dtype)
 
-        return cls(
-            az_union,
-            el_union,
-            f_union,
-            p_union,
-            rcs_power=joined_power,
-            rcs_phase=joined_phase,
-            rcs_domain="power_phase",
-            source_path=ref.source_path,
-            history=history,
-            units=dict(ref.units),
-            extra=output_extra,
-            _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
-        )
+        for grid in grids:
+            az_idx, el_idx, f_idx, p_idx = aligned_indices(grid)
+            if domain == "raw_field":
+                def read_block(selection, field=grid._complex):
+                    return field[selection]
+            else:
+                read_block = grid.rcs_slice
+            pol_block = max(1, min(len(p_idx), _JOIN_MERGE_BLOCK_CELLS))
+            freq_block = max(1, min(len(f_idx), _JOIN_MERGE_BLOCK_CELLS // pol_block))
+            remaining = max(1, _JOIN_MERGE_BLOCK_CELLS // (pol_block * freq_block))
+            elev_block = max(1, min(len(el_idx), remaining))
+            remaining = max(1, _JOIN_MERGE_BLOCK_CELLS // (pol_block * freq_block * elev_block))
+            az_block = max(1, min(len(az_idx), remaining))
+            for a_start in range(0, len(az_idx), az_block):
+                a_stop = min(a_start + az_block, len(az_idx))
+                for e_start in range(0, len(el_idx), elev_block):
+                    e_stop = min(e_start + elev_block, len(el_idx))
+                    for f_start in range(0, len(f_idx), freq_block):
+                        f_stop = min(f_start + freq_block, len(f_idx))
+                        for p_start in range(0, len(p_idx), pol_block):
+                            p_stop = min(p_start + pol_block, len(p_idx))
+                            target = np.ix_(
+                                az_idx[a_start:a_stop], el_idx[e_start:e_stop],
+                                f_idx[f_start:f_stop], p_idx[p_start:p_stop],
+                            )
+                            block = np.asarray(read_block((
+                                slice(a_start, a_stop), slice(e_start, e_stop),
+                                slice(f_start, f_stop), slice(p_start, p_stop),
+                            )))
+                            existing = joined[target]
+                            incoming_finite = np.isfinite(block.real) & np.isfinite(block.imag)
+                            existing_finite = np.isfinite(existing.real) & np.isfinite(existing.imag)
+                            both = existing_finite & incoming_finite
+                            if overlap == "error" and np.any(both):
+                                if domain == "raw_field":
+                                    conflict = both & ~(
+                                        np.isclose(existing.real, block.real, rtol=1.0e-12, atol=1.0e-15)
+                                        & np.isclose(existing.imag, block.imag, rtol=1.0e-12, atol=1.0e-15)
+                                    )
+                                else:
+                                    existing_power = existing.real * existing.real + existing.imag * existing.imag
+                                    block_power = block.real * block.real + block.imag * block.imag
+                                    power_equal = np.isclose(existing_power, block_power, rtol=1.0e-6, atol=1.0e-12)
+                                    both_zero = (existing_power == 0.0) & (block_power == 0.0)
+                                    phase_delta = np.abs(np.angle(existing * np.conj(block)))
+                                    conflict = both & (
+                                        ~power_equal | (~both_zero & (phase_delta > 1.0e-5))
+                                    )
+                                if np.any(conflict):
+                                    raise ValueError(
+                                        "conflicting finite samples overlap during join"
+                                    )
+                            take = incoming_finite if overlap == "last" else incoming_finite & ~existing_finite
+                            if np.any(take):
+                                existing[take] = block[take]
+                                joined[target] = existing
+        return joined
 
     @classmethod
     def overlap_many(cls, *grids, tol=1e-6):
@@ -1248,22 +1374,27 @@ class GridCombineMixin:
         ):
             raise ValueError("no overlap across one or more axes")
 
-        aligned_power = []
-        aligned_phase = []
+        # One read per input: the aligned samples (a complex field, or power
+        # and phase for other storage) both decide which cells every input
+        # covers and, once trimmed, become the outputs.
+        aligned_samples = []
+        missing_any = None
         for grid_idx, grid in enumerate(grids):
-            az_idx = az_indices[grid_idx]
-            el_idx = el_indices[grid_idx]
-            f_idx = f_indices[grid_idx]
-            p_idx = p_indices[grid_idx]
-            aligned_power.append(grid.power[np.ix_(az_idx, el_idx, f_idx, p_idx)].copy())
-            aligned_phase.append(grid.phase[np.ix_(az_idx, el_idx, f_idx, p_idx)].copy())
-
-        missing_any = np.zeros(aligned_power[0].shape, dtype=bool)
-        for power in aligned_power:
-            missing_any |= ~np.isfinite(power)
-        for power, phase in zip(aligned_power, aligned_phase):
-            power[missing_any] = np.nan
-            phase[missing_any] = np.nan
+            alignment = np.ix_(
+                az_indices[grid_idx], el_indices[grid_idx],
+                f_indices[grid_idx], p_indices[grid_idx],
+            )
+            if grid.storage_kind == "complex":
+                samples = grid._sample_kwargs(alignment)
+                field = samples["rcs"]
+                missing = np.isnan(field.real) & np.isnan(field.imag)
+            else:
+                power, phase = grid.power_phase_slice(alignment)
+                samples = {"rcs_power": np.array(power, copy=True),
+                           "rcs_phase": np.array(phase, copy=True)}
+                missing = ~np.isfinite(samples["rcs_power"])
+            aligned_samples.append(samples)
+            missing_any = missing if missing_any is None else (missing_any | missing)
 
         finite = ~missing_any
         az_keep = finite.any(axis=(1, 2, 3))
@@ -1286,9 +1417,7 @@ class GridCombineMixin:
         overlap_grids = []
         final_common_selection = np.ix_(az_sel, el_sel, f_sel, p_sel)
         final_missing = missing_any[final_common_selection]
-        for grid_index, (grid, power, phase) in enumerate(
-            zip(grids, aligned_power, aligned_phase)
-        ):
+        for grid_index, (grid, aligned) in enumerate(zip(grids, aligned_samples)):
             source_indices = (
                 np.asarray(az_indices[grid_index], dtype=int)[az_sel],
                 np.asarray(el_indices[grid_index], dtype=int)[el_sel],
@@ -1317,16 +1446,21 @@ class GridCombineMixin:
                     raw = np.asarray(overlap_extra[raw_key]).copy()
                     raw[final_missing] = np.nan
                     overlap_extra[raw_key] = raw
-            if grid.storage_kind == "complex":
+            if "rcs" in aligned:
                 # Owned samples (raw solver field or physical field) that the
                 # constructor adopts; masking NaN pairs keeps them clean.
-                samples = grid._sample_kwargs(source_selection)
+                samples = {
+                    key: (value[final_common_selection] if key == "rcs" else value)
+                    for key, value in aligned.items()
+                }
                 samples["rcs"][final_missing] = np.nan + 1j * np.nan
             else:
                 samples = {
-                    "rcs_power": power[final_common_selection],
-                    "rcs_phase": phase[final_common_selection],
+                    "rcs_power": aligned["rcs_power"][final_common_selection],
+                    "rcs_phase": aligned["rcs_phase"][final_common_selection],
                 }
+                samples["rcs_power"][final_missing] = np.nan
+                samples["rcs_phase"][final_missing] = np.nan
             overlap_grids.append(
                 cls(
                     az_common,

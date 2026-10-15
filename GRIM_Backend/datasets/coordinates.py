@@ -827,15 +827,6 @@ class GridCoordinatesMixin:
             raise ValueError("combined azimuth axis is empty")
 
         out_shape = (len(az_merged), 1, len(self.frequencies), len(self.polarizations))
-        out_power = np.full(out_shape, np.nan, dtype=self.power.dtype)
-        out_phase = np.full(out_shape, np.nan, dtype=self.phase.dtype)
-        raw_pair = self._complete_authoritative_raw_arrays()
-        preserve_raw = raw_pair is not None
-        if preserve_raw:
-            raw_real = np.asarray(raw_pair[0], dtype=np.float64)
-            raw_imag = np.asarray(raw_pair[1], dtype=np.float64)
-            out_raw_real = np.full(out_shape, np.nan, dtype=np.float64)
-            out_raw_imag = np.full(out_shape, np.nan, dtype=np.float64)
 
         lo_target_idx = self._indices_for_axis_values(
             az_merged, az_lo, tol=azimuth_tol
@@ -856,59 +847,100 @@ class GridCoordinatesMixin:
                 "deduplicate the azimuth axis or use a smaller tolerance"
             )
 
-        lo_power = self.power[:, lo_idx, :, :]
-        lo_phase = self.phase[:, lo_idx, :, :]
-        hi_power = self.power[:, hi_idx, :, :]
-        hi_phase = self.phase[:, hi_idx, :, :]
-        if preserve_raw:
-            lo_raw_real = raw_real[:, lo_idx, :, :]
-            lo_raw_imag = raw_imag[:, lo_idx, :, :]
-            hi_raw_real = raw_real[:, hi_idx, :, :]
-            hi_raw_imag = raw_imag[:, hi_idx, :, :]
+        self._ensure_legacy_source_current()
+        field_native = self.storage_kind == "complex" and (
+            self.storage_domain == "raw_field"
+            or not any(key in self.extra for key in ("rcs_amp_real", "rcs_amp_imag"))
+        )
+        preserve_raw = False
+        if field_native:
+            # Merge the stored field itself (raw solver field or normalized
+            # physical field): one complex array instead of power, phase and
+            # raw arrays, and no power/phase -> complex conversion afterwards.
+            field_domain = self.storage_domain
+            stored = self._complex
+            out_field = np.full(out_shape, np.nan + 1j * np.nan, dtype=stored.dtype)
+            for label, target_indices, source_field in (
+                ("lower elevation", lo_target_idx, stored[:, lo_idx, :, :]),
+                ("shifted higher elevation", hi_target_idx, stored[:, hi_idx, :, :]),
+            ):
+                for src_idx, dst_idx in enumerate(target_indices):
+                    context = (
+                        f"El->Az360 {label} at azimuth "
+                        f"{az_merged[dst_idx]:.12g} {azimuth_unit}"
+                    )
+                    self._merge_equivalent_field_blocks(
+                        out_field[dst_idx, 0, :, :],
+                        source_field[src_idx, :, :],
+                        context=context,
+                        raw=(field_domain == "raw_field"),
+                    )
+            samples = {"rcs": out_field, "rcs_storage_domain": field_domain}
+        else:
+            out_power = np.full(out_shape, np.nan, dtype=self.power.dtype)
+            out_phase = np.full(out_shape, np.nan, dtype=self.phase.dtype)
+            raw_pair = self._complete_authoritative_raw_arrays()
+            preserve_raw = raw_pair is not None
+            if preserve_raw:
+                raw_real = np.asarray(raw_pair[0], dtype=np.float64)
+                raw_imag = np.asarray(raw_pair[1], dtype=np.float64)
+                out_raw_real = np.full(out_shape, np.nan, dtype=np.float64)
+                out_raw_imag = np.full(out_shape, np.nan, dtype=np.float64)
 
-        for label, target_indices, source_power, source_phase, source_real, source_imag in (
-            (
-                "lower elevation",
-                lo_target_idx,
-                lo_power,
-                lo_phase,
-                lo_raw_real if preserve_raw else None,
-                lo_raw_imag if preserve_raw else None,
-            ),
-            (
-                "shifted higher elevation",
-                hi_target_idx,
-                hi_power,
-                hi_phase,
-                hi_raw_real if preserve_raw else None,
-                hi_raw_imag if preserve_raw else None,
-            ),
-        ):
-            for src_idx, dst_idx in enumerate(target_indices):
-                context = (
-                    f"El->Az360 {label} at azimuth "
-                    f"{az_merged[dst_idx]:.12g} {azimuth_unit}"
-                )
-                self._merge_equivalent_sample_blocks(
-                    out_power[dst_idx, 0, :, :],
-                    out_phase[dst_idx, 0, :, :],
-                    source_power[src_idx, :, :],
-                    source_phase[src_idx, :, :],
-                    context=context,
-                )
-                if preserve_raw:
-                    self._merge_equivalent_raw_blocks(
-                        out_raw_real[dst_idx, 0, :, :],
-                        out_raw_imag[dst_idx, 0, :, :],
-                        source_real[src_idx, :, :],
-                        source_imag[src_idx, :, :],
+            lo_power = self.power[:, lo_idx, :, :]
+            lo_phase = self.phase[:, lo_idx, :, :]
+            hi_power = self.power[:, hi_idx, :, :]
+            hi_phase = self.phase[:, hi_idx, :, :]
+            if preserve_raw:
+                lo_raw_real = raw_real[:, lo_idx, :, :]
+                lo_raw_imag = raw_imag[:, lo_idx, :, :]
+                hi_raw_real = raw_real[:, hi_idx, :, :]
+                hi_raw_imag = raw_imag[:, hi_idx, :, :]
+
+            for label, target_indices, source_power, source_phase, source_real, source_imag in (
+                (
+                    "lower elevation",
+                    lo_target_idx,
+                    lo_power,
+                    lo_phase,
+                    lo_raw_real if preserve_raw else None,
+                    lo_raw_imag if preserve_raw else None,
+                ),
+                (
+                    "shifted higher elevation",
+                    hi_target_idx,
+                    hi_power,
+                    hi_phase,
+                    hi_raw_real if preserve_raw else None,
+                    hi_raw_imag if preserve_raw else None,
+                ),
+            ):
+                for src_idx, dst_idx in enumerate(target_indices):
+                    context = (
+                        f"El->Az360 {label} at azimuth "
+                        f"{az_merged[dst_idx]:.12g} {azimuth_unit}"
+                    )
+                    self._merge_equivalent_sample_blocks(
+                        out_power[dst_idx, 0, :, :],
+                        out_phase[dst_idx, 0, :, :],
+                        source_power[src_idx, :, :],
+                        source_phase[src_idx, :, :],
                         context=context,
                     )
+                    if preserve_raw:
+                        self._merge_equivalent_raw_blocks(
+                            out_raw_real[dst_idx, 0, :, :],
+                            out_raw_imag[dst_idx, 0, :, :],
+                            source_real[src_idx, :, :],
+                            source_imag[src_idx, :, :],
+                            context=context,
+                        )
 
-        if preserve_raw:
-            unmodeled = ~np.isfinite(out_power)
-            out_raw_real[unmodeled] = np.nan
-            out_raw_imag[unmodeled] = np.nan
+            if preserve_raw:
+                unmodeled = ~np.isfinite(out_power)
+                out_raw_real[unmodeled] = np.nan
+                out_raw_imag[unmodeled] = np.nan
+            samples = {"rcs_power": out_power, "rcs_phase": out_phase}
 
         combined_extra = self._exact_transform_extra(
             coordinate_change="combine-elevation-pair-to-azimuth-360",
@@ -939,8 +971,8 @@ class GridCoordinatesMixin:
             np.asarray([el_axis[lo_idx]], dtype=float),
             np.array(self.frequencies, copy=True),
             np.array(self.polarizations, copy=True),
-            rcs_power=out_power,
-            rcs_phase=out_phase,
+            **samples,
             rcs_domain="power_phase",
             extra=combined_extra,
+            _adopt_clean_arrays=field_native,
         )
