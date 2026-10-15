@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import weakref
 
 import numpy as np
 
@@ -109,6 +110,7 @@ class RcsGrid(
         self._legacy_fingerprint = None
         self._storage_kind = "power_phase"
         self._storage_domain = "physical"
+        self._raw_coverage_cache = None
         if (_adopt_clean_arrays is not None and _adopt_clean_arrays is not False
                 and _adopt_clean_arrays is not _ADOPT_CLEAN_ARRAYS_TOKEN):
             raise ValueError("_adopt_clean_arrays is reserved for internal operations")
@@ -162,9 +164,20 @@ class RcsGrid(
             self.power_domain = "linear_rcs"
             self.source_path, self.history = source_path, history
             dtype = np.complex128 if _real_storage_dtype(raw) == np.float64 else np.complex64
-            field = np.array(raw, dtype=dtype, copy=True)
-            invalid = ~np.isfinite(field.real) | ~np.isfinite(field.imag)
-            field[invalid] = np.nan + 1j * np.nan
+            if (
+                _adopt_clean_arrays is _ADOPT_CLEAN_ARRAYS_TOKEN
+                and raw is direct
+                and raw.dtype == dtype
+                and raw.flags.owndata
+            ):
+                # An internal exact operation hands over a fresh array whose
+                # non-finite samples are already NaN pairs. Adopt it instead of
+                # copying and rescanning a grid-sized field.
+                field = raw
+            else:
+                field = np.array(raw, dtype=dtype, copy=True)
+                invalid = ~np.isfinite(field.real) | ~np.isfinite(field.imag)
+                field[invalid] = np.nan + 1j * np.nan
             self._install_complex(field, domain=rcs_storage_domain, copy=False)
             if rcs_storage_domain == "raw_field" and self._authoritative_raw_amplitude_from_pair((self._complex.real, self._complex.imag), (0, 0, 0, 0)) is None:
                 raise ValueError("raw complex normalization is not defined for this dataset")
@@ -362,31 +375,76 @@ class RcsGrid(
             return None
         real = np.asarray(real)
         imag = np.asarray(imag)
-        if real.shape != self.power.shape or imag.shape != self.power.shape:
+        if real.shape != self.shape or imag.shape != self.shape:
             return None
+        if not self._raw_pair_coverage_matches(real, imag):
+            return None
+        return real, imag
 
+    def _raw_pair_coverage_matches(self, real, imag):
+        """Return whether finite raw coverage equals finite modeled coverage.
 
-        for start in range(
-            0, self.power.size, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS
-        ):
-            stop = min(
-                self.power.size,
-                start + _RAW_COMPLEX_VALIDATION_BLOCK_CELLS,
+        The block scan is grid-sized, so its verdict is memoised for the exact
+        array objects it inspected (held weakly).  Replacing any of those arrays
+        invalidates the memo.  An in-place edit that changes a NaN pattern
+        without replacing the array is not re-detected until then.
+        """
+
+        # A late raw pair may replace the physical source. Inspect coverage
+        # directly to avoid power -> rcs_slice recursion.
+        source = (
+            self._complex
+            if self._complex is not None and not self._legacy_samples
+            else self._power
+        )
+        arrays = (real, imag, source)
+        cache = getattr(self, "_raw_coverage_cache", None)
+        if cache is not None:
+            refs, verdict = cache
+            if all(ref() is array for ref, array in zip(refs, arrays)):
+                return verdict
+        verdict = self._scan_raw_pair_coverage(real, imag, source)
+        try:
+            self._raw_coverage_cache = (
+                tuple(weakref.ref(array) for array in arrays), verdict
             )
+        except TypeError:
+            self._raw_coverage_cache = None
+        return verdict
 
+    @staticmethod
+    def _scan_raw_pair_coverage(real, imag, source):
+        """Block-compare finite raw coverage with the modeled samples."""
 
-            if self._complex is not None and not self._legacy_samples:
-                # A late raw pair may replace the physical source. Inspect
-                # coverage directly to avoid power -> rcs_slice recursion.
-                with np.errstate(over="ignore", invalid="ignore"):
-                    modeled = np.isfinite(np.abs(self._complex.flat[start:stop]) ** 2)
+        for start in range(0, source.size, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS):
+            stop = start + _RAW_COMPLEX_VALIDATION_BLOCK_CELLS
+            block = source.flat[start:stop]
+            if np.iscomplexobj(block):
+                modeled = np.isfinite(block.real) & np.isfinite(block.imag)
             else:
-                modeled = np.isfinite(self._power.flat[start:stop])
+                modeled = np.isfinite(block)
             raw_finite = np.isfinite(real.flat[start:stop])
             raw_finite &= np.isfinite(imag.flat[start:stop])
             if np.any(modeled != raw_finite):
-                return None
-        return real, imag
+                return False
+        return True
+
+    def _raw_normalization_defined(self):
+        """Return whether a raw solver pair can be normalised for this dataset.
+
+        This is the O(1) precondition for every authoritative raw-pair read,
+        mirroring ``_authoritative_raw_amplitude_from_pair``; the grid-sized
+        coverage scan only runs once it holds.
+        """
+
+        quantity = self.linear_quantity()
+        if quantity == "sigma_3d":
+            return True
+        if quantity != "sigma_2d":
+            return False
+        freq_hz = np.asarray(self._frequency_value_to_hz(self.frequencies), dtype=float)
+        k0 = (2.0 * np.pi * freq_hz) / C0
+        return bool(np.all(np.isfinite(k0)) and np.all(k0 > 0.0))
 
     def _drop_malformed_raw_metadata(self, extra):
         """Remove a partial raw pair before it can become derived authority."""
@@ -435,6 +493,8 @@ class RcsGrid(
     def _authoritative_raw_amplitude(self, selection=None):
         """Return a solver-provided raw field when its normalization is known."""
 
+        if not self._raw_normalization_defined():
+            return None
         pair = self._complete_authoritative_raw_arrays()
         if pair is None:
             return None
@@ -456,30 +516,27 @@ class RcsGrid(
 
         self._ensure_legacy_source_current()
         if (self._complex is not None and self._storage_domain == "physical"
-                and ("rcs_amp_real" in self.extra or "rcs_amp_imag" in self.extra)):
+                and ("rcs_amp_real" in self.extra or "rcs_amp_imag" in self.extra)
+                and self._raw_normalization_defined()):
             pair = self._complete_authoritative_raw_arrays()
-            if pair is not None and self._authoritative_raw_amplitude_from_pair(pair, (0, 0, 0, 0)) is not None:
+            if pair is not None:
                 result = (lambda selection: self._authoritative_raw_amplitude_from_pair(pair, selection), np.dtype(np.float64))
                 return (*result, True) if include_authority else result
         if self._complex is not None:
             result = (self.rcs_slice, np.dtype(np.float64) if self._storage_domain == "raw_field" else self._complex.real.dtype)
             return (*result, self._storage_domain == "raw_field") if include_authority else result
-        pair = self._complete_authoritative_raw_arrays()
-        quantity = self.linear_quantity()
-        if pair is not None and quantity in {"sigma_2d", "sigma_3d"}:
-            if quantity == "sigma_2d":
-                freq_hz = self._frequency_value_to_hz(self.frequencies)
-                k0 = (2.0 * np.pi * np.asarray(freq_hz, dtype=float)) / C0
-                if np.any(~np.isfinite(k0)) or np.any(k0 <= 0.0):
-                    pair = None
-            if pair is not None:
-                result = (
-                    lambda selection: self._authoritative_raw_amplitude_from_pair(
-                        pair, selection
-                    ),
-                    np.dtype(np.float64),
-                )
-                return (*result, True) if include_authority else result
+        pair = (
+            self._complete_authoritative_raw_arrays()
+            if self._raw_normalization_defined() else None
+        )
+        if pair is not None:
+            result = (
+                lambda selection: self._authoritative_raw_amplitude_from_pair(
+                    pair, selection
+                ),
+                np.dtype(np.float64),
+            )
+            return (*result, True) if include_authority else result
         real_dtype = np.dtype(
             _real_storage_dtype(self.power, self.phase)
         )
@@ -498,6 +555,18 @@ class RcsGrid(
 
     def rcs_slice(self, selection):
         """Copy/normalize the selected complex field without a whole-grid allocation."""
+        return self._complex_samples(selection, owned=True)
+
+    def _complex_samples(self, selection, *, owned):
+        """Return the selected physical complex samples.
+
+        ``owned=True`` guarantees a fresh writable array: a basic slice of the
+        read-only store is copied once, while advanced-index results and
+        normalized raw fields already own their data and are returned as is.
+        ``owned=False`` may return a read-only view of the stored field for
+        derived read-only computations such as power and phase, which avoids
+        one grid-sized copy per read.
+        """
         self._ensure_legacy_source_current()
         if self._complex is not None:
             if self._storage_domain == "raw_field":
@@ -506,7 +575,10 @@ class RcsGrid(
                 authoritative = self._authoritative_raw_amplitude(selection)
                 if authoritative is not None:
                     return authoritative
-            return np.array(self._complex[selection], copy=True)
+            result = self._complex[selection]
+            if owned and (not isinstance(result, np.ndarray) or not result.flags.owndata):
+                result = np.array(result, copy=True)
+            return result
         authoritative = self._authoritative_raw_amplitude(selection)
         if authoritative is not None:
             return authoritative
@@ -591,6 +663,7 @@ class RcsGrid(
         *,
         rcs_power=None,
         rcs_phase=None,
+        rcs_storage_domain="physical",
         rcs_domain=None,
         history=None,
         units=None,
@@ -612,6 +685,7 @@ class RcsGrid(
             rcs,
             rcs_power=rcs_power,
             rcs_phase=rcs_phase,
+            rcs_storage_domain=rcs_storage_domain,
             rcs_domain=(self.rcs_domain if rcs_domain is None else rcs_domain),
             source_path=self.source_path,
             history=history if history is not None else self.history,

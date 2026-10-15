@@ -468,9 +468,14 @@ class GridCoordinatesMixin:
             "requested_radar_grid_json",
             "assembly_angular_coordinate_contract",
         }
+        raw_in_samples = samples.get("rcs_storage_domain") == "raw_field"
         extra = {}
         for key, value in (self.extra or {}).items():
             if key in stale_grid_metadata:
+                continue
+            if raw_in_samples and key in self._RAW_AMPLITUDE_EXTRA_KEYS:
+                # The raw field travels in ``samples``; the constructor
+                # re-derives these views from the rearranged array.
                 continue
             array = np.asarray(value)
             if array.ndim >= 4 and tuple(array.shape[:4]) == original_shape:
@@ -636,9 +641,14 @@ class GridCoordinatesMixin:
             "source_body_mesh_certification_json",
             "requested_radar_grid_json",
         }
+        raw_in_samples = samples.get("rcs_storage_domain") == "raw_field"
         converted_extra = {}
         for key, value in extra.items():
             if key in stale_grid_metadata:
+                continue
+            if raw_in_samples and key in self._RAW_AMPLITUDE_EXTRA_KEYS:
+                # The raw field travels in ``samples``; the constructor
+                # re-derives these views from the rearranged array.
                 continue
             value_array = np.asarray(value)
             if (

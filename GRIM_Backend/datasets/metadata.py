@@ -948,12 +948,18 @@ class GridMetadataMixin:
         such as phase wrapping where neither axes nor samples change.
         """
 
+        self._ensure_legacy_source_current()
+        # A raw solver field stored as the samples themselves travels through
+        # ``_sample_kwargs`` and is re-derived by the constructor; transforming
+        # its real/imaginary views here would only double the allocation.
+        raw_in_samples = self._storage_domain == "raw_field"
         if preserve_all:
             extra = {
                 key: copy.deepcopy(value)
                 for key, value in self._extra_to_write().items()
+                if not (raw_in_samples and key in self._RAW_AMPLITUDE_EXTRA_KEYS)
             }
-            if self._complete_authoritative_raw_arrays() is None:
+            if not raw_in_samples and self._complete_authoritative_raw_arrays() is None:
                 for key in (
                     *self._RAW_AMPLITUDE_EXTRA_KEYS,
                     "raw_complex_amplitude_preserved",
@@ -963,7 +969,10 @@ class GridMetadataMixin:
             extra = self._safe_derived_scalar_extra(
                 include_field_conventions=True
             )
-            pair = self._complete_authoritative_raw_arrays()
+            pair = (
+                None if raw_in_samples or not preserve_raw
+                else self._complete_authoritative_raw_arrays()
+            )
             if preserve_raw and pair is not None:
                 real_array, imag_array = pair
                 transform = array_transform or (

@@ -53,12 +53,12 @@ def test_power_and_phase_match_physical_complex_response():
 def test_lazy_components_bound_slices_and_flat_reads(monkeypatch):
     ds = grid(np.arange(1, 101) * (1 + 2j))
     calls = []
-    original = ds.rcs_slice
-    def observe(selection):
-        result = original(selection)
+    original = ds._complex_samples
+    def observe(selection, *, owned):
+        result = original(selection, owned=owned)
         calls.append(result.size)
         return result
-    monkeypatch.setattr(ds, "rcs_slice", observe)
+    monkeypatch.setattr(ds, "_complex_samples", observe)
     assert ds.power.shape == (100, 1, 1, 1)
     assert ds.power.size == 100
     assert ds.power.dtype == np.dtype(np.float64)

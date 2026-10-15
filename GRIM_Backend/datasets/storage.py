@@ -164,10 +164,10 @@ class GridStorageMixin:
         if self._complex is not None and not self._legacy_samples:
             if self._storage_domain == "raw_field":
                 return np.dtype(np.float64)
-            if "rcs_amp_real" in self.extra and "rcs_amp_imag" in self.extra:
-                pair = self._complete_authoritative_raw_arrays()
-                if pair is not None and self._authoritative_raw_amplitude_from_pair(pair, (0, 0, 0, 0)) is not None:
-                    return np.dtype(np.float64)
+            if ("rcs_amp_real" in self.extra and "rcs_amp_imag" in self.extra
+                    and self._raw_normalization_defined()
+                    and self._complete_authoritative_raw_arrays() is not None):
+                return np.dtype(np.float64)
             return self._complex.real.dtype
         return np.result_type(self._power.dtype, self._phase.dtype) if self._phase is not None else self._power.dtype
 
@@ -199,6 +199,7 @@ class GridStorageMixin:
         self._storage_kind = "complex"
         self._storage_domain = domain
         self._legacy_fingerprint = None
+        self._raw_coverage_cache = None
         if domain == "raw_field":
             self.extra["rcs_amp_real"] = self._complex.real
             self.extra["rcs_amp_imag"] = self._complex.imag
@@ -207,8 +208,13 @@ class GridStorageMixin:
     def _canonicalize_samples(self, complex_input=None, *, prefer_complex=False):
         """Choose one representation, retaining exceptional phase information."""
         power, phase = self._power, self._phase
-        pair = self._complete_authoritative_raw_arrays()
-        if pair is not None and self.linear_quantity() in {"sigma_2d", "sigma_3d"}:
+        # The coverage scan is grid-sized; skip it when the quantity cannot
+        # normalise a raw pair at all.
+        pair = (
+            self._complete_authoritative_raw_arrays()
+            if self.linear_quantity() in {"sigma_2d", "sigma_3d"} else None
+        )
+        if pair is not None:
             report = self._raw_complex_consistency_report(
                 expected_shape=power.shape, frequencies=self.frequencies,
                 rcs_power=power, rcs_phase=phase, units=self.units, extra=self.extra,
@@ -273,20 +279,36 @@ class GridStorageMixin:
             phase[outside] = np.remainder(phase[outside] + np.pi, 2 * np.pi) - np.pi
         return phase
 
+    @staticmethod
+    def _squared_magnitude(field):
+        """Return ``|field|**2`` as ``re*re + im*im`` in the field's real precision.
+
+        This avoids ``hypot`` (a square root that is squared straight away) and
+        works on a read-only view, so a power read allocates only the result
+        and one same-sized scratch array instead of copying the complex field.
+        """
+        real, imag = field.real, field.imag
+        with np.errstate(over="ignore", invalid="ignore"):
+            result = np.multiply(real, real)
+            if isinstance(result, np.ndarray):
+                np.add(result, np.multiply(imag, imag), out=result)
+            else:
+                result = result + imag * imag
+        return np.asarray(result)
+
     def power_slice(self, selection=Ellipsis):
         if self._legacy_samples or self._complex is None:
             return _readonly(np.array(self._power[selection], copy=True))
-        field = self.rcs_slice(selection)
-        with np.errstate(over="ignore", invalid="ignore"):
-            result = np.abs(field) ** 2
-        return _readonly(result)
+        return _readonly(self._squared_magnitude(
+            self._complex_samples(selection, owned=False)
+        ))
 
     def phase_slice(self, selection=Ellipsis):
         if self._phase is not None:
             return _readonly(np.array(self._phase[selection], copy=True))
         if self._complex is None:
             return _readonly(np.full(np.shape(self._power[selection]), np.nan, dtype=self.real_dtype))
-        field = self.rcs_slice(selection)
+        field = self._complex_samples(selection, owned=False)
         result = np.angle(field)
         result = np.where(np.isfinite(field.real) & np.isfinite(field.imag), result, np.nan)
         if str(self.units.get("phase_wrap", "")).strip() == "0_360":
@@ -370,12 +392,27 @@ class GridStorageMixin:
         self._phase = value
 
     def _sample_kwargs(self, selection=None, transform=None):
+        """Return constructor samples for an exact rearrangement of this grid.
+
+        Every returned array is freshly owned, so a caller may edit it in place
+        and the constructor may adopt it (``_adopt_clean_arrays``) without a
+        further copy.  A raw solver field is returned unnormalized together
+        with ``rcs_storage_domain``; the constructor then re-derives the raw
+        metadata views instead of validating a normalized field against them.
+        """
         self._ensure_legacy_source_current()
         selection = Ellipsis if selection is None else selection
+
         def changed(values):
-            result = values if transform is None else transform(values)
+            result = np.asarray(values if transform is None else transform(values))
+            if result.flags.owndata and result.flags.writeable:
+                return result
             return np.array(result, copy=True)
+
         if self._complex is not None:
+            if self._storage_domain == "raw_field":
+                return {"rcs": changed(self._complex[selection]),
+                        "rcs_storage_domain": "raw_field"}
             return {"rcs": changed(self.rcs_slice(selection))}
         result = {"rcs_power": changed(self._power[selection])}
         if self._phase is not None:
@@ -385,9 +422,10 @@ class GridStorageMixin:
     def native_sample_payload(self):
         self._ensure_legacy_source_current()
         if (self._complex is not None and self._storage_domain == "physical"
-                and ("rcs_amp_real" in self.extra or "rcs_amp_imag" in self.extra)):
+                and ("rcs_amp_real" in self.extra or "rcs_amp_imag" in self.extra)
+                and self._raw_normalization_defined()):
             pair = self._complete_authoritative_raw_arrays()
-            if pair is not None and self._authoritative_raw_amplitude_from_pair(pair, (0, 0, 0, 0)) is not None:
+            if pair is not None:
                 raw = np.empty(pair[0].shape, dtype=np.result_type(pair[0].dtype, pair[1].dtype, np.complex64))
                 raw.real, raw.imag = pair
                 return {"storage_kind": "complex", "storage_domain": "raw_field", "rcs_complex": _readonly(raw)}

@@ -8,7 +8,7 @@ import math
 import numpy as np
 
 from GRIM_Backend.datasets.grid import RcsGrid
-from GRIM_Backend.datasets.constants import C0
+from GRIM_Backend.datasets.constants import C0, _ADOPT_CLEAN_ARRAYS_TOKEN
 from GRIM_Backend.datasets.memory import _bounded_grid_selections
 
 
@@ -112,17 +112,27 @@ def _phase_shifted_response(dataset: RcsGrid, phase_degrees: float) -> np.ndarra
 def duplicate_dataset(dataset: RcsGrid) -> RcsGrid:
     """Return a detached copy with the same numerical samples and metadata."""
 
+    samples = dataset._sample_kwargs()
+    # A raw solver field travels in ``samples``; its real/imaginary metadata
+    # views are re-derived by the constructor rather than deep-copied twice.
+    raw_in_samples = samples.get("rcs_storage_domain") == "raw_field"
+    extra = {
+        key: copy.deepcopy(value)
+        for key, value in (dataset.extra or {}).items()
+        if not (raw_in_samples and key in ("rcs_amp_real", "rcs_amp_imag"))
+    }
     return RcsGrid(
         dataset.azimuths.copy(),
         dataset.elevations.copy(),
         dataset.frequencies.copy(),
         dataset.polarizations.copy(),
-        **dataset._sample_kwargs(),
+        **samples,
         rcs_domain=dataset.rcs_domain,
         source_path=dataset.source_path,
         history=dataset.history,
         units=copy.deepcopy(dataset.units or {}),
-        extra=copy.deepcopy(dataset.extra or {}),
+        extra=extra,
+        _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
     )
 
 

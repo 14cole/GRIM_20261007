@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from GRIM_Backend.datasets.constants import C0
+from GRIM_Backend.datasets.constants import C0, _ADOPT_CLEAN_ARRAYS_TOKEN
 from GRIM_Backend.datasets.grid import RcsGrid
 from GRIM_Backend.datasets.coordinates import wedge_to_conic_geometry_deg
 from GRIM_Backend.io.loaders import (
@@ -5165,17 +5165,24 @@ class DatasetOpsMixin:
             copies = []
             total = len(datasets)
             for index, (name, dataset) in enumerate(datasets, start=1):
+                samples = dataset._sample_kwargs()
+                raw_in_samples = samples.get("rcs_storage_domain") == "raw_field"
                 duplicate = RcsGrid(
                     dataset.azimuths.copy(),
                     dataset.elevations.copy(),
                     dataset.frequencies.copy(),
                     dataset.polarizations.copy(),
-                    **dataset._sample_kwargs(),
+                    **samples,
                     rcs_domain=dataset.rcs_domain,
                     source_path=dataset.source_path,
                     history=dataset.history,
                     units=copy.deepcopy(dataset.units or {}),
-                    extra=copy.deepcopy(dataset.extra or {}),
+                    extra={
+                        key: copy.deepcopy(value)
+                        for key, value in (dataset.extra or {}).items()
+                        if not (raw_in_samples and key in ("rcs_amp_real", "rcs_amp_imag"))
+                    },
+                    _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
                 )
                 copies.append((index - 1, name, duplicate))
                 progress(index, total, name)

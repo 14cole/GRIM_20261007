@@ -18,45 +18,64 @@ from GRIM_Backend.datasets.constants import (
 class GridAxesMixin:
     """Axis selection, alignment, interpolation, cropping, and wrapping."""
 
-    def _frequency_relabel_extra(self, extra, old_frequencies, new_frequencies):
+    def _frequency_relabel(self, extra, samples, old_frequencies, new_frequencies):
         """Keep the normalized 2-D response unchanged when frequency labels move.
 
         Solver amplitudes encode sqrt(k) as part of their normalization. A
         coordinate relabel changes k, but must not change the response sample.
-        Work on the already-permuted raw pair so inline edits retain alignment.
+        The raw encoding lives either in ``samples`` (raw-field storage, as
+        returned by ``_sample_kwargs``) or in the already-permuted ``extra``
+        pair (power/phase storage with an authoritative pair); the matching
+        representation is rescaled so inline edits retain alignment.  Returns
+        the updated ``(extra, samples)``; returned sample arrays stay fresh and
+        clean, so the constructor may adopt them.
         """
         old = np.asarray(old_frequencies, dtype=float)
         new = np.asarray(new_frequencies, dtype=float)
         if np.array_equal(old, new) or self.linear_quantity() != "sigma_2d":
-            return extra, None
-        if self._complete_authoritative_raw_arrays() is None:
-            return extra, None
+            return extra, samples
+        raw_in_samples = samples.get("rcs_storage_domain") == "raw_field"
+        if not raw_in_samples and self._complete_authoritative_raw_arrays() is None:
+            return extra, samples
         for key in ("solver_metadata_json", "solver_certification", "requested_radar_grid_json"):
             extra.pop(key, None)
         if np.any(old <= 0.0) or np.any(new <= 0.0):
             # Keep permissive coordinate relabeling. Invalid frequency labels
             # cannot encode solver-normalized amplitudes, so retain canonical
             # response samples instead and leave the frequency issue to Audit.
-            canonical = None
             if np.all(old > 0.0):
-                field = (np.asarray(extra["rcs_amp_real"], dtype=np.float64)
-                         + 1j * np.asarray(extra["rcs_amp_imag"], dtype=np.float64))
+                if raw_in_samples:
+                    field = np.asarray(samples["rcs"], dtype=np.complex128)
+                else:
+                    field = (np.asarray(extra["rcs_amp_real"], dtype=np.float64)
+                             + 1j * np.asarray(extra["rcs_amp_imag"], dtype=np.float64))
                 k = 2.0 * np.pi * self._frequency_value_to_hz(old) / C0
-                field /= (2.0 * np.sqrt(k))[None, None, :, None]
-                canonical = (np.abs(field) ** 2, np.angle(field))
+                field = field * (1.0 / (2.0 * np.sqrt(k)))[None, None, :, None]
+                invalid = ~np.isfinite(field.real) | ~np.isfinite(field.imag)
+                field[invalid] = np.nan + 1j * np.nan
+                samples = {"rcs": field}
+            elif raw_in_samples:
+                raise ValueError(
+                    "raw sigma_2d samples cannot be normalized for nonpositive frequencies"
+                )
             for key in ("rcs_amp_real", "rcs_amp_imag", "raw_complex_amplitude_preserved"):
                 extra.pop(key, None)
             extra["frequency_relabel_normalization"] = (
                 "normalized response retained; raw solver encoding removed because relabeled frequencies are nonpositive"
             )
-            return extra, canonical
+            return extra, samples
         scale = np.sqrt(new / old)[None, None, :, None]
-        for key in ("rcs_amp_real", "rcs_amp_imag"):
-            extra[key] = np.asarray(extra[key], dtype=np.float64) * scale
+        if raw_in_samples:
+            field = samples["rcs"]
+            field *= scale
+            samples = dict(samples, rcs=field)
+        else:
+            for key in ("rcs_amp_real", "rcs_amp_imag"):
+                extra[key] = np.asarray(extra[key], dtype=np.float64) * scale
         extra["frequency_relabel_normalization"] = (
             "raw sigma_2d solver amplitudes rescaled to preserve normalized response"
         )
-        return extra, None
+        return extra, samples
 
     def _alignment_interpolation_plan(self, other):
         """Shrink first so intermediate grids never exceed the input/output."""
@@ -199,9 +218,14 @@ class GridAxesMixin:
                 {"polarization_alias_primary", "polarization_aliases_json"}
             )
 
+        raw_in_samples = samples.get("rcs_storage_domain") == "raw_field"
         edited_extra = {}
         for key, extra_value in self.extra.items():
             if key in stale_grid_metadata:
+                continue
+            if raw_in_samples and key in self._RAW_AMPLITUDE_EXTRA_KEYS:
+                # The raw field travels in ``samples``; the constructor
+                # re-derives these views from the rearranged array.
                 continue
             if reordered:
                 extra_array = np.asarray(extra_value)
@@ -218,11 +242,9 @@ class GridAxesMixin:
             edited_extra[key] = extra_value
         self._drop_malformed_raw_metadata(edited_extra)
         if axis_index == 2:
-            edited_extra, canonical = self._frequency_relabel_extra(
-                edited_extra, np.asarray(self.frequencies)[order], axes[2]
+            edited_extra, samples = self._frequency_relabel(
+                edited_extra, samples, np.asarray(self.frequencies)[order], axes[2]
             )
-            if canonical is not None:
-                samples = dict(zip(("rcs_power", "rcs_phase"), canonical))
         self._invalidate_assembly_sampling_hash(
             edited_extra, f"edit-{str(name).strip().lower()}-axis"
         )
@@ -388,6 +410,7 @@ class GridAxesMixin:
                     lambda value: value[selection],
                     coordinate_change=("align-intersect-relabel" if relabeled else None),
                 ),
+                _adopt_clean_arrays=True,
             )
 
 
@@ -968,6 +991,7 @@ class GridAxesMixin:
             extra=self._exact_transform_extra(
                 lambda value: value[selection]
             ),
+            _adopt_clean_arrays=True,
         )
 
     @staticmethod
@@ -1102,6 +1126,7 @@ class GridAxesMixin:
                 coordinate_change="mirror-azimuth",
                 preserve_angular_contract=False,
             ),
+            _adopt_clean_arrays=True,
         )
 
     def swap_elevation_azimuth(self):
@@ -1124,6 +1149,7 @@ class GridAxesMixin:
                 coordinate_change="swap-elevation-azimuth",
                 preserve_angular_contract=False,
             ),
+            _adopt_clean_arrays=True,
         )
 
     def convert_axis_units(
@@ -1188,6 +1214,7 @@ class GridAxesMixin:
             extra=self._exact_transform_extra(
                 coordinate_change="convert-axis-storage-units"
             ),
+            _adopt_clean_arrays=True,
         )
 
     def shift_azimuth(self, delta_deg: float):
@@ -1205,6 +1232,7 @@ class GridAxesMixin:
                 coordinate_change="shift-azimuth",
                 preserve_angular_contract=False,
             ),
+            _adopt_clean_arrays=True,
         )
 
     def wrap_azimuth(
@@ -1381,17 +1409,21 @@ class GridAxesMixin:
                 "phase wrap mode must be '0_360' or '-180_180'"
             )
 
-        wrapped_phase = np.array(self.phase, copy=True)
-        period = 2.0 * np.pi
-        with np.errstate(invalid="ignore"):
-            if mode == "0_360":
-                np.remainder(wrapped_phase, period, out=wrapped_phase)
-                range_label = "[0, 360) deg"
-            else:
-                np.add(wrapped_phase, np.pi, out=wrapped_phase)
-                np.remainder(wrapped_phase, period, out=wrapped_phase)
-                np.subtract(wrapped_phase, np.pi, out=wrapped_phase)
-                range_label = "[-180, 180) deg"
+        samples = self._sample_kwargs()
+        range_label = "[0, 360) deg" if mode == "0_360" else "[-180, 180) deg"
+        if "rcs_phase" in samples:
+            # Only power/phase storage holds a phase array to rewrap. Complex
+            # storage derives phase on read, so it just records the interval
+            # instead of materialising and discarding a grid-sized phase array.
+            wrapped_phase = samples["rcs_phase"]
+            period = 2.0 * np.pi
+            with np.errstate(invalid="ignore"):
+                if mode == "0_360":
+                    np.remainder(wrapped_phase, period, out=wrapped_phase)
+                else:
+                    np.add(wrapped_phase, np.pi, out=wrapped_phase)
+                    np.remainder(wrapped_phase, period, out=wrapped_phase)
+                    np.subtract(wrapped_phase, np.pi, out=wrapped_phase)
 
         history_entry = f"Wrap phase to {range_label}; complex field unchanged"
         prior_history = str(self.history or "").strip()
@@ -1400,9 +1432,6 @@ class GridAxesMixin:
         )
         wrapped_units = dict(self.units)
         wrapped_units["phase_wrap"] = mode
-        samples = self._sample_kwargs()
-        if "rcs_phase" in samples:
-            samples["rcs_phase"] = wrapped_phase
         return self._new_grid(
             np.array(self.azimuths, copy=True),
             np.array(self.elevations, copy=True),
@@ -1412,6 +1441,7 @@ class GridAxesMixin:
             history=history,
             units=wrapped_units,
             extra=self._exact_transform_extra(preserve_all=True),
+            _adopt_clean_arrays=True,
         )
 
     def round_axes(
@@ -1447,10 +1477,8 @@ class GridAxesMixin:
         extra = self._exact_transform_extra(
             coordinate_change="round-" + "-".join(changed)
         )
-        extra, canonical = self._frequency_relabel_extra(extra, self.frequencies, axes[2])
-        samples = (
-            dict(zip(("rcs_power", "rcs_phase"), canonical))
-            if canonical is not None else self._sample_kwargs()
+        extra, samples = self._frequency_relabel(
+            extra, self._sample_kwargs(), self.frequencies, axes[2]
         )
         return self._new_grid(
             *axes,
@@ -1458,6 +1486,7 @@ class GridAxesMixin:
             **samples,
             rcs_domain="power_phase",
             extra=extra,
+            _adopt_clean_arrays=True,
         )
 
     def round_azimuths(self, decimals: int):
@@ -1487,4 +1516,5 @@ class GridAxesMixin:
                 coordinate_change="shift-elevation",
                 preserve_angular_contract=False,
             ),
+            _adopt_clean_arrays=True,
         )

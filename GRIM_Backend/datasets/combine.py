@@ -1318,9 +1318,10 @@ class GridCombineMixin:
                     raw[final_missing] = np.nan
                     overlap_extra[raw_key] = raw
             if grid.storage_kind == "complex":
-                field = np.array(grid.rcs_slice(source_selection), copy=True)
-                field[final_missing] = np.nan + 1j * np.nan
-                samples = {"rcs": field}
+                # Owned samples (raw solver field or physical field) that the
+                # constructor adopts; masking NaN pairs keeps them clean.
+                samples = grid._sample_kwargs(source_selection)
+                samples["rcs"][final_missing] = np.nan + 1j * np.nan
             else:
                 samples = {
                     "rcs_power": power[final_common_selection],
@@ -1338,6 +1339,7 @@ class GridCombineMixin:
                     history=grid.history,
                     units=dict(grid.units),
                     extra=overlap_extra,
+                    _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
                 )
             )
 
