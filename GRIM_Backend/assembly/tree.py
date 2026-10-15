@@ -3557,8 +3557,7 @@ def _combine_children(
         for g in coh_grids:
             if cancel_check is not None and cancel_check():
                 raise InterruptedError("Assembly build canceled.")
-            missing = np.isfinite(g.power) & ~np.isfinite(g.phase)
-            if np.any(missing):
+            if g.phase_coverage() != "complete":
                 raise ValueError(
                     "a branch containing incoherent or phase-unknown data cannot "
                     "be used as a coherent assembly child"

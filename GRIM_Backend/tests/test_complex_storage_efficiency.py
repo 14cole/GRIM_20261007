@@ -3,7 +3,9 @@
 These pin the allocation and validation behaviour that the complex-storage
 migration enables: power reads that never copy the field, single-copy
 advanced-index reads, exact rearrangements that adopt their fresh samples,
-raw solver subsets that stay raw, and raw-pair checks that cost O(1) per read.
+raw solver subsets that stay raw, raw-pair checks that cost O(1) per read,
+phase-availability answers that read no sample of canonical storage, native
+loads that adopt the decoded field, and phase reads with a single scratch mask.
 """
 from __future__ import annotations
 
@@ -14,7 +16,12 @@ import pytest
 
 from GRIM_Backend.datasets.constants import C0
 from GRIM_Backend.datasets.grid import RcsGrid
-from GRIM_Backend.datasets.transforms import duplicate_dataset
+from GRIM_Backend.datasets.transforms import (
+    convert_extrusion,
+    duplicate_dataset,
+    translate_phase_center,
+)
+from GRIM_Backend.reports.plot_data import NamedGrid, _phase_capability
 
 
 def _field(shape, dtype=np.complex128, seed=0):
@@ -350,3 +357,198 @@ def test_raw_normalization_predicate_mirrors_the_pair_normalizer():
     with pytest.raises(ValueError, match="normalization is not defined"):
         RcsGrid(*_axes(shape), rcs=raw, rcs_storage_domain="raw_field",
                 units={"rcs_linear_quantity": "power_ratio", "rcs_log_unit": "dB"})
+
+
+def test_phase_coverage_answers_from_storage_kind_and_scans_only_polar_pairs(monkeypatch):
+    shape = (256, 4, 64, 2)
+    field = _field(shape)
+    ds = RcsGrid(*_axes(shape), rcs=field)
+    assert ds.storage_kind == "complex" and ds.phase_coverage() == "complete"
+    assert ds._unknown_phase_count() == 0
+    power_only = RcsGrid(*_axes(shape), rcs_power=np.abs(field) ** 2)
+    assert power_only.storage_kind == "power" and power_only.phase_coverage() == "none"
+    assert power_only._unknown_phase_count() == field.size - 1  # every finite sample
+    # Neither canonical kind reads a sample (about 2 MiB of full-grid masks before).
+    assert _peak_bytes(ds.phase_coverage) < 16 * 1024
+    assert _peak_bytes(power_only.phase_coverage) < 16 * 1024
+
+    power = np.abs(field) ** 2
+    phase = np.angle(field)
+    phase[5:9, 0, :, 0] = np.nan  # finite power without a phase
+    mixed = RcsGrid(*_axes(shape), rcs_power=power, rcs_phase=phase)
+    assert mixed.storage_kind == "power_phase" and mixed.phase_coverage() == "partial"
+    assert mixed._unknown_phase_count() == 4 * 64
+    # The scan is bounded by the validation block, not by the grid.
+    monkeypatch.setattr("GRIM_Backend.datasets.storage._RAW_COMPLEX_VALIDATION_BLOCK_CELLS", 4096)
+    assert mixed.phase_coverage() == "partial" and mixed._unknown_phase_count() == 4 * 64
+    assert _peak_bytes(mixed.phase_coverage) < 64 * 1024
+    assert _peak_bytes(mixed._unknown_phase_count) < 64 * 1024
+
+    exceptional_power, exceptional_phase = power.copy(), np.angle(field)
+    exceptional_power[3, 0, 0, 0] = 0.0
+    exceptional_phase[3, 0, 0, 0] = 1.0  # a nonzero phase at zero power keeps polar storage
+    exceptional = RcsGrid(*_axes(shape), rcs_power=exceptional_power, rcs_phase=exceptional_phase)
+    assert exceptional.storage_kind == "power_phase" and exceptional.phase_coverage() == "complete"
+
+    small = (4, 1, 2, 1)
+    empty = RcsGrid(*_axes(small), rcs_power=np.full(small, np.nan))
+    assert empty.phase_coverage() == "none" and empty._unknown_phase_count() == 0
+    legacy = RcsGrid(*_axes(small), rcs=_field(small))
+    legacy.rcs_phase[2, 0, 0, 0] = np.nan  # a legacy edit removes one phase
+    assert legacy.storage_kind == "legacy_power_phase"
+    assert legacy.phase_coverage() == "partial" and legacy._unknown_phase_count() == 1
+
+
+def test_phase_availability_checks_read_no_samples_of_complex_grids(monkeypatch):
+    shape = (256, 4, 64, 2)
+    field = _field(shape)
+    ds = RcsGrid(*_axes(shape), rcs=field, units=_sigma_units("sigma_3d"))
+    other = RcsGrid(*_axes(shape), rcs=_field(shape, seed=1), units=_sigma_units("sigma_3d"))
+    reads = []
+    for name in ("power_slice", "phase_slice"):
+        original = getattr(RcsGrid, name)
+
+        def counting(self, selection=Ellipsis, *, _name=name, _original=original):
+            reads.append((_name, selection))
+            return _original(self, selection)
+
+        monkeypatch.setattr(RcsGrid, name, counting)
+
+    ds._assert_compatible(other, coherent=True)
+    assert _phase_capability((NamedGrid("a", ds), NamedGrid("b", other)))[0]
+    moved = translate_phase_center(ds, x_m=0.1, y_m=0.0, z_m=0.0)
+    assert moved.storage_kind == "complex"
+    assert reads == []
+    # Each check used to build full power and phase arrays (about 2.4 MiB here).
+    assert _peak_bytes(lambda: ds._assert_compatible(other, coherent=True)) < 16 * 1024
+    assert _peak_bytes(lambda: _phase_capability((NamedGrid("a", ds),))) < 16 * 1024
+
+    power_only = RcsGrid(*_axes(shape), rcs_power=np.abs(field) ** 2, units=_sigma_units("sigma_3d"))
+    with pytest.raises(ValueError, match=r"requires phase; right grid has \d+ finite-power sample"):
+        ds._assert_compatible(power_only, coherent=True)
+    assert _phase_capability((NamedGrid("p", power_only),))[2].startswith(
+        "No finite stored phase is available for: p"
+    )
+    with pytest.raises(ValueError, match="needs complex"):
+        translate_phase_center(power_only, x_m=0.1, y_m=0.0, z_m=0.0)
+
+    phase = np.angle(field)
+    phase[5:9, 0, :, 0] = np.nan
+    mixed = RcsGrid(*_axes(shape), rcs_power=np.abs(field) ** 2, rcs_phase=phase,
+                    units=_sigma_units("sigma_3d"))
+    assert _phase_capability((NamedGrid("m", mixed),))[0]  # partial phase still plots
+    with pytest.raises(ValueError, match=r"left grid has 256 finite-power sample\(s\) with unknown phase"):
+        mixed._assert_compatible(ds, coherent=True)
+    shifted = translate_phase_center(mixed, x_m=0.1, y_m=0.0, z_m=0.0)
+    assert shifted.storage_kind == "power_phase"
+    np.testing.assert_array_equal(np.isnan(np.asarray(shifted.phase)), np.isnan(phase))
+
+
+def test_convert_extrusion_scales_the_complex_field_without_a_power_grid(monkeypatch):
+    shape = (256, 4, 64, 2)
+    field = _field(shape)
+    ds = RcsGrid(*_axes(shape), rcs=field, units=_sigma_units("sigma_3d"))
+    reads = []
+    original = RcsGrid.power_slice
+    monkeypatch.setattr(RcsGrid, "power_slice",
+                        lambda self, selection=Ellipsis: reads.append(selection) or original(self, selection))
+    width = convert_extrusion(ds, to="dbke", length_m=2.0)
+    assert reads == []
+    assert width.storage_kind == "complex" and width.linear_quantity() == "sigma_2d"
+    frequency_hz = np.asarray(ds.frequencies, dtype=float) * 1.0e9
+    scale = (C0 / (2.0 * 2.0 * 2.0 * frequency_hz)).reshape(1, 1, -1, 1)
+    np.testing.assert_array_equal(width.rcs, field * np.sqrt(scale))
+    # Field copy, scaled field and the constructor's copy; the unused power
+    # grid added half a field (about 2.7x before).
+    assert _peak_bytes(lambda: convert_extrusion(ds, to="dbke", length_m=2.0)) < 2.5 * field.nbytes
+
+    phase = np.angle(field)
+    phase[5:9, 0, :, 0] = np.nan
+    polar = RcsGrid(*_axes(shape), rcs_power=np.abs(field) ** 2, rcs_phase=phase,
+                    units=_sigma_units("sigma_3d"))
+    assert polar.storage_kind == "power_phase"
+    converted = convert_extrusion(polar, to="dbke", length_m=2.0)
+    np.testing.assert_array_equal(np.asarray(converted.power), np.asarray(polar.power) * scale)
+    np.testing.assert_array_equal(np.asarray(converted.phase), np.asarray(polar.phase))
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_native_load_adopts_the_decoded_complex_field(tmp_path, monkeypatch, compressed):
+    shape = (512, 4, 64, 2)  # 4 MiB of complex128 samples
+    field = _field(shape)
+    # Validation blocks are a constant, not a fraction of the grid; shrink
+    # them so the bounds below reflect a large archive.
+    monkeypatch.setattr("GRIM_Backend.io.native._RAW_COMPLEX_VALIDATION_BLOCK_CELLS", 8192)
+    physical = RcsGrid(*_axes(shape), rcs=field, units=_sigma_units("sigma_3d"))
+    path = physical.save(tmp_path / "physical", compressed=compressed)
+    restored = RcsGrid.load(path)
+    assert restored.storage_kind == "complex" and restored.storage_domain == "physical"
+    np.testing.assert_array_equal(restored.rcs, field)
+    assert restored._complex.flags.owndata and not restored._complex.flags.writeable
+    # The decoded member becomes the stored field: no constructor copy and no
+    # grid-sized masks (about 2.2x before).  Archive decoding itself keeps a
+    # few hundred KiB of transient buffers, hence the minimum of two runs.
+    assert min(_peak_bytes(lambda: RcsGrid.load(path)) for _ in range(2)) < 1.6 * field.nbytes
+
+    raw = RcsGrid(*_axes(shape), rcs=field, rcs_storage_domain="raw_field", units=_sigma_units("sigma_3d"))
+    raw_path = raw.save(tmp_path / "raw", compressed=compressed)
+    restored_raw = RcsGrid.load(raw_path)
+    assert restored_raw.storage_kind == "complex" and restored_raw.storage_domain == "raw_field"
+    np.testing.assert_array_equal(restored_raw.rcs, raw.rcs)
+    np.testing.assert_array_equal(restored_raw.extra["rcs_amp_imag"], field.imag)
+    assert np.shares_memory(restored_raw.extra["rcs_amp_real"], restored_raw._complex)
+    assert min(_peak_bytes(lambda: RcsGrid.load(raw_path)) for _ in range(2)) < 1.6 * field.nbytes
+
+
+def test_native_arrays_from_a_mapping_are_copied_not_adopted():
+    shape = (16, 2, 4, 2)
+    field = _field(shape)
+    grid = RcsGrid(*_axes(shape), rcs=field)
+    payload = grid._native_archive_payload()
+    assert payload["rcs_complex"] is grid._complex  # the mapping holds the live array
+    restored = RcsGrid._from_native_arrays(payload)
+    np.testing.assert_array_equal(restored.rcs, field)
+    assert not np.shares_memory(restored._complex, grid._complex)
+
+
+def _former_phase(field, wrap, real_dtype):
+    """The phase formula before the in-place rewrite, kept to pin identical values."""
+    result = np.angle(field)
+    result = np.where(np.isfinite(field.real) & np.isfinite(field.imag), result, np.nan)
+    if wrap == "0_360":
+        result = np.where(result < 0, result + 2 * np.pi, result)
+        result = np.where(result >= 2 * np.pi, 0., result)
+    elif wrap == "-180_180":
+        result = np.where(result >= np.pi, -np.pi, result)
+    return result.astype(real_dtype, copy=False)
+
+
+@pytest.mark.parametrize("dtype", [np.complex64, np.complex128])
+@pytest.mark.parametrize("wrap", ["", "0_360", "-180_180"])
+def test_phase_reads_are_bit_identical_with_one_scratch_mask(dtype, wrap):
+    shape = (256, 4, 64, 2)
+    field = _field(shape, dtype)
+    field[2, 0, 0, 0] = -1.0 + 0.0j            # exactly pi
+    field[3, 0, 0, 0] = complex(-1.0, -0.0)    # exactly -pi
+    field[4, 0, 0, 0] = complex(1.0, -0.0)     # negative zero
+    field[5, 0, 0, 0] = complex(1.0, -1e-17)   # wraps up to exactly 2*pi
+    real_dtype = np.dtype(np.float32 if dtype == np.complex64 else np.float64)
+    ds = RcsGrid(*_axes(shape), rcs=field, units={"phase_wrap": wrap} if wrap else {})
+    expected = _former_phase(ds.rcs, wrap, real_dtype)
+    phase = np.asarray(ds.phase)
+    assert phase.dtype == real_dtype and not phase.flags.writeable
+    np.testing.assert_array_equal(phase, expected)
+    assert np.isnan(phase[0, 0, 0, 0])
+    if wrap == "0_360":
+        assert phase[5, 0, 0, 0] == 0.0 and phase[3, 0, 0, 0] == expected[3, 0, 0, 0]
+    elif wrap == "-180_180":
+        assert phase[2, 0, 0, 0] == -np.pi and phase[3, 0, 0, 0] == -np.pi
+    np.testing.assert_array_equal(ds.phase[2:6, 0, :, 1], expected[2:6, 0, :, 1])
+    selection = np.ix_([1, 3], [0], [0, 7], [1])
+    np.testing.assert_array_equal(ds.phase[selection], expected[selection])
+    scalar = ds.phase[3, 0, 0, 0]
+    assert np.ndim(scalar) == 0 and scalar == expected[3, 0, 0, 0]
+    # One result plus one boolean scratch array (about 1.13x the result for
+    # float64, 1.25x for float32); the former angle/where chain peaked at
+    # 2.1x to 3.3x.
+    assert _peak_bytes(lambda: np.asarray(ds.phase)) < 1.5 * field.size * real_dtype.itemsize

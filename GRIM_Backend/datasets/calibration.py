@@ -248,35 +248,18 @@ class GridCalibrationMixin:
 
         measured_pol_index = [measured_pols.index(label) for label in dut_pols]
         exact_pol_index = [exact_pols.index(label) for label in dut_pols]
+        # Every storage kind returns ``0+0j`` for a zero-power sample, so the
+        # fields need no power grid to repair them, and nothing below edits
+        # these fresh arrays in place.
         measured_amp = np.asarray(
-            measured_calibration.rcs[..., measured_pol_index], dtype=np.complex128
+            measured_calibration.rcs_slice((Ellipsis, measured_pol_index)),
+            dtype=np.complex128,
         )
         exact_amp = np.asarray(
-            exact_reference.rcs[..., exact_pol_index], dtype=np.complex128
+            exact_reference.rcs_slice((Ellipsis, exact_pol_index)),
+            dtype=np.complex128,
         )
         dut_amp = np.asarray(self.rcs, dtype=np.complex128)
-        measured_power = np.asarray(
-            measured_calibration.power[..., measured_pol_index]
-        )
-        exact_power = np.asarray(exact_reference.power[..., exact_pol_index])
-        dut_power = np.asarray(self.power)
-
-
-        exact_zero_power = np.isfinite(exact_power) & (exact_power == 0.0)
-        dut_zero_power = np.isfinite(dut_power) & (dut_power == 0.0)
-        exact_amp = np.array(exact_amp, copy=True)
-        dut_amp = np.array(dut_amp, copy=True)
-        exact_amp[exact_zero_power & ~np.isfinite(exact_amp)] = 0.0 + 0.0j
-        dut_amp[dut_zero_power & ~np.isfinite(dut_amp)] = 0.0 + 0.0j
-
-
-        measured_amp = np.array(measured_amp, copy=True)
-        measured_zero_power = np.isfinite(measured_power) & (
-            measured_power == 0.0
-        )
-        measured_amp[
-            measured_zero_power & ~np.isfinite(measured_amp)
-        ] = 0.0 + 0.0j
 
         range_phase = np.exp(
             -1j * (4.0 * np.pi * frequency_hz * offset_m / C0)

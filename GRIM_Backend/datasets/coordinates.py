@@ -317,9 +317,7 @@ class GridCoordinatesMixin:
         tau_sorted = tau_deg[tau_order]
         if np.any(np.diff(tau_sorted) <= 1.0e-9):
             raise ValueError("Wedge tilt axis contains duplicate coordinates")
-        if np.any(
-            np.isfinite(self.power) & ~np.isfinite(self.phase)
-        ):
+        if self.phase_coverage() != "complete":
             raise ValueError(
                 "Wedge-to-Conic Jones rotation requires finite phase for every "
                 "finite polarization sample; power-only data cannot be rotated"

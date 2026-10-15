@@ -13,6 +13,9 @@ import weakref
 import numpy as np
 from numpy.lib.mixins import NDArrayOperatorsMixin
 
+from GRIM_Backend.datasets.constants import _RAW_COMPLEX_VALIDATION_BLOCK_CELLS
+from GRIM_Backend.datasets.memory import _bounded_grid_selections
+
 
 def _readonly(value):
     array = np.asarray(value)
@@ -179,6 +182,54 @@ class GridStorageMixin:
     def storage_domain(self):
         return self._storage_domain
 
+    def phase_coverage(self):
+        """Report the stored phase as ``"complete"``, ``"partial"`` or ``"none"``.
+
+        A sample carries a phase when both its power and its phase are
+        finite.  ``"complete"`` means every finite-power sample does,
+        ``"partial"`` that only some do and ``"none"`` that no sample does.
+        Canonical complex storage is complete and power-only storage has
+        none, so both answer without reading a sample.  Only a
+        ``power_phase`` grid (exceptional phase information that complex
+        storage cannot encode) or the legacy writable arrays are scanned,
+        in bounded blocks that stop as soon as the verdict is known.  A grid
+        without any finite sample reports ``"none"``.
+        """
+        self._ensure_legacy_source_current()
+        if self._storage_kind == "complex":
+            return "complete"
+        if self._phase is None:
+            return "none"
+        power, phase = np.asarray(self._power), np.asarray(self._phase)
+        has_phase = has_unknown = False
+        if power.size:
+            for selection in _bounded_grid_selections(power.shape, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS):
+                finite_power = np.isfinite(power[selection])
+                finite_phase = np.isfinite(phase[selection])
+                has_phase = has_phase or bool(np.any(finite_power & finite_phase))
+                has_unknown = has_unknown or bool(np.any(finite_power & ~finite_phase))
+                if has_phase and has_unknown:
+                    break
+        if not has_phase:
+            return "none"
+        return "partial" if has_unknown else "complete"
+
+    def _unknown_phase_count(self):
+        """Count finite-power samples without a phase, in bounded blocks."""
+        self._ensure_legacy_source_current()
+        if self._storage_kind == "complex":
+            return 0
+        power = np.asarray(self._power)
+        phase = None if self._phase is None else np.asarray(self._phase)
+        count = 0
+        if power.size:
+            for selection in _bounded_grid_selections(power.shape, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS):
+                unknown = np.isfinite(power[selection])
+                if phase is not None:
+                    unknown &= ~np.isfinite(phase[selection])
+                count += int(np.count_nonzero(unknown))
+        return count
+
     @property
     def power(self):
         return self._power if self._legacy_samples else SampleComponent(self, "power")
@@ -309,13 +360,24 @@ class GridStorageMixin:
         if self._complex is None:
             return _readonly(np.full(np.shape(self._power[selection]), np.nan, dtype=self.real_dtype))
         field = self._complex_samples(selection, owned=False)
-        result = np.angle(field)
-        result = np.where(np.isfinite(field.real) & np.isfinite(field.imag), result, np.nan)
-        if str(self.units.get("phase_wrap", "")).strip() == "0_360":
-            result = np.where(result < 0, result + 2 * np.pi, result)
-            result = np.where(result >= 2 * np.pi, 0., result)
-        elif str(self.units.get("phase_wrap", "")).strip() == "-180_180":
-            result = np.where(result >= np.pi, -np.pi, result)
+        wrap = str(self.units.get("phase_wrap", "")).strip()
+        # ``arctan2`` on the component views is what ``np.angle`` computes
+        # and allocates only the result; one boolean scratch array then
+        # serves every mask and the wrap is applied in place.  NaN
+        # components already propagate; the first mask also hides
+        # infinities.  Scalar selections become 0-d arrays, as before.
+        result = np.asarray(np.arctan2(field.imag, field.real))
+        scratch = np.asarray(np.isfinite(field))
+        np.logical_not(scratch, out=scratch)
+        np.copyto(result, np.nan, where=scratch)
+        if wrap == "0_360":
+            np.less(result, 0, out=scratch)
+            np.add(result, 2 * np.pi, out=result, where=scratch)
+            np.greater_equal(result, 2 * np.pi, out=scratch)
+            np.copyto(result, 0.0, where=scratch)
+        elif wrap == "-180_180":
+            np.greater_equal(result, np.pi, out=scratch)
+            np.copyto(result, -np.pi, where=scratch)
         return _readonly(result.astype(self.real_dtype, copy=False))
 
     def _expose_legacy_samples(self):

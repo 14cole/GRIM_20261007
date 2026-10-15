@@ -774,13 +774,16 @@ class GridMetadataMixin:
                 raise TypeError("_scan_phase_samples must be True or False")
             if _scan_phase_samples:
                 for label, grid in (("left", self), ("right", other)):
-                    missing = np.isfinite(grid.power) & ~np.isfinite(grid.phase)
-                    if np.any(missing):
-                        raise ValueError(
-                            f"coherent operation requires phase; {label} grid has "
-                            f"{int(np.count_nonzero(missing))} finite-power sample(s) "
-                            "with unknown phase"
-                        )
+                    # Reads no sample for complex or power-only storage; a
+                    # power/phase pair is scanned in bounded blocks.
+                    if grid.phase_coverage() == "complete":
+                        continue
+                    missing = grid._unknown_phase_count()
+                    raise ValueError(
+                        f"coherent operation requires phase; {label} grid has "
+                        + (f"{missing} finite-power sample(s) with unknown phase"
+                           if missing else "no sample with a known phase")
+                    )
             self._assert_coherent_metadata_compatible(
                 other, metadata_attested=coherent_metadata_attested
             )

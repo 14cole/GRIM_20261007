@@ -573,7 +573,6 @@ def convert_extrusion(dataset: RcsGrid, *, to: str, length_m: float) -> RcsGrid:
         quantity = "sigma_3d"
     scale = np.where(np.isfinite(frequency_hz) & (frequency_hz > 0.0), scale, np.nan)
     scale_4d = scale.reshape(1, 1, -1, 1)
-    power = dataset.power * scale_4d
     units = dict(dataset.units or {})
     units["rcs_log_unit"] = "dBke" if destination == "dbke" else "dBsm"
     units["rcs_linear_quantity"] = quantity
@@ -592,6 +591,7 @@ def convert_extrusion(dataset: RcsGrid, *, to: str, length_m: float) -> RcsGrid:
             units=units,
             extra=_derived_response_extra(dataset),
         )
+    power = dataset.power * scale_4d
     return RcsGrid(
         dataset.azimuths,
         dataset.elevations,
@@ -1378,8 +1378,14 @@ def translate_phase_center(
     if not np.any(offset):
         raise ValueError("the phase-center offset is zero")
     power = dataset.power
-    phase_in = _authoritative_response_phase(dataset)
-    if not np.any(np.isfinite(power) & np.isfinite(phase_in)):
+    complex_storage = dataset.storage_kind == "complex"
+    # Complex storage carries a phase for every finite sample and is shifted
+    # below straight from its field, so only power/phase storage needs the
+    # authoritative phase array, and only a grid without any phase scans it.
+    phase_in = None if complex_storage else _authoritative_response_phase(dataset)
+    if dataset.phase_coverage() == "none" and not np.any(
+        np.isfinite(power) & np.isfinite(phase_in)
+    ):
         raise ValueError("moving the phase center needs complex (phase) data")
     azimuth = _angle_axis_radians(dataset, "azimuth")
     elevation = _angle_axis_radians(dataset, "elevation")
@@ -1406,7 +1412,6 @@ def translate_phase_center(
         + np.sin(elevation)[None, :] * offset[2]
     )
     sign = 1.0 if _declared_time_sign(dataset) == "-jwt" else -1.0
-    complex_storage = dataset.storage_kind == "complex"
     shifted_response = np.empty(
         power.shape, dtype=np.complex128 if complex_storage else np.float64
     )

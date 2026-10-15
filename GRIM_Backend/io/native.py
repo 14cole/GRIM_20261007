@@ -11,10 +11,38 @@ from GRIM_Backend.datasets.memory import _bounded_grid_selections
 
 from GRIM_Backend.datasets.constants import (
     C0,
+    _ADOPT_CLEAN_ARRAYS_TOKEN,
     _ANGLE_UNITS,
     _FREQUENCY_UNITS,
     _RAW_COMPLEX_VALIDATION_BLOCK_CELLS,
 )
+
+
+def _owned_decoded_member(array):
+    """Return a freshly decoded NPZ member as an array that owns its buffer.
+
+    ``numpy.load`` reads a member into a new one-dimensional buffer and hands
+    back a reshaped view of it, so the view does not own its data although
+    nothing else references the buffer.  Reshaping that buffer in place
+    yields an owned array of the member's shape.  Any other layout (for
+    example a Fortran-ordered member) is returned as is and copied later.
+    """
+    if array.flags.owndata:
+        return array
+    base = array.base
+    if (
+        isinstance(base, np.ndarray)
+        and base.flags.owndata
+        and base.ndim == 1
+        and base.dtype == array.dtype
+        and base.size == array.size
+        and base.flags.c_contiguous
+        and array.flags.c_contiguous
+        and base.ctypes.data == array.ctypes.data
+    ):
+        base.shape = array.shape
+        return base
+    return array
 
 
 class NativeFormatMixin:
@@ -654,11 +682,26 @@ class NativeFormatMixin:
                 if domain == "raw_field":
                     if "rcs_amp_real" in extra or "rcs_amp_imag" in extra:
                         raise ValueError(f"{path} redundantly declares raw complex samples")
+                # The block scan above proves every sample is finite or a NaN
+                # pair, so a member NumPy decoded into its own buffer becomes
+                # the stored field without the constructor's copy and masks.
+                # Arrays supplied through a mapping may still be referenced by
+                # the caller and are copied as before, as is a physical field
+                # that the constructor must check against a retained raw pair.
+                adopt = False
+                if (
+                    isinstance(data, np.lib.npyio.NpzFile)
+                    and field.dtype in (np.complex64, np.complex128)
+                    and not any(key in extra for key in ("rcs_amp_real", "rcs_amp_imag"))
+                ):
+                    field = _owned_decoded_member(field)
+                    adopt = bool(field.flags.owndata)
                 # Validate through bounded derived views rather than allocating
                 # complete normalized-field, power, and phase copies on load.
                 candidate = cls(data["azimuths"], data["elevations"], data["frequencies"],
                                 data["polarizations"], rcs=field, rcs_storage_domain=domain,
-                                units=units, extra=extra)
+                                units=units, extra=extra,
+                                _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN if adopt else None)
                 power, phase, extra = candidate.power, candidate.phase, candidate.extra
             else:
                 power = np.asarray(data["rcs_power"])

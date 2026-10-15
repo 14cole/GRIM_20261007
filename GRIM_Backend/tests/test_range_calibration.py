@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -401,6 +402,65 @@ class RangeCalibrationTest(unittest.TestCase):
             "exact_reference_content_sha256"
         ]
         self.assertNotEqual(hash_a, hash_b)
+
+    def test_zero_power_cells_calibrate_without_a_power_grid(self) -> None:
+        # A zero field is fully known in every storage kind: a zero DUT cell
+        # calibrates to zero, a zero exact standard gives a zero correction
+        # factor and a zero measured denominator masks its bin.  Range Cal
+        # no longer builds power grids to repair such cells because ``rcs``
+        # already returns 0+0j for zero power.
+        frequencies = (9.0, 10.0)
+        exact_amp = np.asarray([[[[2.0 + 0.5j, 1.0 - 0.25j], [1.5 - 0.2j, 0.0j]]]])
+        measured_amp = np.asarray([[[[0.5 + 0.3j, 0.0j], [0.8 - 0.4j, 0.7 + 0.2j]]]])
+        truth = np.asarray(
+            [
+                [[[1.0 + 2.0j, 0.5 - 0.4j], [0.0j, 1.0 + 0.1j]]],
+                [[[0.8 - 0.6j, 1.3 + 0.7j], [0.4 + 0.9j, 2.0 - 1.0j]]],
+            ]
+        )
+        dut = _grid(truth, azimuths=(-10.0, 10.0), frequencies=frequencies)
+        exact = _grid(exact_amp, frequencies=frequencies)
+        measured = _grid(measured_amp, frequencies=frequencies)
+        reads = []
+        original = RcsGrid.power_slice
+        with mock.patch.object(
+            RcsGrid,
+            "power_slice",
+            lambda self, selection=Ellipsis: reads.append(selection) or original(self, selection),
+        ):
+            result = dut.range_calibrate(
+                measured, exact, 0.0,
+                allow_singleton_angular_broadcast=True, convention_attested=True,
+            )
+        # Only the two provenance hashes read a power grid.
+        self.assertEqual(len(reads), 2)
+        with np.errstate(invalid="ignore"):
+            expected = truth * exact_amp / np.where(measured_amp == 0.0, np.nan, measured_amp)
+        np.testing.assert_allclose(result.rcs, expected, rtol=1.0e-12, atol=1.0e-12)
+        self.assertEqual(result.rcs[0, 0, 1, 0], 0.0 + 0.0j)  # zero DUT cell
+        self.assertEqual(result.rcs[1, 0, 1, 1], 0.0 + 0.0j)  # zero exact standard
+        self.assertTrue(np.all(np.isnan(result.rcs[:, 0, 0, 1])))  # zero measured denominator
+        gain = json.loads(result.extra["range_calibration_json"])["correction_gain_db"]
+        self.assertEqual(gain["zero_factor_count"], 1)
+        self.assertEqual(gain["zero_measured_denominator_bin_count"], 1)
+        self.assertEqual(gain["masked_output_bin_count"], 2)
+
+        # Power/phase storage with an unknown phase at the zero cell reaches
+        # the same result: the former repair targeted exactly this case.
+        power = np.abs(truth) ** 2
+        phase = np.angle(truth)
+        phase[0, 0, 1, 0] = np.nan
+        polar = RcsGrid(
+            dut.azimuths, dut.elevations, dut.frequencies, dut.polarizations,
+            rcs_power=power, rcs_phase=phase, units=dict(dut.units),
+        )
+        self.assertEqual(polar.storage_kind, "power_phase")
+        polar_result = polar.range_calibrate(
+            measured, exact, 0.0,
+            allow_singleton_angular_broadcast=True, convention_attested=True,
+        )
+        np.testing.assert_allclose(polar_result.rcs, expected, rtol=1.0e-12, atol=1.0e-12)
+        self.assertEqual(polar_result.rcs[0, 0, 1, 0], 0.0 + 0.0j)
 
 
 if __name__ == "__main__":

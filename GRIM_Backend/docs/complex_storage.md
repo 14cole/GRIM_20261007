@@ -53,6 +53,12 @@ slice. `numpy.asarray(dataset.power)` explicitly requests the full power
 array. `dataset.rcs` returns the full physical complex array; `rcs_slice`
 avoids that full-grid allocation. Derived full-grid caches are not retained.
 
+`dataset.phase_coverage()` reports whether every finite sample carries a
+phase (`"complete"`), only some do (`"partial"`), or none does (`"none"`).
+Complex and power-only storage answer without reading a sample; a mixed
+power/phase pair is scanned in bounded blocks. Use it instead of testing
+`numpy.isfinite` on the full phase array.
+
 Use explicit methods when changing samples:
 
 ```python

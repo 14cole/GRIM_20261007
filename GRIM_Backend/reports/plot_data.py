@@ -382,10 +382,13 @@ def _text_intersection(axis_values: Sequence[np.ndarray]) -> tuple[str, ...]:
 
 
 def _phase_capability(datasets: tuple[NamedGrid, ...]) -> tuple[bool, str, str]:
+    # Complex storage carries a phase for every finite sample and power-only
+    # storage none, so this reads no sample unless a grid keeps an
+    # exceptional power/phase pair, which is scanned in bounded blocks.
     missing_phase = [
         dataset.name
         for dataset in datasets
-        if not np.any(np.isfinite(np.asarray(dataset.grid.phase, dtype=float)))
+        if dataset.grid.phase_coverage() == "none"
     ]
     if missing_phase:
         return (

@@ -567,10 +567,7 @@ class GridAxesMixin:
             phase_interp = np.full(power_interp.shape, np.nan, dtype=np.float64)
         # Unknown phase cannot produce usable complex interpolation. Retained
         # raw amplitudes still take precedence even when rcs_phase is unknown.
-        has_phase = complex_storage or any(
-            np.any(np.isfinite(self.phase.flat[start:start + 262_144]))
-            for start in range(0, self.phase.size, 262_144)
-        )
+        has_phase = self.phase_coverage() != "none"
         if has_phase or self._complete_authoritative_raw_arrays() is not None:
             complex_interp = self._interp_complex_axis(
                 np.asarray(self.rcs, dtype=np.complex128),
