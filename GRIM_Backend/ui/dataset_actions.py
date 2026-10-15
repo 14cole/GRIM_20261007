@@ -370,6 +370,20 @@ def _load_dataset_from_dropped_text(path: str) -> tuple["RcsGrid", str]:
     return dataset, history
 
 
+HISTORY_COLUMN = 2
+HISTORY_COLUMN_SETTINGS_KEY = "datasets/show-history-column-v1"
+
+
+def _setting_flag(value) -> bool:
+    """Interpret a QSettings value as a flag; INI backends hand back strings."""
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on"}
+    try:
+        return bool(value)
+    except (TypeError, ValueError):
+        return False
+
+
 class DatasetOpsMixin:
     def _preflight_derived_outputs(
         self,
@@ -3392,37 +3406,78 @@ class DatasetOpsMixin:
             return
         self.table.selectAll()
 
+    def _history_column_visible(self) -> bool:
+        return not self.table.isColumnHidden(HISTORY_COLUMN)
+
+    def _set_history_column_visible(self, visible: bool, *, persist: bool = True) -> None:
+        """Show or hide the History column; the choice is remembered between sessions."""
+        visible = bool(visible)
+        self.table.setColumnHidden(HISTORY_COLUMN, not visible)
+        if not persist:
+            return
+        settings = getattr(self, "_settings", None)
+        if settings is None:
+            return
+        settings.setValue(HISTORY_COLUMN_SETTINGS_KEY, visible)
+        sync = getattr(settings, "sync", None)
+        if callable(sync):
+            sync()
+
+    def _restore_history_column_visibility(self) -> None:
+        """Apply the saved History column choice; the column is hidden by default."""
+        settings = getattr(self, "_settings", None)
+        saved = (
+            settings.value(HISTORY_COLUMN_SETTINGS_KEY, False)
+            if settings is not None else False
+        )
+        self._set_history_column_visible(_setting_flag(saved), persist=False)
+
     def _on_dataset_context_menu(self, pos) -> None:
         clicked = self.table.indexAt(pos)
-        if not self.table.selectionModel().selectedRows():
-            if clicked.isValid():
-                self.table.selectRow(clicked.row())
-            else:
-                return
+        if not self.table.selectionModel().selectedRows() and clicked.isValid():
+            self.table.selectRow(clicked.row())
+        has_rows = bool(self.table.selectionModel().selectedRows())
         menu = QMenu(self)
-        action_save = menu.addAction("Save")
-        export_menu = menu.addMenu("Export as…")
-        action_export_pio = export_menu.addAction("Pioneer (.pio)…")
-        action_export_ptm = export_menu.addAction("PTM (.ptm)…")
-        action_export_csv = export_menu.addAction("CSV…")
-        action_delete = menu.addAction("Delete")
-        menu.addSeparator()
-        action_color = menu.addAction("Text Color…")
-        action_reset_color = menu.addAction("Reset Text Color")
+        action_save = action_export_pio = action_export_ptm = action_export_csv = None
+        action_delete = action_color = action_reset_color = None
+        if has_rows:
+            action_save = menu.addAction("Save")
+            export_menu = menu.addMenu("Export as…")
+            action_export_pio = export_menu.addAction("Pioneer (.pio)…")
+            action_export_ptm = export_menu.addAction("PTM (.ptm)…")
+            action_export_csv = export_menu.addAction("CSV…")
+            action_delete = menu.addAction("Delete")
+            menu.addSeparator()
+            action_color = menu.addAction("Text Color…")
+            action_reset_color = menu.addAction("Reset Text Color")
+            menu.addSeparator()
+        # The History column is hidden by default. Its toggle is reachable from
+        # any right-click on the table, including the empty area below the rows.
+        action_history = menu.addAction("Show History Column")
+        action_history.setCheckable(True)
+        action_history.setChecked(self._history_column_visible())
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
-        if action == action_save:
+        if action is None:
+            return
+        if action is action_history:
+            visible = not self._history_column_visible()
+            self._set_history_column_visible(visible)
+            self.status.showMessage(
+                "History column shown." if visible else "History column hidden."
+            )
+        elif action is action_save:
             self._save_selected_datasets()
-        elif action == action_export_pio:
+        elif action is action_export_pio:
             self._export_pio_selected()
-        elif action == action_export_ptm:
+        elif action is action_export_ptm:
             self._export_ptm_selected()
-        elif action == action_export_csv:
+        elif action is action_export_csv:
             self._export_csv_selected()
-        elif action == action_delete:
+        elif action is action_delete:
             self._delete_selected_datasets()
-        elif action == action_color:
+        elif action is action_color:
             self._set_dataset_text_color()
-        elif action == action_reset_color:
+        elif action is action_reset_color:
             self._reset_dataset_text_color()
 
     def _set_dataset_text_color(self) -> None:

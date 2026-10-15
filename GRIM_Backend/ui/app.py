@@ -907,6 +907,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_dataset_selection_changed)
         self.table.itemChanged.connect(self._on_dataset_table_item_changed)
         self.table.customContextMenuRequested.connect(self._on_dataset_context_menu)
+        self._restore_history_column_visibility()
         self.table.horizontalHeader().sectionDoubleClicked.connect(self._on_dataset_header_double_clicked)
         for context in self._plot_contexts.values():
             context.delta_map_controls.changed.connect(self._on_delta_map_controls_changed)
