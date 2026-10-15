@@ -52,6 +52,12 @@ Use **Save XY…** after applying edits to save the resulting coordinates as a f
 
 ## Measure
 
+For a quick image measurement without drawing an overlay, use **Measure** in the main toolbar while an Az. vs D.R., ISAR, or Range–Freq image is displayed. Click any two positions in the same image. The compact ruler controls provide **Clear measurement** and **Copy results**, including both coordinates, signed changes, and positive separations in the displayed units. A third click starts a new measurement. **Stop picking** or Escape pauses picking; Pan and Zoom Box also pause it. Closing the controls, clearing, or replotting removes the ruler.
+
+On Az. vs D.R., the ruler reports azimuth separation and downrange separation independently. Azimuth is an angle, so these values do not define a diagonal target-plane distance. Angular separation follows the displayed axis without wrapping around 360 degrees. On spatial ISAR images, both axes are lengths and the ruler also reports straight-line distance in the displayed plane. The clicks are continuous image coordinates, not snapped native-cell samples; measurement precision depends on where you place them. **Export Plot** includes the visible ruler, and the Python recorder identifies it as a visual annotation.
+
+For measurements tied to editable overlay geometry:
+
 - Click an overlay line segment to show its length. This measures the segment between its two neighboring points, not the entire connected outline. You can also right-click the line and choose **Measure segment**.
 - Click **Measure**, then click two overlay points. The points can belong to different overlays in the same panel. Right-click **Measure from this point** and **Measure to this point** are also available.
 - The plot shows a dashed measurement line and a label; the controls show the length and changes in X and Y. Values use five decimal places. Escape or **Finish measuring** returns to normal point dragging, while the measurement remains visible. **Clear measurement** removes it.

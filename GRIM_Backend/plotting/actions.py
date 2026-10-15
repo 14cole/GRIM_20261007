@@ -1884,6 +1884,10 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             return
         if button is not MouseButton.LEFT:
             return
+        panel = getattr(self, "inline_analysis", None)
+        measure = getattr(panel, "on_image_measurement_press", None)
+        if callable(measure) and measure(event):
+            return
         overlays = getattr(self, "spatial_overlays", None)
         if overlays is not None and overlays.on_press(event):
             return
@@ -3299,6 +3303,14 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
         recorder = getattr(self, "python_recorder", None)
         overlays = getattr(self, "spatial_overlays", None)
+        ruler = getattr(getattr(self, "inline_analysis", None), "image_measurement", None)
+        if recorder is not None and ruler is not None and any(
+                artist.axes in self.plot_figure.axes and artist.get_visible()
+                for artist in ruler.artists):
+            recorder.record_unsupported_plot(
+                "image_measurement", "image rulers are visual annotations; use Export Plot for the annotated image and Copy results for the coordinates and separations"
+            )
+            return False
         if recorder is not None and overlays is not None and overlays.has_visible_paths():
             recorder.record_unsupported_plot(
                 "spatial_overlay", "editable overlays are visual annotations; use Export Plot for the annotated image and Save XY for the points"

@@ -40,6 +40,24 @@ temporary allocations.
 
 ## Python access
 
+To correct a reversed stored phase sign, select datasets and use
+**Dataset Operations → Transform → Flip Phase**. Each selection produces a new
+dataset with the same magnitude and coordinates: I is unchanged, Q is negated,
+and phase becomes its negative. Unknown phase stays unknown. Applying it twice
+restores the original samples. The operation records the correction in history
+and Python replay; save the result to retain it in a file.
+
+This is an explicit correction of the samples, with the declared time convention
+left unchanged. It is different from adding a constant 180-degree phase shift
+or converting both the samples and their convention metadata. It can correct a
+phase-sign mismatch that mirrors a range or ISAR image; it does not alter the
+PTM or PIO loader's interpretation for other files.
+
+```python
+from GRIM_Backend.scripting.workspace import flip_phase
+corrected = flip_phase(dataset)
+```
+
 Prefer the new read accessors for analysis:
 
 ```python

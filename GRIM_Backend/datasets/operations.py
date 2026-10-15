@@ -162,6 +162,7 @@ _RESULT_DETAILS = {
     "range_calibrate": "range_calibration_json",
     "time_gate": "time_gate_json",
     "translate_phase_center": "phase_center_translation_json",
+    "flip_phase": "phase_sign_correction_json",
     "decimate_axis": "decimation_json",
     "regrid_axis": "regrid_support_json",
     "interpolate_axis": "regrid_support_json",

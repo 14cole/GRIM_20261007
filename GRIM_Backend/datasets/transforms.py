@@ -115,6 +115,92 @@ def duplicate_dataset(dataset: RcsGrid) -> RcsGrid:
     )
 
 
+@dataset_operation('flip_phase')
+def flip_phase(dataset: RcsGrid) -> RcsGrid:
+    """Correct the stored phase sign: ``I + jQ`` becomes ``I - jQ``.
+
+    Magnitude, coordinates, and the declared interpretation of the samples
+    stay unchanged. This is a phase-sign correction, not an automatic change
+    of time convention, and not a 180-degree phase offset. Unknown phases
+    remain unknown. A second flip restores the original response.
+    """
+
+    dataset._ensure_legacy_source_current()
+    extra = _derived_response_extra(dataset)
+    dataset._invalidate_assembly_sampling_hash(extra, 'flip-phase')
+    # Conjugation changes no amplitude normalization. Keep that declaration
+    # while the shared derived-response policy removes stale solver reports.
+    if 'amplitude_convention' in (dataset.extra or {}):
+        extra['amplitude_convention'] = copy.deepcopy(dataset.extra['amplitude_convention'])
+    extra.pop('raw_complex_amplitude_preserved', None)
+    units = copy.deepcopy(dataset.units or {})
+    raw_pair = (dataset._complete_authoritative_raw_arrays()
+                if dataset._raw_normalization_defined() else None)
+    if dataset._complex is not None and dataset._storage_domain == 'raw_field':
+        raw_pair = (dataset._complex.real, dataset._complex.imag)
+    blocks = lambda: _bounded_grid_selections(dataset.shape, 262_144)
+
+    if dataset._complex is not None:
+        # Retain raw solver quadratures without normalizing/reconstructing
+        # them, including a validated authoritative pair attached later.
+        if raw_pair is not None:
+            real, imag = raw_pair
+            dtype = np.result_type(real.dtype, imag.dtype, np.complex64)
+            field = allocate_result(dataset.shape, dtype)
+            for block in blocks():
+                field[block].real = real[block]
+                np.negative(imag[block], out=field[block].imag, dtype=field.real.dtype)
+            samples = {'rcs': field, 'rcs_storage_domain': 'raw_field'}
+        else:
+            field = allocate_result(dataset.shape, dataset._complex.dtype)
+            for block in blocks():
+                np.conjugate(dataset._complex[block], out=field[block])
+            samples = {'rcs': field}
+    else:
+        # Polar storage can encode unknown phase, zero-amplitude phase, and
+        # unwrapped turns that a complex field cannot. Preserve that evidence.
+        samples = {'rcs_power': copy_result(dataset._power)}
+        if dataset._phase is not None:
+            phase = allocate_result(dataset.shape, dataset._phase.dtype)
+            wrap = str(units.get('phase_wrap', '')).strip()
+            for block in blocks():
+                part = phase[block]
+                np.negative(dataset._phase[block], out=part)
+                if wrap == '0_360':
+                    finite = np.isfinite(part)
+                    part[finite] = np.remainder(part[finite], 2.0 * np.pi)
+                    part[part >= 2.0 * np.pi] = 0.0
+                elif wrap == '-180_180':
+                    outside = np.isfinite(part) & ((part < -np.pi) | (part >= np.pi))
+                    part[outside] = np.remainder(part[outside] + np.pi, 2.0 * np.pi) - np.pi
+            samples['rcs_phase'] = phase
+        if raw_pair is not None:
+            # An exceptional polar grid may retain raw authority beside
+            # unknown/zero phase. Conjugate both representations consistently
+            # without filling in any phase that the source did not store.
+            real, imag = raw_pair
+            extra['rcs_amp_real'] = copy_result(real)
+            imag_dtype = np.result_type(imag.dtype, np.float32)
+            extra['rcs_amp_imag'] = allocate_result(dataset.shape, imag_dtype)
+            for block in blocks():
+                np.negative(imag[block], out=extra['rcs_amp_imag'][block], dtype=imag_dtype)
+            extra['raw_complex_amplitude_preserved'] = True
+    extra['phase_sign_correction_json'] = json.dumps({
+        'schema': 'grim.phase-sign-correction.v1',
+        'operation': 'complex_conjugate',
+        'interpretation': 'Correct stored phase sign; declared time and phase conventions retained.',
+        'quadratures': 'I unchanged; Q negated',
+        'unknown_phase': 'preserved',
+    }, sort_keys=True)
+    return RcsGrid(
+        dataset.azimuths, dataset.elevations, dataset.frequencies,
+        dataset.polarizations, **samples,
+        rcs_domain=dataset.rcs_domain, source_path=dataset.source_path,
+        history=dataset.history, units=units, extra=extra,
+        _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
+    )
+
+
 def _positive_stride(value, name: str) -> int:
     """Validate a replayed physical-axis stride without silently rounding it."""
 

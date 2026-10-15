@@ -155,6 +155,7 @@ try:
         coherent_divide,
         convert_extrusion,
         duplicate_dataset,
+        flip_phase,
         decimate_axis,
         join_datasets,
         medianize_azimuth,

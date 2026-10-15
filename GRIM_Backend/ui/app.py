@@ -532,6 +532,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             ("Shift", "btn_shift"),
             ("Round", "btn_round"),
             ("Offset", "btn_offset"),
+            ("Flip Phase", "btn_flip_phase"),
             ("Medianize", "btn_medianize"),
             ("Duplicate", "btn_duplicate"),
             ("Time Gate…", "btn_time_gate"),
@@ -674,6 +675,11 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
             ),
             "btn_round": "Round coordinate axes without changing sample values.",
             "btn_offset": "Apply an additive level offset without inventing coherent phase.",
+            "btn_flip_phase": (
+                "Create a dataset with phase sign reversed: I stays the same and Q is negated. "
+                "Magnitude and axes are unchanged; unknown phase remains unknown. "
+                "Corrects a reversed phase sign without changing the declared time convention."
+            ),
             "btn_medianize": (
                 "Create sliding azimuth-window medians of linear power. The statistical "
                 "result has unknown phase and cannot be used as a coherent field."
@@ -1071,6 +1077,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_shift.clicked.connect(self._shift_selected)
         self.btn_round.clicked.connect(self._round_selected)
         self.btn_offset.clicked.connect(self._offset_selected)
+        self.btn_flip_phase.clicked.connect(self._flip_phase_selected)
         self.btn_range_cal.clicked.connect(self._range_cal_selected)
         self.btn_audit.clicked.connect(self._audit_selected_datasets)
         self.btn_compatibility.clicked.connect(
@@ -1962,7 +1969,7 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                 "frequency": "Frequency response by elevation/polarization. Choose individual angular cuts, linear-power mean, median, percentile, or maximum in Plot Settings.",
                 "elevation_sweep": "Elevation response by frequency/polarization. Choose individual angular cuts or an explicit aggregation in Plot Settings; coverage is reported.",
                 "waterfall": "Waterfall view over any pair of azimuth, elevation, and frequency, with linked horizontal and vertical cuts. Choose axes in Plot Settings.",
-                "measure": "Measure an existing trace on this canvas: peaks, minimum, crossings, bandwidth, and region statistics.",
+                "measure": "Measure traces (peaks, crossings, bandwidth, region statistics) or click two image points for distance. Azimuth vs Downrange reports angular and downrange separation separately.",
                 "phase_analysis": "Plot magnitude/phase, I/Q, phase residual, or phase-slope diagnostics on this canvas.",
                 "polarization": "Plot channel strengths, co-/cross-channel ratios, reciprocity, and channel phase differences on this canvas.",
                 "image_compare": "Compare captured images with locked coordinates and scales, linked cursors, blink/swipe, signed differences, and region statistics.",

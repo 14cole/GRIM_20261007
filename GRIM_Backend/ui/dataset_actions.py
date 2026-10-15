@@ -65,6 +65,7 @@ from GRIM_Backend.datasets.transforms import (
     crop_dataset,
     decimate_axis,
     duplicate_dataset,
+    flip_phase,
     medianize_azimuth,
     offset_db,
     regrid_axis,
@@ -1453,7 +1454,7 @@ class DatasetOpsMixin:
             (
                 "btn_slice", "btn_stats", "btn_percentile", "btn_interpolate",
                 "btn_decimate", "btn_mirror", "btn_wrap", "btn_shift",
-                "btn_round", "btn_offset", "btn_medianize", "btn_duplicate",
+                "btn_round", "btn_offset", "btn_flip_phase", "btn_medianize", "btn_duplicate",
                 "btn_time_gate",
                 "btn_audit", "btn_provenance",
                 "btn_axis_units", "btn_el_to_az360", "btn_swap_el_az",
@@ -4776,6 +4777,44 @@ class DatasetOpsMixin:
             operation,
             publish,
             start_message=f"Applying offset to {len(datasets)} dataset(s)...",
+        )
+
+    def _flip_phase_selected(self) -> None:
+        datasets = self._selected_datasets_ordered(
+            use_selection_order=True,
+            empty_message="Select one or more datasets to flip phase.",
+        )
+        if datasets is None:
+            return
+        source_references = [
+            self._python_reference_for_dataset(dataset) for _name, dataset in datasets
+        ]
+
+        def operation(_index, _name, dataset):
+            return flip_phase(dataset)
+
+        def publish(results, skipped) -> None:
+            recorder = getattr(self, "python_recorder", None)
+            for source_index, name, result in results:
+                output_name = f"{name} [Phase flipped]"
+                output_id = self._add_dataset_row(
+                    result, output_name, f"Phase sign reversed: {name}", file_name=""
+                )
+                source_ref = source_references[source_index]
+                if recorder is not None and source_ref is not None:
+                    recorder.record_function(
+                        self._python_output_reference(output_id, output_name),
+                        "flip_phase", [source_ref],
+                        comment=f"Reverse phase sign of {name} (I unchanged; Q negated)",
+                    )
+            message = f"Phase flip created {len(results)} dataset(s). Magnitude unchanged."
+            if skipped:
+                message += f" Skipped: {_compact_item_summary(skipped)}"
+            self.status.showMessage(message)
+
+        self._start_dataset_map_job(
+            "Flip phase", datasets, operation, publish,
+            start_message=f"Flipping phase for {len(datasets)} dataset(s)...",
         )
 
     def _time_gate_selected(self) -> None:

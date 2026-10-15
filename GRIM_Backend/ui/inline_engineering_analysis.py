@@ -23,6 +23,7 @@ from GRIM_Backend.plotting.analysis_preparation import capture_cut, cached_cut
 from GRIM_Backend.plotting.analysis_results import phase_analysis, polarization_analysis
 from GRIM_Backend.plotting.requests import PlotCancelled
 from GRIM_Backend.ui.analysis_presenter import EngineeringAnalysisPresenter
+from GRIM_Backend.ui.image_measurement import ImageMeasurement, measurement_axes
 
 
 _PHASE_HELP = {
@@ -138,6 +139,7 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
         self._display_serial = 0
         self._iq_controller = None
         self._iq_hold = False
+        self._image_measurement_active = False
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(3)
@@ -190,6 +192,8 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
         close = QToolButton(); close.setText("×"); close.setToolTip("Hide analysis controls")
         close.clicked.connect(self.deactivate); row.addWidget(close)
         outer.addLayout(row)
+        self.image_measurement = ImageMeasurement(owner, self.canvas)
+        outer.addWidget(self.image_measurement)
         self.settings_area = _SettingsScrollArea()
         self.settings_area.setWidgetResizable(True)
         self.settings_area.setFrameShape(QScrollArea.NoFrame)
@@ -349,7 +353,22 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
         self._analysis_hidden_replot = None
         previous = self.active_key
         self.active_key = key
+        self.image_measurement.deactivate()
+        self._image_measurement_active = key == "measure" and bool(measurement_axes(self.figure))
         self.settings_button.setChecked(True)
+        self.settings_button.setVisible(not self._image_measurement_active)
+        if self._image_measurement_active:
+            self._analysis_runner.cancel()
+            self._remove_overlays()
+            self.results_button.setChecked(False)
+            self.results.hide(); self.canvas.show()
+            self.header_controls.hide(); self.settings_area.hide()
+            self.tool_label.setText("Measure distance")
+            self.image_measurement.open()
+            self._update_canvas_minimum()
+            self.show()
+            return
+        self._toggle_settings(True)
         if previous != key:
             self._prefer_native_source = False
         self._updating = True
@@ -363,6 +382,9 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
 
     def refresh_from_selection(self, *_args):
         if not self.active_key or self.owner.plot_figure is not self.figure:
+            return
+        if self._image_measurement_active:
+            self.image_measurement.open()
             return
         self._analysis_runner.cancel()
         self._cut_cache = {}
@@ -543,7 +565,8 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
         self.settings_area.updateGeometry()
 
     def _update_current(self, *_args):
-        if self._updating or not self.active_key or self.owner.plot_figure is not self.figure:
+        if (self._updating or not self.active_key or self.owner.plot_figure is not self.figure
+                or self._image_measurement_active):
             return
         self._presentation()
         key = self.active_key
@@ -930,6 +953,7 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
             self.summary.setText(f"Marker unavailable: {error}")
 
     def stop_region_selection(self):
+        self.image_measurement.pause()
         if self._span is not None:
             self._span.disconnect_events()
             for artist in self._span.artists:
@@ -938,9 +962,15 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
             self._span = None
 
     def resume_interaction(self):
+        if self._image_measurement_active:
+            return
         if (self.active_key == "measure" and self.drag_region.isChecked() and not self.isHidden()
                 and self.owner.plot_figure is self.figure):
             self._update_current()
+
+    def on_image_measurement_press(self, event):
+        return (self._image_measurement_active and not self.isHidden()
+                and self.image_measurement.on_press(event))
 
     def _remove_overlays(self):
         self._disconnect_iq()
@@ -956,6 +986,8 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
         self._analysis_hidden_replot = None
         self._cut_cache = {}
         self._remove_overlays()
+        self.image_measurement.deactivate()
+        self._image_measurement_active = False
         self.figure._grim_iq_held = None
         self._measurement = None
         self.active_key = None
