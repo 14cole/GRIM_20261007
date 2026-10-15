@@ -800,9 +800,9 @@ class BoRWorkflowRegressionTests(unittest.TestCase):
                 str(base), str(shadowed), points=[point], radar_grid=grid,
                 occluder=blocker,
             )
-            with np.load(base, allow_pickle=False) as original, np.load(
-                combined, allow_pickle=False
-            ) as updated, np.load(shadowed, allow_pickle=False) as blocked:
+            with grim_io.load_grim_npz(base) as original, grim_io.load_grim_npz(
+                combined
+            ) as updated, grim_io.load_grim_npz(shadowed) as blocked:
                 original_field = original["rcs_amp_real"] + 1j * original["rcs_amp_imag"]
                 updated_field = updated["rcs_amp_real"] + 1j * updated["rcs_amp_imag"]
                 blocked_field = blocked["rcs_amp_real"] + 1j * blocked["rcs_amp_imag"]
@@ -810,7 +810,7 @@ class BoRWorkflowRegressionTests(unittest.TestCase):
             self.assertGreater(float(np.max(np.abs(updated_field))), 0.0)
             np.testing.assert_array_equal(blocked_field, original_field)
 
-            with np.load(base, allow_pickle=False) as stored:
+            with grim_io.load_grim_npz(base) as stored:
                 gui_payload = {
                     key: np.array(stored[key], copy=True)
                     for key in stored.files
@@ -842,7 +842,7 @@ class BoRWorkflowRegressionTests(unittest.TestCase):
                 str(gui_base), str(gui_combined), points=[point],
                 radar_grid=grid, declared_coherent_base=True,
             )
-            with np.load(gui_combined, allow_pickle=False) as updated:
+            with grim_io.load_grim_npz(gui_combined) as updated:
                 self.assertEqual(str(updated["combine_role"]), "coherent")
                 self.assertTrue(bool(updated["raw_complex_amplitude_preserved"]))
                 self.assertIn("rcs_amp_real", updated.files)
@@ -890,7 +890,7 @@ class BoRWorkflowRegressionTests(unittest.TestCase):
             feature_sum.export_radar_grim(
                 str(base), bor_result=None, placements=[], **grid
             )
-            with np.load(base, allow_pickle=False) as stored:
+            with grim_io.load_grim_npz(base) as stored:
                 payload = {
                     key: np.array(stored[key], copy=True)
                     for key in stored.files
@@ -921,7 +921,7 @@ class BoRWorkflowRegressionTests(unittest.TestCase):
             feature_sum.add_features_to_monostatic_grim(
                 str(base), str(combined), points=[point], radar_grid=grid
             )
-            with np.load(combined, allow_pickle=False) as updated:
+            with grim_io.load_grim_npz(combined) as updated:
                 for key in (
                     "solver_metadata_json",
                     "production_mesh_certification_json",
@@ -953,7 +953,7 @@ class BoRWorkflowRegressionTests(unittest.TestCase):
             exact = validate_feature_reconstruction.compare_grims(truth, truth)
             self.assertTrue(exact["passed"])
             self.assertEqual(exact["normalized_complex_rms"], 0.0)
-            with np.load(truth, allow_pickle=False) as source:
+            with grim_io.load_grim_npz(truth) as source:
                 payload = {
                     key: np.array(source[key], copy=True) for key in source.files
                 }
@@ -1060,8 +1060,8 @@ class BoRWorkflowRegressionTests(unittest.TestCase):
             feature_sum.add_features_to_monostatic_grim(
                 str(base), str(combined), feature_provenance={"test": True}
             )
-            with np.load(base, allow_pickle=False) as original, np.load(
-                combined, allow_pickle=False
+            with grim_io.load_grim_npz(base) as original, grim_io.load_grim_npz(
+                combined
             ) as updated:
                 np.testing.assert_array_equal(
                     updated["rcs_amp_real"], original["rcs_amp_real"]
@@ -1125,18 +1125,18 @@ class BoRWorkflowRegressionTests(unittest.TestCase):
                     + 1j * payload["rcs_amp_imag"]
                 )
 
-            with np.load(base, allow_pickle=False) as clean, np.load(
-                direct, allow_pickle=False
-            ) as direct_total, np.load(
-                direct_delta_path, allow_pickle=False
-            ) as direct_delta, np.load(
-                point_a_total, allow_pickle=False
-            ) as total_a, np.load(
-                point_a_delta_path, allow_pickle=False
-            ) as delta_a, np.load(
-                point_b_total, allow_pickle=False
-            ) as total_b, np.load(
-                point_b_delta_path, allow_pickle=False
+            with grim_io.load_grim_npz(base) as clean, grim_io.load_grim_npz(
+                direct
+            ) as direct_total, grim_io.load_grim_npz(
+                direct_delta_path
+            ) as direct_delta, grim_io.load_grim_npz(
+                point_a_total
+            ) as total_a, grim_io.load_grim_npz(
+                point_a_delta_path
+            ) as delta_a, grim_io.load_grim_npz(
+                point_b_total
+            ) as total_b, grim_io.load_grim_npz(
+                point_b_delta_path
             ) as delta_b:
                 clean_field = coherent_field(clean)
                 direct_field = coherent_field(direct_total)

@@ -998,7 +998,12 @@ def make_delta_grim(clean: 'PathOrList', featured: 'PathOrList', out_path: 'str'
 
 
     k_per_freq = 2.0 * math.pi * np.asarray(fr, dtype=float) * 1e9 / C0
-    sigma_2d = np.abs(amp) ** 2 / (4.0 * k_per_freq)[None, None, :, None]
+    # Power and phase come straight from the float64 components; the raw pair
+    # is stored as views of the field rather than copies.
+    amp_real, amp_imag = amp.real, amp.imag
+    sigma_2d = amp_real * amp_real
+    sigma_2d += amp_imag * amp_imag
+    sigma_2d /= (4.0 * k_per_freq)[None, None, :, None]
     out = out_path if out_path.lower().endswith(".grim") else out_path + ".grim"
     payload = dict(
         azimuths=az, elevations=np.array([0.0]), frequencies=fr,
@@ -1006,7 +1011,7 @@ def make_delta_grim(clean: 'PathOrList', featured: 'PathOrList', out_path: 'str'
         polarization_alias_primary=",".join(pols),
         polarization_aliases_json=json.dumps(pols),
         rcs_power=sigma_2d.astype(np.float32),
-        rcs_phase=np.angle(amp).astype(np.float32),
+        rcs_phase=np.arctan2(amp_imag, amp_real).astype(np.float32),
         rcs_domain="delta", power_domain="linear_rcs",
         source_path="", history=(history or "make_delta_grim: featured - clean"),
         units=json.dumps(units),
@@ -1016,8 +1021,8 @@ def make_delta_grim(clean: 'PathOrList', featured: 'PathOrList', out_path: 'str'
             f"legacy convention identified by complex_field_domain="
             f"{source_field_domain}"),
         raw_complex_amplitude_preserved=True,
-        rcs_amp_real=amp.real.astype(np.float64),
-        rcs_amp_imag=amp.imag.astype(np.float64),
+        rcs_amp_real=amp_real,
+        rcs_amp_imag=amp_imag,
         complex_field_domain=DELTA_FIELD_DOMAIN,
     )
     for source in cg + fg:
@@ -1919,10 +1924,12 @@ def save_body_grim(bodies: 'Dict[float, Dict[str, Any]]', out_path: 'str', *,
     units = {"azimuth": "deg", "elevation": "deg", "frequency": "GHz",
              "rcs_log_unit": "dBsm", "rcs_linear_quantity": "sigma_3d",
              "azimuth_meaning": _BODY_AZ_MEANING}
-    amp_real = amp.real.astype(np.float64)
-    amp_imag = amp.imag.astype(np.float64)
-    stored_power = 4.0 * math.pi * (
-        amp_real.astype(float) ** 2 + amp_imag.astype(float) ** 2)
+    # Power and phase come straight from the float64 components; the raw pair
+    # is stored as views of the field rather than copies.
+    amp_real, amp_imag = amp.real, amp.imag
+    stored_power = amp_real * amp_real
+    stored_power += amp_imag * amp_imag
+    stored_power *= 4.0 * math.pi
     out = out_path if str(out_path).lower().endswith(".grim") else str(out_path) + ".grim"
     payload = dict(
         azimuths=th, elevations=np.array([0.0]), frequencies=np.asarray(freqs, float),
@@ -1930,8 +1937,7 @@ def save_body_grim(bodies: 'Dict[float, Dict[str, Any]]', out_path: 'str', *,
         polarization_alias_primary="VV,HH",
         polarization_aliases_json=json.dumps(["VV", "HH"]),
         rcs_power=stored_power.astype(np.float32),
-        rcs_phase=np.angle(
-            amp_real.astype(float) + 1j * amp_imag.astype(float)).astype(np.float32),
+        rcs_phase=np.arctan2(amp_imag, amp_real).astype(np.float32),
         rcs_domain="power_phase", power_domain="linear_rcs",
         source_path=str(source_path),
         history=(history or "save_body_grim: BoR body solve")

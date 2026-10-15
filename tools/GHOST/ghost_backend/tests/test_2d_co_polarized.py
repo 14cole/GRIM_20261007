@@ -378,7 +378,7 @@ class CoPolarizedGrimTests(unittest.TestCase):
                 result, str(Path(tmp) / "dual")
             )
             self.assertEqual(len(written), 1)
-            with np.load(written[0], allow_pickle=False) as payload:
+            with grim_io.load_grim_npz(written[0]) as payload:
                 np.testing.assert_array_equal(
                     payload["polarizations"], ["VV", "HH"]
                 )
@@ -431,7 +431,7 @@ class CoPolarizedGrimTests(unittest.TestCase):
             )
             self.assertEqual(len(written), 1)
             self.assertIn("inc_10", Path(written[0]).stem)
-            with np.load(written[0], allow_pickle=False) as payload:
+            with grim_io.load_grim_npz(written[0]) as payload:
                 np.testing.assert_array_equal(
                     payload["polarizations"], ["VV", "HH"]
                 )
@@ -463,12 +463,12 @@ class CoPolarizedGrimTests(unittest.TestCase):
         original_save = grim_io._save_grim_npz
         calls = 0
 
-        def fail_second_stage(payload, path):
+        def fail_second_stage(payload, path, **options):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise OSError("simulated second-incidence disk failure")
-            return original_save(payload, path)
+            return original_save(payload, path, **options)
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "bistatic_dual"

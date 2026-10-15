@@ -544,7 +544,7 @@ class GrimInterchangeAcceptanceTests(unittest.TestCase):
                 result, str(Path(tmp) / "acceptance")
             )
             self.assertEqual(len(written), 1)
-            with np.load(written[0], allow_pickle=False) as data:
+            with grim_io.load_grim_npz(written[0]) as data:
                 units = json.loads(str(data["units"].item()))
                 self.assertEqual(units["rcs_log_unit"], "dBke")
                 self.assertEqual(units["rcs_linear_quantity"], "sigma_2d")

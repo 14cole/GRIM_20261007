@@ -51,7 +51,10 @@ def test_full_and_bounded_assembly_readers_preserve_native_complex(tmp_path, dom
     single = _load_grim_sample(path, frequency=3., azimuth=1., elevation=1.)
     np.testing.assert_allclose(whole["_amp"], raw, rtol=2.e-15, atol=1.e-28)
     np.testing.assert_allclose(single["_amp"], raw[1:2, 1:2, 1:2], rtol=2.e-15, atol=1.e-28)
-    np.testing.assert_allclose(whole["rcs_power"], np.abs(physical) ** 2, rtol=2.e-15)
+    # A raw solver field expands to the float32 power a version-1 GHOST archive
+    # stored; a physical field keeps its float64 power.
+    power_rtol = 2.e-15 if domain == "physical" else 2. * np.finfo(np.float32).eps
+    np.testing.assert_allclose(whole["rcs_power"], np.abs(physical) ** 2, rtol=power_rtol)
     assert "rcs_complex" not in whole and "grim_format_version" not in whole
 
 

@@ -37,7 +37,7 @@ import ghost_backend.assembly.components as components
 import ghost_backend.assembly.fields as feature_sum
 import ghost_backend.assembly.workflow as feature_workflow
 from ghost_backend.geometry.frames import to_axis_frame
-from ghost_backend.io.grim import _save_grim_npz
+from ghost_backend.io.grim import _save_grim_npz, load_grim_npz
 from ghost_backend.assembly.line_expansion import C0, PSI_HH_DEG, PSI_VV_DEG
 import test_point_scatter_physics as point_oracle  # noqa: E402
 
@@ -759,12 +759,12 @@ class TriaxialEllipsoidFeatureAssemblyRegression(unittest.TestCase):
 
             saved = feature_workflow.execute_feature_assembly(plan)
             self.assertEqual(Path(saved), fixture["output"].resolve())
-            with np.load(fixture["base"], allow_pickle=False) as stored_base:
+            with load_grim_npz(fixture["base"]) as stored_base:
                 clean_after = (
                     stored_base["rcs_amp_real"]
                     + 1j * stored_base["rcs_amp_imag"]
                 )
-            with np.load(saved, allow_pickle=False) as stored:
+            with load_grim_npz(saved) as stored:
                 actual = stored["rcs_amp_real"] + 1j * stored["rcs_amp_imag"]
                 power = np.asarray(stored["rcs_power"], dtype=float)
                 provenance = json.loads(str(stored["feature_provenance_json"]))

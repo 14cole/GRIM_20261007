@@ -238,8 +238,12 @@ class VehiclePanelIntegrationTests(unittest.TestCase):
                 workflow.execute_feature_assembly(workflow.prepare_feature_assembly(replace(
                     dispatch.plan.request, output_grim=line_only, enabled_point_placement_ids=())))
                 def field(path):
-                    with np.load(path, allow_pickle=False) as data:
-                        return data["rcs_amp_real"] + 1j * data["rcs_amp_imag"]
+                    # GHOST writes GRIM format version 2 (one complex field);
+                    # GRIM's loader serves the raw pair for either version.
+                    from GRIM_Backend.datasets.grid import RcsGrid
+
+                    extra = RcsGrid.load(str(path)).extra
+                    return extra["rcs_amp_real"] + 1j * extra["rcs_amp_imag"]
                 total, only_point, only_line = field(output), field(point_only), field(line_only)
                 self.assertGreater(float(np.linalg.norm(only_point-clean)), 1e-8)
                 self.assertGreater(float(np.linalg.norm(only_line-clean)), 1e-8)

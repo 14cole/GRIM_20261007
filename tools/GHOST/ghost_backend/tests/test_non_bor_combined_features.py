@@ -30,7 +30,7 @@ sys.path.insert(0, str(TESTS))
 
 import ghost_backend.assembly.components as components
 import ghost_backend.assembly.fields as feature_sum
-from ghost_backend.io.grim import _save_grim_npz
+from ghost_backend.io.grim import _save_grim_npz, load_grim_npz
 from ghost_backend.assembly.line_expansion import C0, SeamCoefficients
 import test_line_feature_non_bor_physics as line_oracle  # noqa: E402
 import test_point_scatter_physics as point_oracle  # noqa: E402
@@ -316,13 +316,13 @@ class CombinedClosedBoxFeatureTests(unittest.TestCase):
                 history="placed top-face line and side-face fasteners",
             )
 
-            with np.load(base, allow_pickle=False) as stored_base:
+            with load_grim_npz(base) as stored_base:
                 clean_after = (
                     stored_base["rcs_amp_real"]
                     + 1j * stored_base["rcs_amp_imag"]
                 )
                 np.testing.assert_array_equal(clean_after, clean)
-            with np.load(output, allow_pickle=False) as stored:
+            with load_grim_npz(output) as stored:
                 actual = (
                     stored["rcs_amp_real"] + 1j * stored["rcs_amp_imag"]
                 )

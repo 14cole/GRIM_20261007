@@ -12,6 +12,24 @@ import numpy as np
 C0 = 299_792_458.0
 EPS = 1e-12
 SOLVER_METADATA_SCHEMA = 'ghost.solver_metadata.v1'
+GRIM_FORMAT_VERSION_ENV = 'GHOST_GRIM_FORMAT_VERSION'
+GRIM_FORMAT_VERSIONS = (1, 2)
+
+
+def _resolve_grim_format_version(format_version: 'Optional[int]' = None) -> 'int':
+    """Return the archive layout to write: 1 (legacy arrays) or 2 (``rcs_complex``).
+
+    ``None`` consults ``GHOST_GRIM_FORMAT_VERSION`` and otherwise selects
+    version 2, the compact layout GRIM itself writes.
+    """
+    if format_version is None:
+        setting = os.environ.get(GRIM_FORMAT_VERSION_ENV, '').strip()
+        return int(setting) if setting in ('1', '2') else 2
+    if isinstance(format_version, bool) or format_version not in GRIM_FORMAT_VERSIONS:
+        raise ValueError(
+            f"GRIM format_version must be 1 or 2; got {format_version!r}."
+        )
+    return int(format_version)
 
 
 def _json_safe(value: 'Any') -> 'Any':
@@ -707,7 +725,25 @@ def _validate_grim_payload(payload: 'Dict[str, Any]') -> 'None':
         finite_grid('combination_estimate_power', nonnegative=True)
 
 
-def _save_grim_npz(payload: 'Dict[str, Any]', path: 'str') -> 'str':
+def _save_grim_npz(
+    payload: 'Dict[str, Any]',
+    path: 'str',
+    *,
+    format_version: 'Optional[int]' = None,
+) -> 'str':
+    """Validate ``payload`` and write it atomically as a ``.grim`` archive.
+
+    Version 2, the default, stores a payload's raw complex amplitude once as
+    ``rcs_complex`` (complex128) with GRIM's ``grim_format_version``,
+    ``storage_kind`` and ``storage_domain`` framing; ``rcs_power``,
+    ``rcs_phase``, ``rcs_amp_real`` and ``rcs_amp_imag`` are omitted and every
+    reader derives power and phase from the field under
+    ``units.rcs_linear_quantity``.  Version 1 keeps those four arrays.  A
+    payload without a raw pair is written in the version-1 layout whichever
+    version is requested; every other metadata key is identical in both.
+    ``format_version=None`` consults ``GHOST_GRIM_FORMAT_VERSION``.
+    """
+    version = _resolve_grim_format_version(format_version)
     _validate_grim_payload(payload)
     out = _ensure_grim_ext(path)
     destination_dir = os.path.dirname(os.path.abspath(out))
@@ -722,6 +758,8 @@ def _save_grim_npz(payload: 'Dict[str, Any]', path: 'str') -> 'str':
     os.close(temporary_fd)
     try:
         with open(temporary_path, 'wb') as f:
+            has_raw_pair = 'rcs_amp_real' in payload and 'rcs_amp_imag' in payload
+            compact = version == 2 and has_raw_pair
             save_payload = dict(
                 azimuths=payload['azimuths'],
                 elevations=payload['elevations'],
@@ -729,8 +767,11 @@ def _save_grim_npz(payload: 'Dict[str, Any]', path: 'str') -> 'str':
                 polarizations=payload['polarizations'],
                 polarization_alias_primary=payload.get('polarization_alias_primary', ''),
                 polarization_aliases_json=payload.get('polarization_aliases_json', ''),
-                rcs_power=payload['rcs_power'],
-                rcs_phase=payload['rcs_phase'],
+            )
+            if not compact:
+                save_payload['rcs_power'] = payload['rcs_power']
+                save_payload['rcs_phase'] = payload['rcs_phase']
+            save_payload.update(
                 rcs_domain=payload['rcs_domain'],
                 power_domain=payload['power_domain'],
                 source_path=payload.get('source_path', ''),
@@ -740,15 +781,22 @@ def _save_grim_npz(payload: 'Dict[str, Any]', path: 'str') -> 'str':
                 amplitude_convention=payload.get('amplitude_convention', ''),
                 raw_complex_amplitude_preserved=('rcs_amp_real' in payload),
             )
-            if 'rcs_amp_real' in payload and 'rcs_amp_imag' in payload:
+            if has_raw_pair:
 
 
-                save_payload['rcs_amp_real'] = np.asarray(
-                    payload['rcs_amp_real'], dtype=np.float64
-                )
-                save_payload['rcs_amp_imag'] = np.asarray(
-                    payload['rcs_amp_imag'], dtype=np.float64
-                )
+                real = np.asarray(payload['rcs_amp_real'], dtype=np.float64)
+                imag = np.asarray(payload['rcs_amp_imag'], dtype=np.float64)
+                if compact:
+                    field = np.empty(real.shape, dtype=np.complex128)
+                    field.real = real
+                    field.imag = imag
+                    save_payload['grim_format_version'] = np.asarray(2, dtype=np.int16)
+                    save_payload['storage_kind'] = 'complex'
+                    save_payload['storage_domain'] = 'raw_field'
+                    save_payload['rcs_complex'] = field
+                else:
+                    save_payload['rcs_amp_real'] = real
+                    save_payload['rcs_amp_imag'] = imag
                 save_payload['complex_field_domain'] = payload.get(
                     'complex_field_domain',
                     'solver_raw_far_field_amplitude',
@@ -809,6 +857,8 @@ def _save_grim_npz(payload: 'Dict[str, Any]', path: 'str') -> 'str':
 
 def _save_grim_npz_batch(
     entries: 'List[tuple[Dict[str, Any], str]]',
+    *,
+    format_version: 'Optional[int]' = None,
 ) -> 'List[str]':
     """Publish a related GRIM collection as one rollback-safe batch.
 
@@ -816,7 +866,7 @@ def _save_grim_npz_batch(
     validated and staged beside its destination before any existing output is
     touched.  Publication then uses same-directory backups so a later failure
     restores the complete previous collection instead of leaving a mixture of
-    old and new incidences.
+    old and new incidences.  ``format_version`` is passed to every file.
     """
 
     if not entries:
@@ -852,7 +902,7 @@ def _save_grim_npz_batch(
             )
             os.close(stage_fd)
             try:
-                _save_grim_npz(payload, stage)
+                _save_grim_npz(payload, stage, format_version=format_version)
             except BaseException:
                 try:
                     os.unlink(stage)
@@ -951,7 +1001,13 @@ def export_result_to_grim(
     source_path: 'str' = '',
     history: 'str' = '',
     preserve_raw_complex_amplitude: 'bool' = True,
+    format_version: 'Optional[int]' = None,
 ) -> 'List[str]':
+    """Export a solver result as one monostatic or a batch of bistatic files.
+
+    ``format_version`` selects the archive layout (see ``_save_grim_npz``);
+    ``None`` consults ``GHOST_GRIM_FORMAT_VERSION`` and defaults to 2.
+    """
     samples = result.get('samples', []) or []
     if not samples:
         raise ValueError('No solver samples were returned, nothing to export.')
@@ -1008,7 +1064,9 @@ def export_result_to_grim(
                 **unit_kwargs,
             )
         payload['solver_metadata_json'] = _solver_metadata_json(result)
-        return [os.path.abspath(_save_grim_npz(payload, output_path))]
+        return [os.path.abspath(_save_grim_npz(
+            payload, output_path, format_version=format_version
+        ))]
 
     if dual_polarized:
         by_channel_inc: 'Dict[str, Dict[float, List[Dict[str, Any]]]]' = {}
@@ -1042,7 +1100,7 @@ def export_result_to_grim(
             payload['solver_metadata_json'] = metadata_json
             out = f'{root_no_ext}_{_suffix_for_incidence(inc)}.grim'
             batch.append((payload, out))
-        return _save_grim_npz_batch(batch)
+        return _save_grim_npz_batch(batch, format_version=format_version)
 
     by_inc = _group_incidence_samples(samples)
 
@@ -1064,7 +1122,40 @@ def export_result_to_grim(
         payload['solver_metadata_json'] = metadata_json
         out = f'{root_no_ext}_{_suffix_for_incidence(inc)}.grim'
         batch.append((payload, out))
-    return _save_grim_npz_batch(batch)
+    return _save_grim_npz_batch(batch, format_version=format_version)
+
+
+class DecodedGrimArrays(dict):
+    """Archive arrays expanded to the version-1 keys.
+
+    ``files`` and the context-manager protocol mirror ``np.load`` so code that
+    reopened GHOST output with ``np.load`` can call :func:`load_grim_npz` in
+    its place.
+    """
+
+    @property
+    def files(self) -> 'List[str]':
+        return list(self)
+
+    def __enter__(self) -> 'DecodedGrimArrays':
+        return self
+
+    def __exit__(self, *exc_info: 'Any') -> 'bool':
+        return False
+
+
+def load_grim_npz(path: 'str') -> 'DecodedGrimArrays':
+    """Read a ``.grim`` archive as the version-1 key set GHOST consumers expect.
+
+    A version-2 archive (``rcs_complex``) is expanded through
+    ``decode_native_samples`` to ``rcs_power``, ``rcs_phase``, ``rcs_amp_real``
+    and ``rcs_amp_imag``; a version-1 archive is returned unchanged.
+    """
+    from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples
+    with np.load(path, allow_pickle=False) as data:
+        arrays = {key: data[key] for key in data.files}
+    return DecodedGrimArrays(decode_native_samples(arrays, label=str(path)))
+
 
 def _ensure_csv_ext(path: 'str') -> 'str':
     return path if path.lower().endswith('.csv') else f'{path}.csv'

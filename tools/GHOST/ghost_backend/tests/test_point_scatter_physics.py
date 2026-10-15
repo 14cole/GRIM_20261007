@@ -33,6 +33,7 @@ sys.path.insert(0, str(BACKEND.parent))
 import ghost_backend.assembly.components as components
 import ghost_backend.assembly.fields as feature_sum
 import ghost_backend.assembly.workflow as feature_workflow
+from ghost_backend.io.grim import load_grim_npz
 from ghost_backend.assembly.line_expansion import C0
 
 
@@ -564,12 +565,12 @@ class NonBorFastenerAssemblyRegression(unittest.TestCase):
             self.assertIs(sample, inspector.evaluate(plan, float(frequencies[0]), float(azimuths[0]), float(elevations[0])))
             self.assertLessEqual(inspector.bytes, inspector.max_bytes)
 
-            with np.load(base, allow_pickle=False) as clean_payload:
+            with load_grim_npz(base) as clean_payload:
                 stored_clean = (
                     clean_payload["rcs_amp_real"]
                     + 1j * clean_payload["rcs_amp_imag"]
                 )
-            with np.load(output, allow_pickle=False) as featured_payload:
+            with load_grim_npz(output) as featured_payload:
                 stored_total = (
                     featured_payload["rcs_amp_real"]
                     + 1j * featured_payload["rcs_amp_imag"]

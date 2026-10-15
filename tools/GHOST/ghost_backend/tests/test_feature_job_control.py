@@ -97,9 +97,9 @@ class FeatureJobControlTests(unittest.TestCase):
             )
             self.assertTrue(features.is_file())
             with (
-                np.load(base, allow_pickle=False) as clean,
-                np.load(output, allow_pickle=False) as total,
-                np.load(features, allow_pickle=False) as delta,
+                grim_io.load_grim_npz(base) as clean,
+                grim_io.load_grim_npz(output) as total,
+                grim_io.load_grim_npz(features) as delta,
             ):
                 self.assertEqual(
                     self._scalar(total, "assembly_response_role"),

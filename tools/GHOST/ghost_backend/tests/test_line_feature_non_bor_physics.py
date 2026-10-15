@@ -30,7 +30,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO.parent))
 
 import ghost_backend.assembly.fields as feature_sum
-from ghost_backend.io.grim import _save_grim_npz
+from ghost_backend.io.grim import _save_grim_npz, load_grim_npz
 from ghost_backend.assembly.line_expansion import C0, SeamCoefficients
 
 
@@ -781,7 +781,7 @@ class ExternalBodyArtifactTests(unittest.TestCase):
                 roll_deg=0.0,
                 history="analytic external flat-panel body",
             )
-            with np.load(base, allow_pickle=False) as stored:
+            with load_grim_npz(base) as stored:
                 payload = {
                     key: np.array(stored[key], copy=True) for key in stored.files
                 }
@@ -818,13 +818,13 @@ class ExternalBodyArtifactTests(unittest.TestCase):
                 history="placed analytic gap on external body",
             )
 
-            with np.load(base, allow_pickle=False) as clean_payload:
+            with load_grim_npz(base) as clean_payload:
                 clean_after = (
                     clean_payload["rcs_amp_real"]
                     + 1j * clean_payload["rcs_amp_imag"]
                 )
                 np.testing.assert_allclose(clean_after[0, :, 0, 0], clean)
-            with np.load(combined, allow_pickle=False) as result:
+            with load_grim_npz(combined) as result:
                 actual = result["rcs_amp_real"] + 1j * result["rcs_amp_imag"]
                 expected = clean + explicit_delta
                 np.testing.assert_allclose(

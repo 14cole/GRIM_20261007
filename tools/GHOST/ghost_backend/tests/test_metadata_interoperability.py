@@ -1,8 +1,10 @@
 """User workflows accept optional annotations without converting the fields."""
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 import sys
 
 import numpy as np
@@ -164,7 +166,10 @@ class MetadataInteropTests(unittest.TestCase):
 
     @unittest.skipIf(RcsGrid is None, 'GRIM companion project is not included in standalone GHOST')
     def test_stale_raw_flag_and_solver_annotation_do_not_block_read_or_save(self):
-        with tempfile.TemporaryDirectory() as directory:
+        # The stale flag and the injected phase array belong to the version-1
+        # layout, so the body is exported with its separate arrays.
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"GHOST_GRIM_FORMAT_VERSION": "1"}):
             root = Path(directory)
             base = root/"body.grim"
             fs.export_radar_grim(str(base), bor_result=None, placements=[], frequencies_ghz=[1.], azimuths_deg=[0.], elevations_deg=[0.])
@@ -181,7 +186,9 @@ class MetadataInteropTests(unittest.TestCase):
 
     @unittest.skipIf(RcsGrid is None, 'GRIM companion project is not included in standalone GHOST')
     def test_bad_annotation_cannot_mask_inconsistent_numerical_fields(self):
-        with tempfile.TemporaryDirectory() as directory:
+        # A rewritten raw array only exists in the version-1 layout.
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"GHOST_GRIM_FORMAT_VERSION": "1"}):
             base = Path(directory)/"body.grim"
             fs.export_radar_grim(str(base), bor_result=None, placements=[], frequencies_ghz=[1.], azimuths_deg=[0.], elevations_deg=[0.])
             rewrite(base, additions={"raw_complex_amplitude_preserved": [True, False]})
@@ -191,6 +198,22 @@ class MetadataInteropTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "inconsistent"):
                 RcsGrid.load(str(base))
             with self.assertRaisesRegex(ValueError, "inconsistent"):
+                fs._load_grim(str(base))
+
+    @unittest.skipIf(RcsGrid is None, 'GRIM companion project is not included in standalone GHOST')
+    def test_stray_raw_arrays_cannot_shadow_a_compact_field(self):
+        # In the default version-2 layout the field is the only sample array;
+        # a stale version-1 raw array beside it is refused rather than trusted.
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+            os.environ.pop("GHOST_GRIM_FORMAT_VERSION", None)
+            base = Path(directory)/"body.grim"
+            fs.export_radar_grim(str(base), bor_result=None, placements=[], frequencies_ghz=[1.], azimuths_deg=[0.], elevations_deg=[0.])
+            with np.load(base, allow_pickle=False) as archive:
+                self.assertIn("rcs_complex", archive.files)
+            rewrite(base, additions={"rcs_amp_real": np.ones((1, 1, 1, 3)), "rcs_amp_imag": np.zeros((1, 1, 1, 3))})
+            with self.assertRaisesRegex(ValueError, "redundantly declares|duplicate native raw"):
+                RcsGrid.load(str(base))
+            with self.assertRaisesRegex(ValueError, "duplicate native raw"):
                 fs._load_grim(str(base))
 
 

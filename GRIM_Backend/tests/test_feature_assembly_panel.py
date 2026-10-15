@@ -2744,12 +2744,16 @@ class FeatureAssemblyPanelQtTests(unittest.TestCase):
                 adapter.execute(adapter.prepare(disabled_request))
 
                 def load_complex(path: Path) -> np.ndarray:
-                    with np.load(path, allow_pickle=False) as payload:
-                        return np.asarray(
-                            payload["rcs_amp_real"]
-                            + 1j * payload["rcs_amp_imag"],
-                            dtype=np.complex128,
-                        )
+                    # GHOST writes GRIM format version 2 (one complex field),
+                    # so read the raw pair through GRIM's loader, which serves
+                    # it for either archive version, not from the members.
+                    from GRIM_Backend.datasets.grid import RcsGrid
+
+                    extra = RcsGrid.load(str(path)).extra
+                    return np.asarray(
+                        extra["rcs_amp_real"] + 1j * extra["rcs_amp_imag"],
+                        dtype=np.complex128,
+                    )
 
                 clean_field = load_complex(base)
                 selected_field = load_complex(selected_output)

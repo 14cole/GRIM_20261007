@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 from ghost_backend.ui.app import GhostWorkspace
 from ghost_backend.runs.bor_setup import resource_summary
 from ghost_backend.assembly.fields import load_body_grim, require_body_radar_support
+from ghost_backend.io.grim import load_grim_npz
 
 
 class BorRadarGridGuiTests(unittest.TestCase):
@@ -147,7 +148,7 @@ class BorRadarGridGuiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             [saved] = tab._export_result_files(result, str(Path(directory) / "grid.grim"),
                                                source_path=str(geometry), history="GUI radar-grid regression")
-            with np.load(saved, allow_pickle=False) as data:
+            with load_grim_npz(saved) as data:
                 np.testing.assert_array_equal(data["azimuths"], azimuths)
                 np.testing.assert_array_equal(data["elevations"], elevations)
                 np.testing.assert_array_equal(data["frequencies"], [1., 2.])

@@ -21,7 +21,7 @@ from ghost_backend.execution.options import execution_scope, validate_options
 from ghost_backend.execution import frequency_sweep as fs
 from ghost_backend.twod import solver
 from ghost_backend.twod.samples import compact_samples
-from ghost_backend.io.grim import export_result_to_grim
+from ghost_backend.io.grim import export_result_to_grim, load_grim_npz
 from test_sweep_preparation import rectangle
 from test_pipeline_performance import small_result as _small_result
 
@@ -226,15 +226,35 @@ class NumericalRecoveryTests(unittest.TestCase):
             dataset=load_dataset(str(path))
             self.assertEqual(len(dataset.frequencies),1)
             frequency=float(dataset.frequencies[0])
-            with np.load(path,allow_pickle=False) as part:
+            with np.load(path,allow_pickle=False) as stored:
+                self.assertIn('rcs_complex',stored.files)
+                self.assertEqual(int(stored['grim_format_version']),2)
+            with load_grim_npz(path) as part:
                 matching=[p for p in reference_paths if (len(reference_paths)==1 or
                           Path(p).stem.split('_inc_')[-1]==path.stem.split('_inc_')[-1])]
                 self.assertEqual(len(matching),1)
-                with np.load(matching[0],allow_pickle=False) as reference:
+                with load_grim_npz(matching[0]) as reference:
                     index=int(np.flatnonzero(reference['frequencies']==frequency)[0])
                     for key in ('rcs_amp_real','rcs_amp_imag'):
                         np.testing.assert_allclose(part[key],reference[key][:,:,index:index+1,:],rtol=5e-12,atol=2e-14)
                 self.assertEqual(dataset.rcs_power.shape,part['rcs_power'].shape)
+                np.testing.assert_array_equal(dataset.extra['rcs_amp_real'],part['rcs_amp_real'])
+                np.testing.assert_array_equal(dataset.extra['rcs_amp_imag'],part['rcs_amp_imag'])
+    def check_joined_loads_in_grim(self, written, reference):
+        """A streamed join of version-2 frequency files is a version-2 archive GRIM loads."""
+        from GRIM_Backend.io.loaders import load_dataset
+        with np.load(written,allow_pickle=False) as stored:
+            self.assertIn('rcs_complex',stored.files)
+            self.assertEqual(int(stored['grim_format_version']),2)
+            self.assertEqual(stored['rcs_complex'].dtype,np.complex128)
+            self.assertFalse({'rcs_power','rcs_phase','rcs_amp_real','rcs_amp_imag'}&set(stored.files))
+        joined=load_dataset(str(written))
+        with load_grim_npz(reference) as expected:
+            np.testing.assert_array_equal(joined.frequencies,expected['frequencies'])
+            np.testing.assert_array_equal(joined.polarizations,expected['polarizations'])
+            for key in ('rcs_amp_real','rcs_amp_imag'):
+                np.testing.assert_allclose(joined.extra[key],expected[key],rtol=5e-12,atol=2e-14)
+            np.testing.assert_allclose(joined.rcs_power,expected['rcs_power'],rtol=2*np.finfo(np.float32).eps)
     def test_bor_preflight_prices_only_the_active_frequency_output(self):
         from ghost_backend.runs.setup import RunSetupMixin
         from ghost_backend.bor import dispatch
@@ -263,7 +283,8 @@ class NumericalRecoveryTests(unittest.TestCase):
         self.check_native_results(run,[reference])
         with mock.patch.object(DiskSamples,'__iter__',side_effect=AssertionError('whole run read by exporter')):
             [written]=export_run(actual,[str(self.root/'joined.grim')],lambda value,path:export_result_to_grim(value,path))
-        with np.load(reference,allow_pickle=False) as a,np.load(written,allow_pickle=False) as b:
+        self.check_joined_loads_in_grim(written,reference)
+        with load_grim_npz(reference) as a,load_grim_npz(written) as b:
             for key in ('azimuths','frequencies','polarizations','rcs_power','rcs_phase','rcs_amp_real','rcs_amp_imag'):
                 np.testing.assert_allclose(a[key],b[key],rtol=1e-12,atol=1e-13) if a[key].dtype.kind not in 'US' else np.testing.assert_array_equal(a[key],b[key])
             meta=json.loads(str(b['solver_metadata_json']))
@@ -366,7 +387,8 @@ class NumericalRecoveryTests(unittest.TestCase):
                            lambda value,path:export_result_to_grim(value,path))
         self.assertEqual(len(written),2)
         for left,right in zip(reference,written):
-            with np.load(left,allow_pickle=False) as a,np.load(right,allow_pickle=False) as b:
+            self.check_joined_loads_in_grim(right,left)
+            with load_grim_npz(left) as a,load_grim_npz(right) as b:
                 for key in ('frequencies','azimuths','rcs_amp_real','rcs_amp_imag'):
                     np.testing.assert_array_equal(a[key],b[key])
 

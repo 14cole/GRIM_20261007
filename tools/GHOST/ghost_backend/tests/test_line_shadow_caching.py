@@ -17,6 +17,7 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND.parent))
 
 import ghost_backend.assembly.fields as feature_sum
+from ghost_backend.io.grim import load_grim_npz
 from ghost_backend.assembly.line_expansion import (
     SeamCoefficients,
     expand_perimeter,
@@ -225,8 +226,8 @@ class LineShadowCachingTests(unittest.TestCase):
                 )
 
             self.assertGreater(scalar_visible.call_count, 0)
-            with np.load(cached_path, allow_pickle=False) as cached, np.load(
-                scalar_path, allow_pickle=False
+            with load_grim_npz(cached_path) as cached, load_grim_npz(
+                scalar_path
             ) as scalar:
                 np.testing.assert_allclose(
                     cached["rcs_amp_real"], scalar["rcs_amp_real"]

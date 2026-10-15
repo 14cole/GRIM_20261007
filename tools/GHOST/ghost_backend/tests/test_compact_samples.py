@@ -249,7 +249,7 @@ class CompactSampleTests(unittest.TestCase):
                       rcs_linear_quantity='sigma_3d', rcs_log_unit='dBsm', samples=[row])
         with tempfile.TemporaryDirectory() as directory, compact_samples():
             files = grim.export_result_to_grim(result, str(Path(directory) / 'bor'))
-            with np.load(files[0], allow_pickle=False) as stored:
+            with grim.load_grim_npz(files[0]) as stored:
                 units = json.loads(stored['units'].item())
                 self.assertEqual(units['rcs_linear_quantity'], 'sigma_3d')
                 self.assertEqual(units['rcs_log_unit'], 'dBsm')

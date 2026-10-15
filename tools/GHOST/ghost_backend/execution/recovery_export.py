@@ -10,7 +10,8 @@ import zipfile
 import numpy as np
 from ghost_backend.execution.recovery import RecoveryRun, sha
 
-GRID_KEYS = {'rcs_power', 'rcs_phase', 'rcs_amp_real', 'rcs_amp_imag', 'combination_estimate_power'}
+GRID_KEYS = {'rcs_power', 'rcs_phase', 'rcs_amp_real', 'rcs_amp_imag', 'rcs_complex',
+             'combination_estimate_power'}
 BODY_KEYS = {'body_model_amp_vv_real', 'body_model_amp_vv_imag',
              'body_model_amp_hh_real', 'body_model_amp_hh_imag'}
 

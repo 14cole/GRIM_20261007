@@ -18,6 +18,7 @@ sys.path.insert(0, str(REPO.parent))
 import ghost_backend.assembly.place_features as place_features  # noqa: E402
 import ghost_backend.assembly.line_expansion as le  # noqa: E402
 import ghost_backend.assembly.fields as feature_sum
+from ghost_backend.io.grim import load_grim_npz
 from ghost_backend.geometry.frames import to_axis_frame
 from ghost_backend.assembly.line_expansion import SeamCoefficients, expand_perimeter
 
@@ -459,7 +460,7 @@ class EndpointNormalExpansionTests(unittest.TestCase):
                 frequencies_ghz=[1.0], azimuths_deg=[0.0],
                 elevations_deg=[0.0],
             )
-            with np.load(output, allow_pickle=False) as payload:
+            with load_grim_npz(output) as payload:
                 np.testing.assert_array_equal(
                     payload["polarizations"], ["VV", "HH", "VH"]
                 )

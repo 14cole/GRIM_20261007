@@ -209,6 +209,17 @@ The 2-D production path co-solves VV/TE and HH/TM and writes them into one
 GRIM artifact per geometry/frequency. The BoR path produces a combined
 body artifact after its per-frequency restart units complete.
 
+New `.grim` archives use GRIM format version 2: the solver's raw complex
+far-field amplitude is stored once as `rcs_complex` (with the
+`grim_format_version`, `storage_kind` and `storage_domain` framing GRIM itself
+writes), and GRIM and GHOST derive power and phase from it under
+`units.rcs_linear_quantity`. The archives are about a third smaller than the
+version-1 layout and GRIM loads them faster in less memory. Set
+`GHOST_GRIM_FORMAT_VERSION=1` (or pass `format_version=1` to
+`export_result_to_grim`) to restore the version-1 layout with `rcs_power`,
+`rcs_phase`, `rcs_amp_real` and `rcs_amp_imag` for older GRIM installations.
+Every GHOST reader loads both versions.
+
 Each newly prepared HPC run contains its own `runtime/ghost_backend` source
 and native-kernel snapshot. The saved worker and generated Slurm scripts use
 that snapshot, so editing the original CONFIG block or updating the checkout

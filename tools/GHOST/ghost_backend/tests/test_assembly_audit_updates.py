@@ -14,6 +14,7 @@ sys.path[:0] = [str(REPO), str(REPO/"tools/GHOST"), str(REPO/"tools/GHOST/ghost_
 import ghost_backend.assembly.fields as fs
 import ghost_backend.assembly.workflow as fw
 import ghost_backend.assembly.line_expansion as le
+from ghost_backend.io.grim import load_grim_npz
 from test_point_scatter_physics import _pattern_dict, _local_spherical_basis, _write_point_grim
 
 
@@ -179,7 +180,7 @@ class WorkflowUpdatesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             base, out = Path(directory)/"body.grim", Path(directory)/"study.grim"
             fs.export_radar_grim(str(base), bor_result=None, placements=[], frequencies_ghz=[1., 2.], azimuths_deg=[0., 30., 60.], elevations_deg=[-10., 0., 10.])
-            with np.load(base, allow_pickle=False) as archive:
+            with load_grim_npz(base) as archive:
                 payload = {key: archive[key] for key in archive.files}
             amp = np.arange(54).reshape(3, 3, 2, 3)*(.001+.002j)
             payload.update(rcs_amp_real=amp.real, rcs_amp_imag=amp.imag, rcs_power=(4*math.pi*np.abs(amp)**2).astype(np.float32), rcs_phase=np.angle(amp).astype(np.float32))

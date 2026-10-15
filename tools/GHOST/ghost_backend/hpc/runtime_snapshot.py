@@ -13,6 +13,9 @@ _RUNTIME_DATA_GLOBS = (
     "geometry/geometries/*.geo", "geometry/geometries/BOR/*.geo",
     "geometry/templates/*.csv", "execution/DATACLASSES_LICENSE.txt",
     "execution/thread_control/LICENSE*.txt",
+    # The bundled CEM Tools package holds the native-sample decoder that
+    # ``hpc.common.read_unit_grims`` needs to collect unit outputs.
+    "data_tools/__init__.py", "data_tools/cem_tools/*.py",
 )
 _NAMESPACE_MARKER = '"""Frozen GHOST backend for this HPC run."""\n'
 

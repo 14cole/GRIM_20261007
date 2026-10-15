@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import ghost_backend.assembly.fields as fs
 import ghost_backend.assembly.workflow as fw
 from ghost_backend.assembly.inspector import ContributionInspector, _stored_complex_sample
+from ghost_backend.io.grim import load_grim_npz
 from test_point_scatter_physics import _write_point_grim
 
 
@@ -110,7 +111,7 @@ class InspectorAssemblyTests(unittest.TestCase):
                 "amp_vv": np.full(181, .1+.2j), "amp_hh": np.full(181, .3-.1j)}},
                 np.array([[0, 1], [.1, 1], [.1, -1], [0, -1]]), str(base),
                 azimuths_deg=[0., 90., 180., 270.], elevations_deg=[0., 45.])
-            with np.load(base, allow_pickle=False) as archive:
+            with load_grim_npz(base) as archive:
                 original = {key: archive[key] for key in archive.files}
             _write_point_grim(point, np.diag([.001, .002, 0]), [1.])
             locations = root/"points.csv"

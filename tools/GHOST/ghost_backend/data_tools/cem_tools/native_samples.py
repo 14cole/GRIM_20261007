@@ -12,6 +12,19 @@ import json
 import numpy as np
 
 C0 = 299_792_458.0
+# Raw-field power and phase are derived in leading-axis blocks of at most this
+# many cells, so expanding a version-2 archive never holds a second full-grid
+# complex array.
+DECODE_BLOCK_CELLS = 262_144
+
+
+def _leading_axis_blocks(shape):
+    """Yield leading-axis slices that cover at most ``DECODE_BLOCK_CELLS`` cells each."""
+    rows = int(shape[0]) if shape else 0
+    cells_per_row = int(np.prod(shape[1:], dtype=np.int64)) if len(shape) > 1 else 1
+    step = max(1, DECODE_BLOCK_CELLS // max(1, cells_per_row))
+    for start in range(0, rows, step):
+        yield slice(start, min(start + step, rows))
 
 
 def decode_native_samples(payload, *, label="GRIM dataset"):
@@ -49,10 +62,12 @@ def decode_native_samples(payload, *, label="GRIM dataset"):
         field = np.asarray(result.pop("rcs_complex"))
         if field.dtype.kind != "c" or field.shape != shape:
             raise ValueError(f"{label}: invalid native complex shape or dtype.")
-        finite = np.isfinite(field.real) & np.isfinite(field.imag)
-        missing = np.isnan(field.real) & np.isnan(field.imag)
-        if np.any(~(finite | missing)):
-            raise ValueError(f"{label}: native complex samples contain infinity or one-sided NaN.")
+        for block in _leading_axis_blocks(shape):
+            real, imag = field.real[block], field.imag[block]
+            finite = np.isfinite(real) & np.isfinite(imag)
+            missing = np.isnan(real) & np.isnan(imag)
+            if np.any(~(finite | missing)):
+                raise ValueError(f"{label}: native complex samples contain infinity or one-sided NaN.")
         try:
             raw_units = np.asarray(result.get("units", "{}")).item()
             if isinstance(raw_units, bytes):
@@ -84,13 +99,31 @@ def decode_native_samples(payload, *, label="GRIM dataset"):
                 raise ValueError(f"{label}: unsupported raw field normalization {quantity!r}.")
             if "rcs_amp_real" in result or "rcs_amp_imag" in result:
                 raise ValueError(f"{label}: duplicate native raw complex samples.")
-            raw, physical = field, field * scale
+            # Expand to what a version-1 GHOST archive stored: float32 power
+            # and phase derived from the raw field, block by block, with the
+            # raw pair left as views of the field. Exact zeros take phase 0 as
+            # the version-1 writer assigned them.
+            raw = field
+            scale_sq = np.asarray(scale, dtype=np.float64) ** 2
+            power = np.empty(shape, dtype=np.float32)
+            phase = np.empty(shape, dtype=np.float32)
+            with np.errstate(over="ignore", invalid="ignore"):
+                for block in _leading_axis_blocks(shape):
+                    real, imag = field.real[block], field.imag[block]
+                    block_power = real * real
+                    block_power += imag * imag
+                    block_power *= scale_sq
+                    power[block] = block_power
+                    block_phase = np.arctan2(imag, real)
+                    block_phase[(real == 0.) & (imag == 0.)] = 0.
+                    phase[block] = block_phase
+            result["rcs_power"], result["rcs_phase"] = power, phase
         else:
             physical = field
             raw = field / scale if scale is not None else None
-        with np.errstate(over="ignore", invalid="ignore"):
-            result["rcs_power"] = np.abs(physical) ** 2
-        result["rcs_phase"] = np.angle(physical)
+            with np.errstate(over="ignore", invalid="ignore"):
+                result["rcs_power"] = np.abs(physical) ** 2
+            result["rcs_phase"] = np.angle(physical)
         if units.get("phase_wrap") == "0_360":
             result["rcs_phase"] = np.mod(result["rcs_phase"], 2. * np.pi)
         if raw is not None and not (domain == "physical" and

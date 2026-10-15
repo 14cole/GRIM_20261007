@@ -35,6 +35,7 @@ sys.path.insert(0, str(REPO.parent))
 sys.path.insert(0, str(TESTS))
 
 import ghost_backend.assembly.workflow as feature_workflow
+from ghost_backend.io.grim import load_grim_npz
 from ghost_backend.assembly.line_expansion import C0
 import test_point_scatter_physics as point_oracle  # noqa: E402
 import test_triaxial_ellipsoid_features as curved_oracle  # noqa: E402
@@ -383,11 +384,11 @@ class WedgeAndWingFeatureAssemblyRegression(unittest.TestCase):
         expected_total = fixture["clean"] + expected_feature
 
         saved = feature_workflow.execute_feature_assembly(plan)
-        with np.load(fixture["base"], allow_pickle=False) as stored_base:
+        with load_grim_npz(fixture["base"]) as stored_base:
             clean_after = (
                 stored_base["rcs_amp_real"] + 1j * stored_base["rcs_amp_imag"]
             )
-        with np.load(saved, allow_pickle=False) as stored:
+        with load_grim_npz(saved) as stored:
             actual = stored["rcs_amp_real"] + 1j * stored["rcs_amp_imag"]
             provenance = json.loads(str(stored["feature_provenance_json"]))
 
