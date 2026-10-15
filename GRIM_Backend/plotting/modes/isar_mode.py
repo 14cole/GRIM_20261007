@@ -17,6 +17,12 @@ from GRIM_Backend.isar.quality import (
     aperture_mode as normalize_aperture_mode,
 )
 from GRIM_Backend.isar.operators import native_image_residual
+from GRIM_Backend.isar.memory import (
+    BATCH_BYTES, compute_memory_policy, current_memory_policy, resolve_memory_limit,
+)
+from GRIM_Backend.datasets.result_storage import (
+    allocate_result, operation_result_storage, result_blocks,
+)
 
 try:  # scipy.fft is multithreaded and preserves single precision
     from scipy import fft as _sp_fft
@@ -512,6 +518,7 @@ def _compute_band_polar_format(
     sample_weights: np.ndarray | None = None,
     elevation_deg: float = 0.0,
     cancel_check=None,
+    apply_sample_weights: bool = False,
 ):
     """Range-Doppler / Polar Format ISAR image (decoupled 2-D IFFT) — the
     industry-standard formation used by FFT-based ISAR tools.
@@ -542,17 +549,18 @@ def _compute_band_polar_format(
     # (36000×1701 slices) and scipy's pocketfft keeps complex64 native.
     win_az = _window_array(window_name, n_az).astype(np.float32)
     win_freq = _window_array(window_name, n_freq).astype(np.float32)
-    rcs_windowed = np.asarray(rcs_polar, dtype=np.complex64) * win_az[:, None]
-    rcs_windowed *= win_freq[None, :]
-    if _cancel_requested(cancel_check):
-        return "ISAR computation superseded."
     if sample_weights is None:
         coherent_gain = float(win_az.sum()) * float(win_freq.sum())
     else:
         weights = np.asarray(sample_weights, dtype=np.float32)
-        if weights.shape != rcs_windowed.shape:
+        if weights.shape != rcs_polar.shape:
             raise ValueError("ISAR sample weights must match the phase-history shape")
-        coherent_gain = float(np.sum(weights * win_az[:, None] * win_freq[None, :]))
+        # Row sums preserve the coherent normalization without allocating a
+        # second full aperture-sized weights array.
+        coherent_gain = float(np.sum(np.asarray([
+            np.sum(weights[row] * win_az[row] * win_freq, dtype=np.float64)
+            for row in range(n_az)
+        ], dtype=np.float64)))
     if coherent_gain <= 0.0:
         return "ISAR selected data has zero weighted aperture coverage."
 
@@ -564,21 +572,42 @@ def _compute_band_polar_format(
 
     if _cancel_requested(cancel_check):
         return "ISAR computation superseded."
-    range_az = _ifft(rcs_windowed, n=n_freq_fft, axis=1)
-    del rcs_windowed
-    if _cancel_requested(cancel_check):
-        return "ISAR computation superseded."
-    isar_complex = _ifft(range_az, n=n_az_fft, axis=0)
+    # Separability permits bounded batches of complete 1-D transforms. Each
+    # staging/output destination uses the job's RAM/disk allocator; no 2-D
+    # FFT or full image fftshift copy is required. One padded FFT vector and
+    # the FFT library's per-vector workspace must still fit in RAM.
+    fft_dtype = np.complex64 if _sp_fft is not None else np.complex128
+    range_az = allocate_result((n_az, n_freq_fft), fft_dtype)
+    rows_per_batch = max(1, BATCH_BYTES // max(1, 32 * (n_freq + n_freq_fft)))
+    for start in range(0, n_az, rows_per_batch):
+        if _cancel_requested(cancel_check):
+            return "ISAR computation superseded."
+        stop = min(n_az, start + rows_per_batch)
+        tile = np.array(rcs_polar[start:stop], dtype=np.complex64, copy=True)
+        if apply_sample_weights and sample_weights is not None:
+            tile *= weights[start:stop]
+        tile *= win_az[start:stop, None]
+        tile *= win_freq[None, :]
+        range_az[start:stop] = _ifft(tile, n=n_freq_fft, axis=1)
+        del tile
+    isar_complex = allocate_result((n_az_fft, n_freq_fft), fft_dtype)
+    columns_per_batch = max(1, BATCH_BYTES // max(1, 48 * (n_az + n_az_fft)))
+    for start in range(0, n_freq_fft, columns_per_batch):
+        if _cancel_requested(cancel_check):
+            return "ISAR computation superseded."
+        stop = min(n_freq_fft, start + columns_per_batch)
+        block = _ifft(range_az[:, start:stop], n=n_az_fft, axis=0)
+        block = np.fft.fftshift(block, axes=0)
+        block *= (n_az_fft * n_freq_fft) / coherent_gain
+        columns = (np.arange(start, stop) + n_freq_fft // 2) % n_freq_fft
+        isar_complex[:, columns] = block
+        del block
     del range_az
-    if _cancel_requested(cancel_check):
-        return "ISAR computation superseded."
-    isar_complex = np.fft.fftshift(isar_complex, axes=(0, 1))
     # Undo the padded 1/(n_az_fft·n_freq_fft) so amplitudes match the
     # canonical unpadded ifft2 normalization.
     # Normalize by the actual coherent aperture gain, not merely the number
     # of samples. This keeps a unit point target at 0 dB for every taper and
     # when gridding/missing-data masks reduce the usable k-space support.
-    isar_complex *= (n_az_fft * n_freq_fft) / coherent_gain
 
     x_range, y_range = _scene_axes(
         n_az_fft, n_freq_fft, theta, freq_hz, df, unit_scale,
@@ -650,7 +679,7 @@ def _pfa_regrid_azimuth(
         target_q = np.asarray(target_q, dtype=float)
     k_ratio = np.asarray(freq_hz, dtype=float) / max(float(np.mean(freq_hz)), 1.0)
     sin_psi = np.sin(psi)
-    out = np.empty_like(S)
+    out = allocate_result(S.shape, S.dtype)
     for n in range(S.shape[1]):
         if n % 16 == 0 and _cancel_requested(cancel_check):
             raise InterruptedError("ISAR computation superseded")
@@ -782,11 +811,10 @@ def _environment_mebibytes(name: str, default: int, minimum: int) -> int:
     return max(value, minimum)
 
 
-# This is a peak *additional working-set* budget, not an RSS claim.  It covers
-# the selected complex slice, regridding temporaries, FFT/FISTA buffers, and
-# already-retained results.  The preprocess cache has its own independent byte
-# bound below.  Workstations with deliberately larger RAM can opt in via the
-# environment rather than silently attempting a multi-gigabyte allocation.
+# Legacy private-call fallback. Public/GUI jobs enter a captured policy based
+# on current available RAM or the engineer's custom limit. This conservative
+# formation estimate includes mapped staging; it is not a process RSS claim.
+# The preprocess cache has its own independent byte bound below.
 _ISAR_WORKING_SET_LIMIT = (
     _environment_mebibytes("GRIM_ISAR_WORKING_SET_MB", 2048, 256) * 1024**2
 )
@@ -814,9 +842,10 @@ def _estimate_band_working_set_bytes(
 ) -> int:
     """Conservative byte estimate for one coherent band formation.
 
-    Coefficients account for simultaneously-live arrays, not file size.  They
-    deliberately include FFT-library scratch and the float64 source slice that
-    may exist briefly while RcsGrid constructs an authoritative complex slice.
+    Coefficients account for simultaneously-live arrays, not file size. They
+    include FFT-library scratch and staging. Fourier staging/remapping now
+    spill to managed disk arrays, so this remains a conservative estimate of
+    total work storage, rather than a prediction of resident RAM.
     """
 
     n_azimuth = max(int(n_azimuth), 1)
@@ -855,14 +884,16 @@ def _validate_isar_working_set(
     estimated_bytes = max(int(estimated_bytes), 0)
     resident_bytes = max(int(resident_bytes), 0)
     total = estimated_bytes + resident_bytes
-    limit = _ISAR_WORKING_SET_LIMIT if limit_bytes is None else int(limit_bytes)
-    if total > limit:
+    policy = current_memory_policy()
+    limit = (policy[0] if policy is not None else _ISAR_WORKING_SET_LIMIT) if limit_bytes is None else int(limit_bytes)
+    if total > limit and not (policy is not None and policy[1]):
         raise ValueError(
             f"{operation} needs an estimated {_format_binary_bytes(total)} peak "
             f"working set ({_format_binary_bytes(resident_bytes)} already retained; "
             f"limit {_format_binary_bytes(limit)}). Narrow the aperture/frequency "
-            "band, export fewer panels, or raise GRIM_ISAR_WORKING_SET_MB only "
-            "on a workstation with verified available RAM"
+            "band, change the ISAR Memory budget, or select Allow computation "
+            "above the memory budget. Headless callers can set memory_limit_bytes "
+            "or GRIM_ISAR_WORKING_SET_MB"
         )
     return total
 
@@ -1922,17 +1953,23 @@ def _compute_band(
         if _cancel_requested(cancel_check):
             return "ISAR computation superseded."
         # Slice first; constructing the whole complex grid can require GBs.
-        sel = np.ix_(sorted_band_indices, [elev_idx], freq_indices_sorted, [pol_idx])
-        rcs_slice = dataset.rcs_slice(sel)[:, 0, :, 0]
-        if _cancel_requested(cancel_check):
-            return "ISAR computation superseded."
-        valid = np.isfinite(rcs_slice)
-        if not np.any(valid):
+        shape = (len(sorted_band_indices), len(freq_indices_sorted))
+        rcs_slice = allocate_result(shape, np.complex64)
+        weights = allocate_result(shape, np.float32)
+        any_valid = False
+        az_ids, freq_ids = np.asarray(sorted_band_indices), np.asarray(freq_indices_sorted)
+        for block in result_blocks(shape):
+            if _cancel_requested(cancel_check):
+                return "ISAR computation superseded."
+            sel = np.ix_(az_ids[block[0]], [elev_idx], freq_ids[block[1]], [pol_idx])
+            tile = dataset.rcs_slice(sel)[:, 0, :, 0]
+            valid = np.isfinite(tile)
+            any_valid = any_valid or bool(np.any(valid))
+            weights[block] = valid
+            rcs_slice[block] = np.nan_to_num(tile, copy=True, nan=0., posinf=0., neginf=0.)
+        del tile, valid
+        if not any_valid:
             return "ISAR imaging requires phase-aware samples; selected data has no finite complex phase history."
-        weights = valid.astype(np.float32)
-        rcs_slice = np.nan_to_num(
-            rcs_slice, copy=False, nan=0.0, posinf=0.0, neginf=0.0
-        ).astype(np.complex64, copy=False)
         if _cancel_requested(cancel_check):
             return "ISAR computation superseded."
 
@@ -2079,9 +2116,13 @@ def _compute_band(
         if _cancel_requested(cancel_check):
             return "ISAR computation superseded."
 
-        weights = np.clip(np.asarray(weights, dtype=np.float32), 0.0, 1.0)
-        observed = np.zeros_like(rcs_slice, dtype=np.complex64)
-        np.divide(rcs_slice, weights, out=observed, where=weights > 1.0e-6)
+        observed = allocate_result(rcs_slice.shape, np.complex64, fill=0)
+        for block in result_blocks(rcs_slice.shape):
+            if _cancel_requested(cancel_check):
+                return "ISAR computation superseded."
+            np.clip(weights[block], 0., 1., out=weights[block])
+            np.divide(rcs_slice[block], weights[block], out=observed[block], where=weights[block] > 1.e-6)
+        del rcs_slice
         df_eff = float(np.mean(np.diff(freq_uniform)))
         prep = {
             "observed": observed,
@@ -2148,24 +2189,25 @@ def _compute_band(
         if isinstance(out, str):
             return out
         complex_image, x_range, y_range, sparse_diagnostics = out
-        magnitude = np.asarray(np.abs(complex_image), dtype=np.float32)
     else:
         if progress is not None:
             progress("Forming Fourier image")
         if _cancel_requested(cancel_check):
             return "ISAR computation superseded."
-        weighted_observed = observed * weights
-        if _cancel_requested(cancel_check):
-            return "ISAR computation superseded."
         out = _compute_band_polar_format(
-            window_name, weighted_observed, theta, freq_uniform, df_eff, unit_scale,
+            window_name, observed, theta, freq_uniform, df_eff, unit_scale,
             sample_weights=weights, elevation_deg=elevation_deg,
-            cancel_check=cancel_check,
+            cancel_check=cancel_check, apply_sample_weights=True,
         )
         if isinstance(out, str):
             return out
         complex_image, x_range, y_range = out
-        magnitude = np.asarray(np.abs(complex_image), dtype=np.float32)
+
+    magnitude = allocate_result(complex_image.shape, np.float32)
+    for block in result_blocks(complex_image.shape):
+        if _cancel_requested(cancel_check):
+            return "ISAR computation superseded."
+        magnitude[block] = np.abs(complex_image[block])
 
     # Sanity-check the computed scene extent.
     x_max_m = (
@@ -2709,6 +2751,17 @@ def _compute_band_composite(
 
 
 def compute_bands(params: dict):
+    """Capture one memory policy and bounded staging allocation per worker."""
+    limit = resolve_memory_limit(params.get("memory_limit_bytes"))
+    params = dict(params, memory_limit_bytes=limit)
+    with compute_memory_policy(limit, allow_exceed=params.get("memory_allow_exceed", False)):
+        # Retain only a modest fraction of the formation budget in ordinary
+        # staging arrays. Larger destinations map directly to temporary disk.
+        with operation_result_storage("auto", ram_budget_bytes=min(128 * 1024**2, limit // 8)):
+            return _compute_bands(params)
+
+
+def _compute_bands(params: dict):
     """Heavy half of the ISAR render: slicing, resampling, FFTs, display
     decimation. Pure numpy over the arrays captured in `params` — no Qt
     access — so the mixin runs it on a worker thread and the GUI stays live.
@@ -2796,8 +2849,9 @@ def compute_bands(params: dict):
             "retained_previous_results_bytes": resident_bytes,
             "preparation_cache_bytes": _PREPROCESS_CACHE_BYTES, "preparation_cache_limit_bytes": _PREPROCESS_CACHE_LIMIT,
             "geometry_plan_cache_bytes": plan_cache_bytes(), "geometry_plan_cache_limit_bytes": 8 * 1024**2,
-            "formation_limit_bytes": _ISAR_WORKING_SET_LIMIT,
-            "definition": "Formation limit bounds additional scratch and retained results; source and caches are reported separately, not total RSS.",
+            "formation_limit_bytes": params["memory_limit_bytes"],
+            "allow_above_budget": params.get("memory_allow_exceed", False),
+            "definition": "Conservative formation estimate includes scratch, RAM/disk staging and retained results; source and caches are reported separately, not total RSS. The engineer can allow computation above this budget.",
         }
         if _cancel_requested(cancel_check):
             return "ISAR computation superseded."
@@ -2894,6 +2948,8 @@ def form_isar(
     scene_half_extent_m=None,
     composite_side: int = 1024,
     native_diagnostics: bool = True,
+    memory_limit_bytes: int | None = None,
+    memory_allow_exceed: bool = False,
     cancel_check=None,
     progress=None,
 ):
@@ -2912,6 +2968,10 @@ def form_isar(
     support PSF cuts, and a complex phase/frame contract accompany results.
     ``cancel_check`` is a callable returning true to stop at a processing block;
     ``progress`` receives stage text. Callbacks run on the calling thread.
+    ``memory_limit_bytes`` defaults to half available RAM. Set
+    ``memory_allow_exceed=True`` to continue above the conservative estimate.
+    Fourier staging spills to disk; each complete padded 1-D FFT and sparse
+    solver workspaces still require RAM.
     Sparse mode is an experimental fixed-lambda LASSO image reconstruction;
     it does not perform target/contaminant separation or emit cleaned phase
     history. ``l1_strength`` must be in ``(0, 1)`` and ``l1_iterations`` is a
@@ -3034,6 +3094,7 @@ def form_isar(
         "isar_contract_assumptions": contract_assumptions,
         "aperture_mode": aperture_mode, "scene_half_extent_m": scene_half_extent_m,
         "composite_side": composite_side, "native_diagnostics": native_diagnostics,
+        "memory_limit_bytes": memory_limit_bytes, "memory_allow_exceed": memory_allow_exceed,
         "cancel_check": cancel_check, "progress": progress,
     })
     if isinstance(result, str):

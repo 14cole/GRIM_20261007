@@ -387,6 +387,10 @@ def _setting_flag(value) -> bool:
 
 
 class DatasetOpsMixin:
+    def _show_storage_usage(self):
+        from GRIM_Backend.ui.storage_usage import StorageUsageDialog
+        StorageUsageDialog(self).exec()
+
     def _current_result_storage_options(self):
         defaults = {'mode': 'auto', 'ram_budget_bytes': 256 * 1024**2}
         try:

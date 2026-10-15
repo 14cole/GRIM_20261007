@@ -16,6 +16,69 @@ from .azimuth_rect_mode import _plan_series
 from .. import distribution_analysis as distribution
 
 
+def clear_state(figure):
+    """Release the exact distribution retained for threshold-only edits."""
+    figure._grim_cdf_state = None
+
+
+def update_threshold(owner):
+    """Update a threshold in O(groups log levels), without rereading samples.
+
+    Returns False when selectors/source/population settings require a fresh
+    preparation. Canvas/source invalidation calls ``clear_state``.
+    """
+    state = getattr(owner.plot_figure, "_grim_cdf_state", None)
+    if not state or state["axes"] is not owner.plot_ax:
+        return False
+    if state["generation"] != getattr(owner, "_plot_render_generation", None):
+        return False
+    config = distribution.owner_options(owner)
+    fixed = lambda values: {key: value for key, value in values.items()
+                            if key not in {"threshold", "threshold_enabled"}}
+    if fixed(config) != fixed(state["config"]):
+        return False
+    curves = state["curves"]
+    low, high = distribution.bounds(curves, config["threshold"] if config["threshold_enabled"] else None)
+    for curve, lines in zip(curves, state["lines"]):
+        curve["lookup"] = distribution.threshold_lookup(curve, config["threshold"])
+        for line in lines:
+            if line.axes is not owner.plot_ax:
+                return False
+            line._grim_cdf_threshold_lookup = curve["lookup"]
+            # Only artificial constant-probability tails move. Measured levels
+            # and every retained exact probability remain unchanged.
+            x = np.array(line.get_xdata(), copy=True)
+            x[0], x[-1] = low, high
+            line.set_xdata(x)
+            native = getattr(line, "_grim_native_samples", None)
+            if native is not None and native.values is not None:
+                native.values[0, 0], native.values[0, -1] = low, high
+    artist = state["threshold_artist"]
+    if config["threshold_enabled"]:
+        if artist is None:
+            artist = owner.plot_ax.axvline(config["threshold"], color=owner._current_plot_text(), linestyle=":", label="_CDF threshold")
+        else:
+            artist.set_xdata([config["threshold"], config["threshold"]])
+            artist.set_visible(True)
+    elif artist is not None:
+        artist.set_visible(False)
+    controls = getattr(owner, "analysis_controls", None)
+    if callable(getattr(controls, "set_cdf_results", None)):
+        text = distribution.table_text(curves, config)
+        if state["omitted"]:
+            text += f"\n{state['omitted']} groups omitted by the visible-series limit."
+        controls.set_cdf_results(text)
+    for spin, value in ((owner.spin_plot_xmin, low), (owner.spin_plot_xmax, high)):
+        spin.blockSignals(True)
+        common.set_spin_value(spin, value)
+        spin.blockSignals(False)
+    owner._apply_plot_limits()
+    owner.plot_figure.canvas.draw_idle()
+    state.update(config=config, threshold_artist=artist)
+    owner._show_plot_status("CDF threshold updated from the exact retained distribution.")
+    return True
+
+
 def _pooled_population(self, dataset, selection):
     pop = distribution.population(dataset, selection, scale="linear" if self._plot_scale_is_linear() else "dbsm")
     return pop["values"], pop["counts"]
@@ -83,6 +146,7 @@ def render(self) -> None:
         self.plot_figure._grim_analysis_constrained_layout = True
         low, high = distribution.bounds(curves, config["threshold"] if config["threshold_enabled"] else None)
         zero_notes = []
+        curve_lines = []
         for curve in curves:
             x, y = distribution.draw_values(curve, (low, high), exceedance=exceedance)
             lines = self._plot_bounded_line(
@@ -93,7 +157,8 @@ def render(self) -> None:
                 line._grim_cdf_population = curve["population"]["counts"]
                 line._grim_cdf_weight_coverage = curve["population"]["coverage"]
                 line._grim_cdf_threshold_lookup = curve["lookup"]
-            if np.any(np.isneginf(curve["levels"])):
+            curve_lines.append(lines)
+            if len(curve["levels"]) and np.isneginf(curve["levels"][0]):
                 population = curve["population"]
                 zero_percent = 100. * population["zero_weight"] / population["coverage"]
                 zero_notes.append(f"{population['counts']['zero']:,} zero samples ({zero_percent:g}% mass) at -∞ dB")
@@ -107,8 +172,9 @@ def render(self) -> None:
             self._note_plot_render(f"Displayed {len(curves)} groups; {omitted} further groups were not evaluated. Narrow the selection to show the rest.")
         if config["weighting"] != "samples":
             self._note_plot_render("CDF uses normalized trapezoidal weights over each selected group coordinate hull, including gaps; not dwell-time or solid angle.")
+        threshold_artist = None
         if config["threshold_enabled"]:
-            self.plot_ax.axvline(config["threshold"], color=self._current_plot_text(), linestyle=":", label="_CDF threshold")
+            threshold_artist = self.plot_ax.axvline(config["threshold"], color=self._current_plot_text(), linestyle=":", label="_CDF threshold")
             low, high = min(low, config["threshold"]), max(high, config["threshold"])
             self._note_plot_render("Inclusive threshold lookup and coverage are available in CDF Population / threshold.")
         if callable(getattr(controls, "set_cdf_results", None)):
@@ -127,6 +193,9 @@ def render(self) -> None:
             common.set_spin_value(spin, float(value))
             spin.blockSignals(False)
         self._apply_plot_limits()
+        self.plot_figure._grim_cdf_state = dict(curves=curves, config=dict(config), lines=curve_lines,
+            axes=self.plot_ax, generation=getattr(self, "_plot_render_generation", None),
+            threshold_artist=threshold_artist, omitted=omitted)
         status = "Exceedance plot updated." if exceedance else "CDF plot updated."
         if skipped:
             status = f"{status[:-1]} Skipped: {', '.join(skipped)}."

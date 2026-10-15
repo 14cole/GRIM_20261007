@@ -699,31 +699,8 @@ class GridArithmeticMixin:
             raise ValueError(
                 "statistic must be mean, median, min, max, std, percentile, or pXX (for percentile XX)"
             )
-        # Keep each population and NumPy's percentile definition/dtype intact.
-        # Tile independent outputs; at least one population must fit in the
-        # reduction workspace. Tile layout can change summation roundoff.
-        reduced_shape = tuple(1 if axis in reduce_axes else count
-                              for axis, count in enumerate(self.shape))
-        population_cells = int(np.prod([self.shape[axis] for axis in reduce_axes]))
-        output_block_cells = max(1, _COHERENT_OPERATION_BLOCK_CELLS // population_cells)
-        reduced = None
-        for selection in _bounded_grid_selections(reduced_shape, output_block_cells):
-            source_selection = tuple(slice(None) if axis in reduce_axes else part
-                                     for axis, part in enumerate(selection))
-            if domain == "complex":
-                values = self.rcs_slice(source_selection)
-            else:
-                values = self.power[source_selection]
-                if domain in {"db", "dbsm"}:
-                    values = self.linear_to_dbsm(values)
-                elif domain == "dbke":
-                    frequency = self.frequencies[source_selection[2]]
-                    values = self.linear_to_dbke(values, frequency.reshape(1, 1, -1, 1))
-            args = (float(percentile),) if stat_key == "percentile" else ()
-            block = reducers[stat_key](values, *args, axis=reduce_axes, keepdims=True)
-            if reduced is None:
-                reduced = allocate_result(reduced_shape, block.dtype)
-            reduced[selection] = block
+        from .reduction_workspace import reduce_dataset
+        reduced = reduce_dataset(self, domain, reduce_axes, stat_key, percentile)
 
         axis_values = [
             np.array(self.azimuths, copy=True),

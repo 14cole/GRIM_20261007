@@ -17,7 +17,11 @@ from GRIM_Backend.plotting.modes.common import NativeSamples, decimate_line, sin
 from GRIM_Backend.ui.engineering_analysis import (
     EngineeringAnalysisDialog, ResultTable, _number, _trace_sort_order, _with_run_breaks,
 )
-from GRIM_Backend.ui.iq_analysis import IQControls, render_iq
+from GRIM_Backend.ui.iq_analysis import IQControls, render_iq, prepare_iq
+from GRIM_Backend.execution.plot_jobs import PlotJobRunner
+from GRIM_Backend.plotting.analysis_preparation import capture_cut, cached_cut
+from GRIM_Backend.plotting.analysis_results import phase_analysis, polarization_analysis
+from GRIM_Backend.plotting.requests import PlotCancelled
 from GRIM_Backend.ui.analysis_presenter import EngineeringAnalysisPresenter
 
 
@@ -117,6 +121,9 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
         self._updating = True
         self._rendering = False
         self.active_key = None
+        self._analysis_runner = PlotJobRunner(self)
+        self._analysis_runner.publication_failed.connect(lambda error: self._show_analysis_error(self.active_key or 'phase', error))
+        self._cut_cache = {}
         self._datasets, self._samples, self._regions = [], {}, {}
         self._region_context = None
         self._measurement, self._span = None, None
@@ -339,6 +346,7 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
             return
         if self.owner.plot_figure is not self.figure:
             return
+        self._analysis_hidden_replot = None
         previous = self.active_key
         self.active_key = key
         self.settings_button.setChecked(True)
@@ -356,6 +364,8 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
     def refresh_from_selection(self, *_args):
         if not self.active_key or self.owner.plot_figure is not self.figure:
             return
+        self._analysis_runner.cancel()
+        self._cut_cache = {}
         old_line = self.trace_combo.currentData()
         old_reference = self.reference_combo.currentText()
         prefer_native = self.active_key == "measure" and self._prefer_native_source
@@ -407,6 +417,7 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
         if self.owner.plot_figure is not self.figure or key not in self.TAB_NAMES:
             return
         hidden = self.isHidden()
+        self._analysis_hidden_replot = key if hidden else None
         self.active_key = key
         if key == "measure": self._prefer_native_source = True
         self.tabs.setCurrentIndex(self.TAB_NAMES[key])
@@ -427,18 +438,14 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
             return self._sweep_snapshot.get(axis)
         return None
 
+    def _capture_cut(self, *, reference=False, polarization=None, dataset_index=None):
+        return capture_cut(self, reference=reference, polarization=polarization,
+                           dataset_index=dataset_index,
+                           selected=None if reference or dataset_index is not None else self._selected_sweep_indices(),
+                           contextual=True)
+
     def _cut(self, *, reference=False, polarization=None):
-        cut = EngineeringAnalysisDialog._cut(self, reference=reference, polarization=polarization)
-        indices = None if reference else self._selected_sweep_indices()
-        if indices is None:
-            context = "Full native sweep; " + ("reference coordinates are matched to A." if reference else "all sweep-axis samples.")
-            return replace(cut, notes=[*cut.notes, context])
-        index = np.asarray(indices, dtype=int)
-        index = index[(index >= 0) & (index < len(cut.x))]
-        context = f"Main selection: {len(index)} of {len(cut.x)} native {cut.axis} samples, captured at Update."
-        return replace(cut, x=cut.x[index], power=cut.power[index], field=cut.field[index], db=cut.db[index],
-                       native_indices=cut.native_indices[index] if cut.native_indices is not None else index,
-                       notes=[*cut.notes, context])
+        return cached_cut(self._capture_cut(reference=reference, polarization=polarization), self._cut_cache)
 
     def _reset_measurement(self, *_args):
         if self._updating:
@@ -567,14 +574,85 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
         if recorder is not None:
             recorder.invalidate_current_plot()
 
-    def _render_diagnostic(self, key):
-        cut = self._cut()
+    def _queue_diagnostic(self, key):
+        request = self._capture_cut()
+        view = self.phase_view.currentData() if key == 'phase' else self.pol_view.currentData()
+        options = self._analysis_options()
+        cache = self._cut_cache
+        reference = self._capture_cut(reference=True) if key == 'phase' and view in {'residual', 'iq_compare', 'iq_difference'} else None
+        repeat_requests = [(name, self._capture_cut(dataset_index=index)) for index, (name, _) in enumerate(self._datasets)
+                           if index != self.dataset_combo.currentIndex()] if view == 'iq_repeat' else []
+        pairs = ([('HH', 'VV'), ('HH', 'HV'), ('VV', 'VH')] if view == 'ratios' else
+                 [('HV', 'VH') if view == 'reciprocity' else (self.pol_a.currentText(), self.pol_b.currentText())])
+        available = [self.fixed['polarization'].itemText(i) for i in range(self.fixed['polarization'].count())]
+        channels = {channel: self._capture_cut(polarization=channel) for channel in available
+                    if channel in {value for pair in pairs for value in pair}} if key == 'polarization' else {}
+        settings = dict(floor_db=self.floor.value(), maximum_gap=self._maximum_gap(), region=self._region(),
+                        scaling=self.iq_controls.scale_combo.currentData(), time_sign=self.phase_sign.currentData(),
+                        phase_offset=self.iq_controls.phase_offset.value(), delay_ns=self.iq_controls.delay_ns.value())
+        held = getattr(self.figure, '_grim_iq_held', None)
+        hold = bool(getattr(self.owner, 'btn_hold', None) and self.owner.btn_hold.isChecked() and self.figure.axes)
+        previous_signature = getattr(self.figure, '_grim_engineering_signature', None)
+        linked = self.iq_controls.linked_checkbox.isChecked()
+        generation = int(getattr(self.owner, '_plot_render_generation', 0))
+        figure = self.figure
+        def compute(cancelled):
+            def read(item):
+                if cancelled(): raise PlotCancelled()
+                return cached_cut(item, cache)
+            cut = read(request)
+            other = read(reference) if reference is not None else None
+            result = {'cut': cut}
+            if key == 'phase' and str(view).startswith('iq'):
+                repeats, notes, skipped = [cut], [], []
+                for name, item in repeat_requests:
+                    try: repeats.append(read(item))
+                    except (ValueError, IndexError, KeyError) as error:
+                        notes.append(f'Skipped {name}: {error}')
+                        skipped.append({'label': name, 'reason': str(error)})
+                if view == 'iq_repeat' and len(repeats) < 2:
+                    notes.append('Only one usable run: select repeated datasets and click Update to compare repeatability.')
+                signature = (key, view, cut.axis, cut.x_unit, cut.level_unit,
+                             settings['scaling'], linked, cut.linear_quantity)
+                result['iq'] = prepare_iq(cut, view, settings=settings, reference=other,
+                                          repeats=(repeats, notes), held=held,
+                                          hold=hold and previous_signature == signature)
+                result['skipped'] = skipped
+            elif key == 'phase':
+                result['analysis'] = phase_analysis(cut, view, options, reference=other)
+            else:
+                cuts = {channel: read(item) for channel, item in channels.items()}
+                result['analysis'] = polarization_analysis(cuts, pairs, view, options, fallback=cut)
+            if cancelled(): raise PlotCancelled()
+            return result
+        def publish(result, error):
+            active = self.active_key == key or (self.active_key is None and getattr(self, '_analysis_hidden_replot', None) == key)
+            if self.owner.plot_figure is not figure or not active or generation != int(getattr(self.owner, '_plot_render_generation', 0)):
+                return
+            if error is not None:
+                self._show_analysis_error(key, error)
+                return
+            self._iq_repeat_skipped = result.get('skipped', [])
+            self._render_diagnostic(key, prepared=result)
+        requests = [request, *channels.values(), *(item for _, item in repeat_requests)]
+        if reference is not None: requests.append(reference)
+        cells = sum(len(item.selected) if item.selected is not None else len(item.dataset.get_axis(item.axis)) for item in requests)
+        self._analysis_runner.cancel()
+        if cells <= int(getattr(self, '_analysis_async_threshold', 25_000)) and not self._analysis_runner.busy:
+            publish(compute(lambda: False), None)
+        else:
+            self.summary.setText('Preparing native analysis…')
+            self._analysis_runner.submit(compute, publish)
+
+    def _render_diagnostic(self, key, *, prepared=None):
+        if prepared is None:
+            self._queue_diagnostic(key)
+            return
+        cut = prepared['cut']
         view = self.phase_view.currentData() if key == "phase" else self.pol_view.currentData()
         iq = key == "phase" and str(view).startswith("iq")
         if key == "phase" and view == "slope" and cut.axis != "frequency":
             raise ValueError("Choose Frequency in Options for a phase-slope fit.")
-        if key == "phase" and view == "residual":
-            self._cut(reference=True)
         signature = (key, view, cut.axis, cut.x_unit, cut.level_unit)
         if iq:
             signature += (self.iq_controls.scale_combo.currentData(), self.iq_controls.linked_checkbox.isChecked(), cut.linear_quantity)
@@ -609,10 +687,10 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
                 self._panels[key] = (_HeldFigure(self.figure), *original[1:])
             try:
                 if iq:
-                    self._iq_controller = render_iq(self, cut, view)
+                    self._iq_controller = render_iq(self, cut, view, prepared=prepared['iq'])
                     self._samples[key] = self._iq_controller.sample_tuples
                 else:
-                    getattr(self, "_analyze_" + key)()
+                    self._publish_analysis(key, prepared['analysis'])
             finally:
                 self._panels[key] = original
             self.figure._grim_engineering_signature = signature
@@ -874,6 +952,9 @@ class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
 
     def deactivate(self, *_args):
         if self._rendering: return
+        self._analysis_runner.cancel()
+        self._analysis_hidden_replot = None
+        self._cut_cache = {}
         self._remove_overlays()
         self.figure._grim_iq_held = None
         self._measurement = None

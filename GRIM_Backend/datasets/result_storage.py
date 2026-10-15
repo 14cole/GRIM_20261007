@@ -9,7 +9,7 @@ from __future__ import annotations
 import atexit
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import operator
 import os
@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import threading
 import weakref
 
 import numpy as np
@@ -31,10 +32,14 @@ def _remove(path):
         shutil.rmtree(path)
     except FileNotFoundError:
         _pending_cleanup.discard(path)
+        from GRIM_Backend.datasets.storage_registry import forget_cache
+        forget_cache(path)
     except OSError:
         _pending_cleanup.add(path)
     else:
         _pending_cleanup.discard(path)
+        from GRIM_Backend.datasets.storage_registry import forget_cache
+        forget_cache(path)
 
 
 def _retry_cleanup():
@@ -56,6 +61,8 @@ class _Owner:
         _retry_cleanup()
         self.path = tempfile.mkdtemp(prefix="grim-result-", dir=directory)
         self.mappings = []
+        from GRIM_Backend.datasets.storage_registry import register_cache
+        register_cache(self.path, kind="result", owner=self)
         self.finalizer = weakref.finalize(self, _close, self.path, self.mappings)
 
 
@@ -71,6 +78,17 @@ class _Policy:
     cache_dir: str | None
     allow_exceed: bool = False
     reserved_ram_bytes: int = 0
+    lock: object = field(default_factory=threading.RLock)
+
+
+def _release_ram(policy, nbytes):
+    with policy.lock:
+        policy.reserved_ram_bytes = max(0, policy.reserved_ram_bytes - nbytes)
+
+
+class _MemoryOwner:
+    def __init__(self, policy, nbytes):
+        self.finalizer = weakref.finalize(self, _release_ram, policy, nbytes)
 
 
 @contextmanager
@@ -78,8 +96,9 @@ def operation_result_storage(mode="memory", *, ram_budget_bytes=256 * 1024**2,
                              cache_dir=None, allow_exceed=False):
     """Select output storage for this operation and its synchronous callees.
 
-    Auto admits allocations cumulatively up to the RAM budget, then maps later
-    destinations. It is a storage threshold, not a process-memory guarantee.
+    Auto keeps live managed allocations within the RAM budget and maps larger
+    destinations. Released buffers return their allowance. This is not a total
+    process-memory guarantee; numerical scratch and other libraries use RAM.
     Contexts are nested and thread-local; each worker must enter its own scope.
     """
     mode = str(mode).strip().lower()
@@ -197,9 +216,15 @@ def allocate_result(shape, dtype, *, fill=None, order="C"):
             owner.finalizer()
             raise
     else:
-        result = np.empty(shape, dtype=dtype, order=order)
-        if policy is not None:
-            policy.reserved_ram_bytes += nbytes
+        if policy is None:
+            result = np.empty(shape, dtype=dtype, order=order)
+        else:
+            # Own the allocation in the subclass itself: plain ndarray views must
+            # keep this owner alive, rather than bypass it through an ndarray base.
+            result = np.ndarray.__new__(_ResultArray, shape, dtype=dtype, order=order)
+            with policy.lock:
+                policy.reserved_ram_bytes += nbytes
+            result._result_owner = _MemoryOwner(policy, nbytes)
     if fill is not None:
         result[...] = fill
     return result

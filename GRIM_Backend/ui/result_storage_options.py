@@ -33,7 +33,7 @@ class ResultStorageDialog(QDialog):
         self.budget.setEnabled(self.mode.currentData() == 'auto')
         self.mode.currentIndexChanged.connect(
             lambda _: self.budget.setEnabled(self.mode.currentData() == 'auto'))
-        form.addRow('Auto RAM allocation budget', self.budget)
+        form.addRow('Auto live RAM budget', self.budget)
         self.folder = QLineEdit(str(options.get('cache_dir') or ''))
         self.folder.setPlaceholderText('System temporary folder')
         browse = QPushButton('Browse…')
@@ -45,7 +45,7 @@ class ResultStorageDialog(QDialog):
         layout.addLayout(form)
         note = QLabel(
             'Auto keeps small result allocations in RAM and writes larger ones to disk. '
-            'The budget applies to each operation batch. Computation still uses some RAM. '
+            'Released temporary arrays return their budget during the operation. Computation still uses some RAM. '
             'Disk results use temporary files; save the dataset to keep it permanently. '
             'This setting applies to new results and does not move existing datasets.')
         note.setWordWrap(True)

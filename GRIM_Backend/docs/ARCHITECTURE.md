@@ -106,11 +106,15 @@ SENTRi, and CST tables use their actual discovered axes and typed allocation
 plan. Other readers retain conservative estimates. Estimates are planning
 values, not guarantees about memory used by the operating system or other apps.
 
-**Disk** storage applies to native `.grim` files. Numeric archive members are
+**Disk** storage applies to native `.grim`, PIO (`.pio`/`.cmplx_di`), and SS files. Numeric archive members are
 extracted in bounded blocks to a private temporary cache and mapped there;
 the input file is never modified. A selected region is copied in bounded blocks
-to RAM or mapped output, as requested. Extraction requires temporary disk space
-for the expanded source and any selected/converted arrays. Cache files remain
+to RAM or mapped output, as requested. Each fully extracted numeric member is
+released and removed after its independent selected/converted output is complete.
+ZIP members must still be decompressed sequentially; selection does not provide
+random reads within compressed files. PIO and SS inputs are mapped read-only and
+decoded in bounded blocks into independent destinations, preserving byte order,
+axis units, exceptional samples, and precision. Cache files remain
 in the system temporary folder unless a different working folder is selected
 in Load options. Choose a drive with enough space for expanded data. They remain
 valid while a dataset, held plot, undo entry, or array view still references them,
@@ -145,9 +149,10 @@ still use original-resolution values; display reduction remains explicit.
 
 **Dataset Operations → Result storage** chooses **Auto**, **RAM**, or **Disk**
 for new operation results. The GUI defaults to Auto with a 256 MiB RAM
-allocation budget per operation batch. Auto admits small destination arrays to
-RAM until that cumulative budget is used, then writes subsequent arrays to
-private temporary files. An individual result can contain both RAM and mapped
+budget for live managed allocations per operation batch. Auto admits fitting
+destination arrays to RAM and writes larger ones to private temporary files.
+Released arrays return their allowance; plain NumPy views retain it until their
+last reference disappears. An individual result can contain both RAM and mapped
 arrays. The dataset name tooltip reports its actual sample storage. Changing
 the setting affects future jobs, not existing datasets or a running worker.
 
@@ -157,8 +162,9 @@ transforms, interpolation, joins/stitches, arithmetic, calibration, statistics,
 gating, and phase-center changes. The result is fully computed before it appears
 in the table; this is disk-backed storage, not deferred numerical evaluation.
 Small coordinate arrays, metadata objects, and numerical scratch still use RAM.
-FFT traces and an exact median/percentile population can require substantial
-temporary RAM even when the result is on disk. The Auto budget controls managed
+Numerical scratch is bounded independently. Exact median/percentile populations
+use disk scratch and in-place selection, while means and stable variance stream
+through the population. Individual FFT traces still require RAM. The Auto budget controls managed
 allocations, not the total memory of Python, NumPy, or the operating system.
 
 The working folder can be selected in the same dialog. Each mapped array owns
@@ -192,3 +198,43 @@ The context is local to its thread, nests safely, and defaults to RAM when not
 explicitly used by headless callers. GUI workers capture the options at launch
 and enter their own context, so concurrent jobs and later settings changes do
 not change each other's allocation policy.
+
+
+## Bounded analysis and storage management
+
+**Dataset Operations → Storage usage** reports loaded sample buffers, additional
+buffers retained by Undo, tracked temporary files, and abandoned caches. Clear
+Undo releases only restore history; active plots and other views retain their
+references. Cleanup requires a marked GRIM cache directory with a verifiably
+ended owning process. Unmarked folders, live processes, inaccessible owners,
+and redirected directories are preserved. The cache manifest includes process
+creation time to distinguish reused process IDs. Disk results remain temporary;
+Save is required for durable datasets.
+
+ISAR Advanced controls now expose an automatic or custom memory budget and an
+explicit option to continue above it. Automatic uses half the available RAM;
+these captured options also travel through Python replay and saved recipes.
+The Fourier path and Range–Frequency transform sweeps in bounded batches and
+write managed intermediate arrays. Range–Frequency no longer rejects an image
+based on total transform work. Batching preserves coherent FFT normalization,
+windowing, axis conventions, and exact incoherent averaging. Large requests use
+background preparation with cancellation; Matplotlib publication stays on Qt.
+
+Statistics stream reduction populations; exact rank statistics use disk scratch
+instead of approximating percentiles. CDF retains exact sorted levels and
+cumulative weights, using bounded scratch for preparation. Threshold-only edits
+reuse that distribution without rereading samples or sorting. Changing inputs,
+clearing the canvas, or leaving CDF invalidates the retained distribution.
+
+Large phase/IQ preparation captures control values and reads selected native
+indices before deriving fields. A bounded native-cut cache avoids rereading the
+same immutable cut during option changes. Legacy mutable sample exposure bypasses
+this cache. Large preparation runs in a latest-request-wins worker; canceled or
+stale requests cannot publish over a newer plot. Gate previews likewise cache the
+unchanged Before profile and process FFT sweeps in byte-bounded batches; the
+azimuth median remains exact.
+
+GUI native saves choose compression using bounded samples from C-contiguous,
+Fortran-contiguous, and strided arrays. Storage layout alone no longer causes a
+compressible dataset to be saved uncompressed. The native file schema and legacy
+readers remain unchanged.

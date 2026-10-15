@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from itertools import islice
+from types import SimpleNamespace
 import numpy as np
 from matplotlib import colormaps
 from matplotlib.collections import LineCollection
@@ -150,7 +151,7 @@ class IQController:
                "Phase (deg)", "Phase status", "I (display)", "Q (display)", "Display scaling",
                "Polarization", "Fixed physical coordinates")
 
-    def __init__(self, panel, cut, mode):
+    def __init__(self, panel, cut, mode, *, prepared=None):
         self.panel, self.owner = panel, panel.owner
         self.figure, self.canvas, self.table, self.note = panel._panels["phase"]
         self.controls, self.cut, self.mode = panel.iq_controls, cut, mode
@@ -162,7 +163,16 @@ class IQController:
         self._notes, self._repeat_cuts = [], None
         self._kwargs = dict(scaling=self.scaling, floor_db=panel.floor.value(),
                             maximum_gap=panel._maximum_gap(), region=panel._region())
-        self._prepare()
+        if prepared is None:
+            self._prepare()
+        else:
+            for key, value in prepared.items():
+                if key != '_held':
+                    setattr(self, key, value)
+            if '_held' in prepared:
+                self.figure._grim_iq_held = prepared['_held']
+        if mode == 'iq_compensated':
+            self.controls.delay_ns.setEnabled(self.cut.axis == 'frequency')
         self._build()
         self._connect()
 
@@ -211,7 +221,6 @@ class IQController:
                                    delay_ns=self.controls.delay_ns.value() if self.cut.axis == "frequency" else 0.,
                                    time_sign=sign, **self._kwargs)
             self.series, self._primary = [report["original"], report["compensated"]], report["original"]
-            self.controls.delay_ns.setEnabled(self.cut.axis == "frequency")
             self.result_rows.extend((("Removed phase offset", f"{report['phase_offset_deg']:.9g}", "deg at reference frequency"),
                                      ("Removed delay", f"{report['delay_ns']:.9g}", "ns; frequency cuts only"),
                                      ("Reference frequency", str(report["reference_frequency"]), self.cut.x_unit if self.cut.axis == "frequency" else "Not applicable"),
@@ -605,6 +614,31 @@ class IQController:
         self._notes = list(dict.fromkeys(self._notes + report.get("notes", [])))
 
 
-def render_iq(panel, cut, mode):
+def render_iq(panel, cut, mode, *, prepared=None):
     """Render an I/Q view and return its disposable interaction controller."""
-    return IQController(panel, cut, mode)
+    return IQController(panel, cut, mode, prepared=prepared)
+
+
+def prepare_iq(cut, mode, *, settings, reference=None, repeats=None, held=None, hold=False):
+    """Prepare numerical I/Q series using captured values, without Qt/Matplotlib access."""
+    def value(item):
+        return SimpleNamespace(value=lambda: item, currentData=lambda: item)
+    controls = SimpleNamespace(phase_offset=value(settings['phase_offset']),
+                               delay_ns=value(settings['delay_ns']))
+    panel = SimpleNamespace(floor=value(settings['floor_db']), phase_sign=value(settings['time_sign']),
+                            _region=lambda: settings['region'], _iq_hold=hold,
+                            _cut=lambda **kwargs: reference,
+                            _iq_repeat_cuts=lambda: repeats or ([cut], []))
+    state = IQController.__new__(IQController)
+    state.panel, state.controls, state.cut, state.mode = panel, controls, cut, mode
+    state.figure = SimpleNamespace(_grim_iq_held=held)
+    state.scaling = settings['scaling']
+    state.series, state.result_rows, state._notes, state._repeat_cuts = [], [], [], None
+    state._kwargs = dict(scaling=state.scaling, floor_db=settings['floor_db'],
+                         maximum_gap=settings['maximum_gap'], region=settings['region'])
+    state._prepare()
+    result = {key: getattr(state, key) for key in
+              ('series', 'result_rows', '_notes', '_repeat_cuts', '_kwargs', '_primary', 'summary', '_indices')}
+    if hasattr(state.figure, '_grim_iq_held'):
+        result['_held'] = state.figure._grim_iq_held
+    return result

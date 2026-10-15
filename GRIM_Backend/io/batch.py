@@ -61,8 +61,15 @@ def _representative_contiguous_bytes(
 
     value = np.asarray(array)
     budget = max(0, int(byte_budget))
-    if budget == 0 or value.nbytes == 0 or not value.flags.c_contiguous:
+    if budget == 0 or value.nbytes == 0:
         return b""
+    if not value.flags.c_contiguous:
+        # Sample bounded logical elements without making a Fortran-ordered,
+        # transposed, or reversed full dataset contiguous just for this probe.
+        count = min(value.size, max(1, budget // max(1, value.dtype.itemsize)))
+        indices = np.linspace(0, value.size - 1, count, dtype=np.intp)
+        selected = np.ascontiguousarray(value.flat[indices])
+        return selected.view(np.uint8).tobytes()[:budget]
     raw = memoryview(value).cast("B")
     if len(raw) <= budget:
         return bytes(raw)
@@ -103,7 +110,7 @@ def _grim_save_compression_decision(dataset: RcsGrid) -> dict[str, object]:
     sampled_arrays = [
         value
         for value in core + ancillary
-        if value.nbytes and value.flags.c_contiguous
+        if value.nbytes
     ]
     total_payload_bytes = sum(int(value.nbytes) for value in arrays)
     per_array_budget = max(

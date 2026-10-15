@@ -55,7 +55,7 @@ class LoadOptionsDialog(QDialog):
         self.storage.addItem('RAM', 'memory')
         self.storage.addItem('Disk — lower RAM use', 'disk')
         self.storage.setCurrentIndex(1 if self._original.get('storage') == 'disk' else 0)
-        form.addRow('.grim sample storage', self.storage)
+        form.addRow('Native/binary sample storage', self.storage)
         self.cache_dir = QLineEdit(str(self._original.get('cache_dir') or ''))
         self.cache_dir.setPlaceholderText('System temporary folder')
         browse = QPushButton('Browse…')
@@ -65,8 +65,8 @@ class LoadOptionsDialog(QDialog):
         folder_row.addWidget(browse)
         form.addRow('Temporary working folder', folder_row)
         layout.addLayout(form)
-        disk_note = QLabel('Disk storage uses a temporary working copy. Other file types load into RAM. '
-                           'Operations that create a new dataset may still need RAM for their result.')
+        disk_note = QLabel('Disk storage supports .grim, PIO, and SS files through a temporary working copy. '
+                           'Other formats load into RAM. New operation outputs follow Result storage options.')
         disk_note.setWordWrap(True)
         layout.addWidget(disk_note)
         self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)

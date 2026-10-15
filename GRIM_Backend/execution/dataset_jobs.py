@@ -107,6 +107,14 @@ def _dataset_load_memory_estimate(path: str, *, storage="memory", selection=None
             # Preserve the authoritative reader's format error. The fallback
             # below is only for malformed/unreadable archives, not valid v2 data.
             pass
+    if str(path).casefold().endswith(('.pio', '.cmplx_di', '.ss')):
+        from GRIM_Backend.io.binary_storage import estimate_binary_import
+        try:
+            report = estimate_binary_import(path, storage=storage)
+            if report is not None:
+                return int(report['retained_bytes']), int(report['estimated_peak_bytes'])
+        except (OSError, ValueError, IndexError):
+            pass  # The reader reports corrupt framing and unsupported headers.
     if str(path).casefold().endswith(_TEXT_LOADER_EXTENSIONS):
         from GRIM_Backend.io.csv import has_flat_csv_signature, load_flat_csv
         if has_flat_csv_signature(path):
@@ -162,7 +170,7 @@ class LoadMemoryLimitError(MemoryError):
         super().__init__(
             f"This dataset batch needs an estimated {plan['serial_peak_bytes'] / 1024**2:.0f} MiB "
             f"but the load budget is {plan['budget_bytes'] / 1024**2:.0f} MiB. "
-            "Adjust Load options, continue once, or use disk storage for .grim files. "
+            "Adjust Load options, continue once, or use disk storage for native/binary files. "
             "Load fewer or smaller dataset files to reduce the estimate.")
 
 
@@ -230,8 +238,9 @@ def _load_dataset_path_task(task: tuple[int, str], *, load_options=None, max_out
         options = dict(load_options or {})
         options.pop('allow_exceed', None)
         options.pop('max_output_bytes', None)
-        if not lower.endswith('.grim'):
+        if not lower.endswith(('.grim', '.pio', '.cmplx_di', '.ss')):
             options.pop('storage', None)
+        if not lower.endswith('.grim'):
             options.pop('selection', None)
         if max_output_bytes is not None:
             options['max_output_bytes'] = max_output_bytes

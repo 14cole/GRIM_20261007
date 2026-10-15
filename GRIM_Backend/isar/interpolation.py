@@ -11,6 +11,7 @@ from collections import OrderedDict
 import hashlib
 import threading
 import numpy as np
+from GRIM_Backend.datasets.result_storage import allocate_result, result_blocks
 
 # Tabulate fractional delays at 1/4096-sample spacing. The half-MiB table
 # avoids millions of repeated special functions with sub-microlevel error.
@@ -130,8 +131,15 @@ def resample_pair(source, field, coverage, target, *, axis, support, cancel_chec
     right = np.clip(np.searchsorted(source, target), 1, n - 1)
     left = right - 1
     fraction = np.clip((target - source[left]) / (source[right] - source[left]), 0, 1).astype(np.float32)
-    out = values[left] + (values[right] - values[left]) * fraction[:, None]
-    weight = weights[left] + (weights[right] - weights[left]) * fraction[:, None]
+    shape = (len(target), values.shape[1])
+    out = allocate_result(shape, values.dtype)
+    weight = allocate_result(shape, weights.dtype)
+    for rows, columns in result_blocks(shape):
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError('ISAR computation canceled')
+        lo, hi = left[rows], right[rows]
+        out[rows, columns] = values[lo, columns] + (values[hi, columns] - values[lo, columns]) * fraction[rows, None]
+        weight[rows, columns] = weights[lo, columns] + (weights[hi, columns] - weights[lo, columns]) * fraction[rows, None]
     steps = np.diff(source)
     cadence = np.median(np.sort(steps)[:max(1, (len(steps) + 1)//2)])
     # A stencil stays inside one contiguous acquisition sector.
@@ -179,8 +187,8 @@ def cartesian_pair(field, coverage, theta, frequency, axes, *, block_size=128, c
     theta, frequency = np.asarray(theta), np.asarray(frequency)
     psi = theta - theta.mean()
     fc = frequency.mean()
-    az_field = np.empty_like(field)
-    az_weight = np.empty_like(coverage)
+    az_field = allocate_result(field.shape, field.dtype)
+    az_weight = allocate_result(coverage.shape, coverage.dtype)
     az_block = min(block_size, max(1, 65536 // len(theta)))
     for start in range(0, len(frequency), az_block):
         if cancel_check is not None and cancel_check():
@@ -192,7 +200,8 @@ def cartesian_pair(field, coverage, theta, frequency, axes, *, block_size=128, c
         f[np.abs(arg) > 1] = 0
         w[np.abs(arg) > 1] = 0
         az_field[:, start:end], az_weight[:, start:end] = f, w
-    out, weight = np.empty_like(field), np.empty_like(coverage)
+    out = allocate_result(field.shape, field.dtype)
+    weight = allocate_result(coverage.shape, coverage.dtype)
     u = fc * q
     range_block = min(block_size, max(1, 65536 // len(frequency)))
     for start in range(0, len(q), range_block):

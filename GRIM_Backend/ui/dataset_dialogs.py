@@ -1563,6 +1563,12 @@ class TimeGateDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Time Gate")
         self._dataset = dataset
+        self._preview_runner = None
+        self._preview_generation = 0
+        self._preview_closed = False
+        self._preview_before_cache = None
+        self._preview_async_cells = 100_000
+        self.finished.connect(self._close_preview)
         geometry = gate_geometry(dataset)
         self._half_range = 0.5 * geometry["unambiguous_m"]
         resolution = geometry["resolution_m"]
@@ -1658,7 +1664,7 @@ class TimeGateDialog(QDialog):
             self.chk_compensate.toggled, self.combo_elevation.currentIndexChanged,
             self.combo_polarization.currentIndexChanged,
         ):
-            signal.connect(self._preview_timer.start)
+            signal.connect(self._schedule_preview)
         self.combo_mode.currentIndexChanged.connect(
             lambda: self.chk_compensate.setEnabled(self.combo_mode.currentData() == "keep")
         )
@@ -1673,33 +1679,109 @@ class TimeGateDialog(QDialog):
             "compensate": bool(self.chk_compensate.isChecked()),
         }
 
+    def _schedule_preview(self, *_args):
+        self._preview_generation += 1
+        if self._preview_runner is not None:
+            self._preview_runner.cancel()
+        self._preview_timer.start()
+
+    def _close_preview(self, *_args):
+        self._preview_closed = True
+        self._preview_generation += 1
+        self._preview_timer.stop()
+        if self._preview_runner is not None:
+            self._preview_runner.close()
+        self._preview_before_cache = None
+
+    def closeEvent(self, event):
+        self._close_preview()
+        super().closeEvent(event)
+
+    @staticmethod
+    def _preview_source_token(dataset, location):
+        # Mutable legacy arrays may change without a GUI notification. They
+        # deliberately bypass the cache; canonical sample arrays are read-only.
+        if getattr(dataset, "_legacy_samples", False):
+            return None
+        if (dataset._storage_domain != "raw_field" and
+                any(name in dataset.extra for name in ("rcs_amp_real", "rcs_amp_imag"))):
+            # Late attached raw metadata is externally mutable, even when
+            # the primary canonical array is read-only.
+            return None
+        from GRIM_Backend.datasets.transforms import _declared_time_sign
+        return (id(dataset._complex), id(dataset._power), id(dataset._phase),
+                dataset.shape, tuple(sorted(location.items())),
+                np.asarray(dataset._frequency_value_to_hz(dataset.frequencies)).tobytes(),
+                _declared_time_sign(dataset), dataset.linear_quantity(), dataset._storage_domain)
+
     def update_preview(self) -> None:
         from GRIM_Backend.datasets.transforms import _validate_gate, down_range_profile
+        from GRIM_Backend.plotting.requests import check_cancel
 
+        if self._preview_closed:
+            return
+        self._preview_timer.stop()
+        self._preview_generation += 1
+        generation = self._preview_generation
+        if self._preview_runner is not None:
+            self._preview_runner.cancel()
+        # Every widget value is captured here, before numerical worker work.
         params = self.get_params()
-        ax = self._axes
-        ax.clear()
-        ok = self.btn_box.button(QDialogButtonBox.Ok)
+        dataset = self._dataset
         try:
-            _validate_gate(self._dataset, params["start_m"], params["stop_m"],
+            _validate_gate(dataset, params["start_m"], params["stop_m"],
                            params["taper"], params["mode"])
             gate_error = ""
         except ValueError as exc:
             gate_error = str(exc)
-        ok.setEnabled(not gate_error)
-        location = {
-            "elevation_index": self.combo_elevation.currentIndex(),
-            "polarization_index": self.combo_polarization.currentIndex(),
-        }
-        try:
-            ranges, before = down_range_profile(self._dataset, **location)
+        self.btn_box.button(QDialogButtonBox.Ok).setEnabled(not gate_error)
+        location = {"elevation_index": self.combo_elevation.currentIndex(),
+                    "polarization_index": self.combo_polarization.currentIndex()}
+        cached_before = self._preview_before_cache
+
+        def compute(cancel):
+            token = TimeGateDialog._preview_source_token(dataset, location)
+            if token is not None and cached_before is not None and cached_before[0] == token:
+                ranges, before = cached_before[1:]
+            else:
+                ranges, before = down_range_profile(dataset, **location, cancel_check=cancel)
+            check_cancel(cancel)
             after = None
             if not gate_error:
-                _ranges, after = down_range_profile(self._dataset, gate=params, **location)
-        except ValueError as exc:
-            self.preview_status.setText(f"No preview: {exc}.")
-            self._canvas.draw_idle()
-            return
+                _ranges, after = down_range_profile(dataset, gate=params, **location, cancel_check=cancel)
+            check_cancel(cancel)
+            return token, ranges, before, after
+
+        def publish(result, error):
+            if self._preview_closed or generation != self._preview_generation:
+                return
+            if error is not None:
+                self.preview_status.setText(f"No preview: {error}.")
+                return
+            if result is None:
+                return
+            token, ranges, before, after = result
+            self._preview_before_cache = (token, ranges, before) if token is not None else None
+            self._publish_preview(ranges, before, after, params, gate_error)
+
+        cells = min(360, dataset.shape[0]) * dataset.shape[2]
+        if cells >= self._preview_async_cells:
+            if self._preview_runner is None:
+                from GRIM_Backend.execution.plot_jobs import PlotJobRunner
+                self._preview_runner = PlotJobRunner(self)
+                self._preview_runner.publication_failed.connect(
+                    lambda error: self.preview_status.setText(f"No preview: {error}."))
+            self.preview_status.setText("Preparing gate preview…")
+            self._preview_runner.submit(compute, publish)
+        else:
+            try:
+                publish(compute(None), None)
+            except (ValueError, MemoryError, OSError) as exc:
+                publish(None, exc)
+
+    def _publish_preview(self, ranges, before, after, params, gate_error):
+        ax = self._axes
+        ax.clear()
         peak = float(np.nanmax(before)) if np.any(before > 0) else 1.0
         ranges = ranges / self._METERS_PER_INCH
         with np.errstate(divide="ignore"):
@@ -1708,7 +1790,7 @@ class TimeGateDialog(QDialog):
             if after is not None:
                 ax.plot(ranges, 10.0 * np.log10(after / peak), color="#1f77b4",
                         linewidth=1.2, label="After")
-        ax.axvspan(self.spin_start.value(), self.spin_stop.value(), color="#59a14f", alpha=0.18,
+        ax.axvspan(params["start_m"] / self._METERS_PER_INCH, params["stop_m"] / self._METERS_PER_INCH, color="#59a14f", alpha=0.18,
                    linewidth=0, label="Gate")
         half_inches = self._half_range / self._METERS_PER_INCH
         ax.set_xlim(-half_inches, half_inches)

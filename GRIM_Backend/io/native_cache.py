@@ -17,6 +17,7 @@ import zipfile
 import numpy as np
 
 from GRIM_Backend.datasets.memory import _bounded_grid_selections
+from GRIM_Backend.datasets.storage_registry import register_cache, forget_cache
 
 AXES = ("azimuths", "elevations", "frequencies", "polarizations")
 KEYS = ("azimuth", "elevation", "frequency", "polarization")
@@ -28,13 +29,15 @@ def _remove_cache(path):
     try:
         shutil.rmtree(path)
     except FileNotFoundError:
-        pass
+        _pending_cleanup.discard(path)
+        forget_cache(path)
     except OSError:
         # Windows may release the final mapping just after its ndarray owner.
         # Retry at the next cache boundary and on clean interpreter shutdown.
         _pending_cleanup.add(path)
     else:
         _pending_cleanup.discard(path)
+        forget_cache(path)
 
 
 def _retry_cleanup():
@@ -57,6 +60,7 @@ class _CacheOwner:
         self.path = tempfile.mkdtemp(prefix="grim-native-", dir=directory)
         self.mappings = []
         self.finalizer = weakref.finalize(self, _close_cache, self.path, self.mappings)
+        register_cache(self.path, kind="native", owner=self)
 
 
 class _CachedArray(np.ndarray):
@@ -211,6 +215,14 @@ def load_native_arrays(path, report, *, storage="disk", selection=None, cache_di
                         else:
                             target[tile] = value[tile]
                 arrays[key] = target
+                # The selected/converted destination is independent. Release
+                # the complete extracted member now instead of retaining it
+                # for the lifetime of a tiny selected region.
+                mapping = value.base._mmap
+                del value
+                mapping.close()
+                owner.mappings.remove(mapping)
+                member_path.unlink()
         arrays.cache_path = owner.path
         arrays.axis_units = units
         arrays.selected = selection is not None

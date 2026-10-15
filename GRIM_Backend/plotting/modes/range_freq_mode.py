@@ -14,13 +14,15 @@ import numpy as np
 
 from GRIM_Backend.datasets.constants import C0
 from GRIM_Backend.datasets.transforms import _declared_time_sign
+from GRIM_Backend.datasets.result_storage import allocate_result, operation_result_storage, result_blocks
+from GRIM_Backend.plotting.requests import PlotPlan, PlotRequest, PlotResult, check_cancel
 
 from . import common
 from .azimuth_rect_mode import _plan_series
 from .isar_mode import _window_array
 
 MAX_COLUMNS = 200
-MAX_WORK_CELLS = 64_000_000
+MAX_BATCH_BYTES = 32 * 1024**2
 RANGE_UNITS = {"m": 1.0, "cm": 100.0, "mm": 1000.0, "in": 1.0 / 0.0254, "ft": 1.0 / 0.3048}
 
 
@@ -34,36 +36,171 @@ def subband_starts(count: int, width: int, max_columns: int = MAX_COLUMNS) -> li
     return np.linspace(0, positions - 1, min(positions, max_columns), dtype=int).tolist()
 
 
-def range_frequency_map(sweeps, frequencies_hz, *, width: int, window: str):
+def range_frequency_plan(n_sweeps, count, width, *, batch_bytes=MAX_BATCH_BYTES):
+    """Plan memory from bytes per batch, independent of total transform work.
+
+    A complete selected sweep and one padded FFT vector are unavoidable RAM
+    work. Additional sweeps are batched within the requested scratch budget.
+    """
+    starts = subband_starts(count, width)
+    size = max(64, 1 << (4 * int(width) - 1).bit_length())
+    bytes_per_sweep = 32 * int(count) + 32 * int(width) + 48 * size
+    batch_rows = max(1, min(max(1, int(n_sweeps)), int(batch_bytes) // bytes_per_sweep))
+    return dict(starts=starts, fft_size=size, batch_rows=batch_rows,
+                scratch_bytes=batch_rows * bytes_per_sweep,
+                output_bytes=len(starts) * size * 8,
+                transform_cells=int(n_sweeps) * len(starts) * size)
+
+
+class SelectedSweeps:
+    """Read only a bounded batch, retaining the azimuth/elevation sweep order."""
+    def __init__(self, dataset, selection):
+        self.dataset, self.selection = dataset, selection
+        self.shape = (len(selection[0]) * len(selection[1]), len(selection[2]))
+        self.complete_count = 0
+        self.conjugate = _declared_time_sign(dataset) == "-jwt"
+
+    def __getitem__(self, rows):
+        azimuth, elevation, frequency, polarization = self.selection
+        indices = np.arange(*rows.indices(self.shape[0]))
+        values = self.dataset.rcs_slice((
+            np.asarray(azimuth)[indices // len(elevation), None],
+            np.asarray(elevation)[indices % len(elevation), None],
+            np.asarray(frequency)[None, :], int(polarization[0])))
+        if self.conjugate:
+            np.conjugate(values, out=values)
+        return values
+
+
+def range_frequency_map(sweeps, frequencies_hz, *, width: int, window: str,
+                        batch_bytes=MAX_BATCH_BYTES, cancel=None):
     """Return ``(ranges_m, starts, power)`` with power shaped (sub-bands, ranges).
 
     ``sweeps`` are complex (n_sweeps, n_frequencies) arrays on a uniform
-    frequency grid in GRIM's exp(+jwt) law; incomplete sweeps must already
-    be removed.
+    frequency grid in GRIM's exp(+jwt) law. Incomplete sweeps are omitted as
+    entire sweeps, so every sub-band averages the same population.
     """
-    sweeps = np.asarray(sweeps, dtype=np.complex128)
+    frequencies_hz = np.asarray(frequencies_hz, dtype=float)
     count = frequencies_hz.size
+    if not hasattr(sweeps, "shape"):
+        sweeps = np.asarray(sweeps)
+    if len(sweeps.shape) != 2 or sweeps.shape[1] != count:
+        raise ValueError("Range–frequency sweeps must match the frequency axis")
+    problem = _uniform_problem(frequencies_hz)
+    if problem:
+        raise ValueError(f"Range–frequency {problem}")
+    plan = range_frequency_plan(sweeps.shape[0], count, width, batch_bytes=batch_bytes)
     step_hz = float(np.mean(np.diff(frequencies_hz)))
     taper = _window_array(window, width)
     gain = float(np.sum(taper))
-    size = max(64, 1 << int(np.ceil(np.log2(4 * width))))
-    starts = subband_starts(count, width)
-    power = np.empty((len(starts), size))
-    for column, start in enumerate(starts):
-        profile = np.fft.ifft(sweeps[:, start:start + width] * taper, n=size, axis=-1)
-        power[column] = np.mean(np.abs(profile * (size / gain)) ** 2, axis=0)
+    if gain <= 0 or not np.isfinite(gain):
+        raise ValueError("Range–frequency window has no coherent gain")
+    size, starts = plan["fft_size"], plan["starts"]
+    check_cancel(cancel)
+    power = allocate_result((len(starts), size), np.float64, fill=0.)
+    complete_count = 0
+    for first in range(0, sweeps.shape[0], plan["batch_rows"]):
+        check_cancel(cancel)
+        batch = np.asarray(sweeps[first:first + plan["batch_rows"]], dtype=np.complex128)
+        complete = np.all(np.isfinite(batch), axis=-1)
+        if not np.all(complete):
+            batch = batch[complete]
+        complete_count += len(batch)
+        if not len(batch):
+            continue
+        for column, start in enumerate(starts):
+            check_cancel(cancel)
+            profile = np.fft.ifft(batch[:, start:start + width] * taper, n=size, axis=-1)
+            profile *= size / gain
+            intensity = np.abs(profile)
+            np.square(intensity, out=intensity)
+            power[column] += np.sum(intensity, axis=0)
+            del profile, intensity
+        del batch
+    if isinstance(sweeps, SelectedSweeps):
+        sweeps.complete_count = complete_count
+    if not complete_count:
+        raise ValueError("no complete complex sweep; needs phase")
+    for column in range(len(starts)):
+        check_cancel(cancel)
+        power[column] = np.fft.fftshift(power[column]) / complete_count
     ranges = np.fft.fftshift(np.fft.fftfreq(size, d=step_hz)) * (C0 / 2.0)
-    return ranges, starts, np.fft.fftshift(power, axes=1)
+    return ranges, starts, power
 
 
 def _uniform_problem(frequencies_hz) -> str:
     if frequencies_hz.size < 8:
         return "needs at least 8 selected frequencies"
+    if not np.all(np.isfinite(frequencies_hz)):
+        return "needs finite selected frequencies"
     steps = np.diff(frequencies_hz)
     step = float(np.mean(steps))
     if step <= 0.0 or np.max(np.abs(steps - step)) > 1.0e-6 * step:
         return "needs uniformly spaced selected frequencies"
     return ""
+
+
+def prepare_range_frequency(request, cancel=None):
+    """No Qt access: bounded reads/FFTs, conversion, reduction and probes."""
+    result = PlotResult(request, [])
+    percent, window, unit = (request.options[key] for key in ("percent", "window", "unit"))
+    scale = RANGE_UNITS[unit]
+    try:
+        with operation_result_storage("auto", ram_budget_bytes=64 * 1024**2):
+            for plan in request.plans:
+                check_cancel(cancel)
+                dataset = plan.dataset
+                native = np.asarray(dataset.frequencies[plan.selection[2]], dtype=float)
+                frequencies_hz = np.asarray(dataset._frequency_value_to_hz(native), dtype=float)
+                problem = _uniform_problem(frequencies_hz)
+                if problem:
+                    result.skipped.append(f"{plan.name} ({problem})")
+                    continue
+                width = int(min(native.size, max(8, round(percent / 100.0 * native.size))))
+                sweeps = SelectedSweeps(dataset, plan.selection)
+                try:
+                    ranges_m, starts, power = range_frequency_map(
+                        sweeps, frequencies_hz, width=width, window=window, cancel=cancel)
+                except ValueError as exc:
+                    result.skipped.append(f"{plan.name} ({exc})")
+                    continue
+                centers = np.asarray([native[s:s + width].mean() for s in starts])
+                # Reuse the owned destination: no second full native display
+                # plane while converting from linear power to display units.
+                if request.scale != "linear":
+                    for rows, columns in result_blocks(power.shape):
+                        check_cancel(cancel)
+                        tile = np.asarray(power[rows, columns])
+                        if np.any(np.isfinite(tile) & (tile <= 0)):
+                            result.notes.append("Zero/nonpositive samples are omitted on logarithmic axes; positive levels are not floored.")
+                        power[rows, columns] = dataset.linear_to_default_db(
+                            np.where(np.isfinite(tile) & (tile > 0), tile, np.nan),
+                            frequency_value=centers[rows, None], eps=0.)
+                for block in result_blocks(power.shape):
+                    power[block][~np.isfinite(power[block])] = np.nan
+                x = common.values_for_display(request.reference, dataset, "frequency", centers)
+                y = ranges_m * scale
+                reduction_options = {} if cancel is None else {"cancel": lambda: check_cancel(cancel)}
+                x_display, y_display, image, reduced = common.decimate_image(
+                    x, y, power, **reduction_options)
+                selected_band = common.values_for_display(request.reference, dataset, "frequency", native[[0, -1]])
+                panel = dict(name=plan.name, pol=str(dataset.polarizations[plan.selection[3][0]]),
+                    sweeps=sweeps.complete_count, x=x_display, y=y_display, image=image,
+                    resolution=C0 / (2.0 * float(np.mean(np.diff(frequencies_hz))) * width) * scale,
+                    width=width, count=native.size, selected_band=selected_band, snapshot=None)
+                result.items.append(panel)
+                if reduced:
+                    check_cancel(cancel)
+                    snapshot = common.NativeSamples.image(power)
+                    panel["snapshot"] = (selected_band if x.size == 1 else common.coordinate_edges(x),
+                                         common.coordinate_edges(y), snapshot)
+                    result.notes.append("Image shows block maxima; native cell probes use original samples. Numerical exports use full data; figure exports use this display.")
+            check_cancel(cancel)
+            result.notes = list(dict.fromkeys(result.notes))
+            return result
+    except BaseException:
+        result.close()
+        raise
 
 
 def render(self) -> None:
@@ -107,75 +244,28 @@ def render(self) -> None:
     percent = controls.range_subband_percent() if controls is not None else 25.0
     window = controls.range_window() if controls is not None else "Hanning"
     unit = controls.range_unit() if controls is not None else "in"
-    scale = RANGE_UNITS[unit]
+    request = PlotRequest("range_freq", reference,
+        tuple(PlotPlan(name, dataset, selection) for name, dataset, selection in plans),
+        scale=self._plot_scale_mode(), options={"percent": percent, "window": window, "unit": unit})
 
-    panels = []
-    for name, dataset, selection in plans:
-        az_indices, elev_indices, freq_indices, pol_indices = selection
-        native = np.asarray(dataset.frequencies[freq_indices], dtype=float)
-        frequencies_hz = np.asarray(dataset._frequency_value_to_hz(native), dtype=float)
-        problem = _uniform_problem(frequencies_hz)
-        if problem:
-            skipped.append(f"{name} ({problem})")
-            continue
-        width = int(min(native.size, max(8, round(percent / 100.0 * native.size))))
-        field = dataset.rcs_slice(
-            np.ix_(az_indices, elev_indices, freq_indices, [pol_indices[0]])
-        )[..., 0].reshape(-1, native.size)
-        if _declared_time_sign(dataset) == "-jwt":
-            field = np.conj(field)
-        sweeps = field[np.all(np.isfinite(field), axis=-1)]
-        if sweeps.shape[0] == 0:
-            skipped.append(f"{name} (no complete complex sweep; needs phase)")
-            continue
-        starts = subband_starts(native.size, width)
-        size = max(64, 1 << int(np.ceil(np.log2(4 * width))))
-        work = sweeps.shape[0] * len(starts) * size
-        if work > MAX_WORK_CELLS:
-            self.status.showMessage(
-                f"Range–Freq blocked: {work:,} transform cells exceed the "
-                f"{MAX_WORK_CELLS:,} interactive limit. Select fewer azimuths or "
-                "elevations, or narrow the sub-band."
-            )
-            return
-        ranges_m, starts, power = range_frequency_map(
-            sweeps, frequencies_hz, width=width, window=window
-        )
-        centers = np.asarray([native[s:s + width].mean() for s in starts])
-        display = self._display_from_linear(
-            dataset, power, frequency_value=centers[:, None]
-        )
-        display = np.where(np.isfinite(display), display, np.nan)
-        x_display = self._plot_axis_values(reference, dataset, "frequency", centers)
-        native_x, native_y, native_image = x_display, ranges_m * scale, display
-        x_display, y_display, image = self._bounded_plot_image(
-            x_display, ranges_m * scale, display
-        )
-        native_snapshot = self._native_image_snapshot(
-            native_x, native_y, native_image, reduced=image.shape != native_image.shape,
-        )
-        if native_snapshot is not None and native_snapshot is not False and native_x.size == 1:
-            # The single full-band column covers the selected band, not an
-            # arbitrary +/-0.5 native frequency unit around its center.
-            native_snapshot = (
-                self._plot_axis_values(reference, dataset, "frequency", native[[0, -1]]),
-                native_snapshot[1], native_snapshot[2],
-            )
-        step_hz = float(np.mean(np.diff(frequencies_hz)))
-        panels.append({
-            "name": name,
-            "native_snapshot": native_snapshot,
-            "pol": str(dataset.polarizations[pol_indices[0]]),
-            "sweeps": int(sweeps.shape[0]),
-            "x": x_display,
-            "y": y_display,
-            "image": image,
-            "resolution": C0 / (2.0 * step_hz * width) * scale,
-            "width": width,
-            "count": native.size,
-            "selected_band": self._plot_axis_values(reference, dataset, "frequency", native[[0, -1]]),
-        })
+    def publish(result):
+        for note in result.notes:
+            self._note_plot_render(note)
+        _display_panels(self, result.items, skipped + result.skipped, datasets, reference, unit)
 
+    # Estimate transform work to schedule substantial narrow-band/many-sweep
+    # jobs in the same cancellable, latest-request-wins runner as Waterfall.
+    work = 0
+    for plan in request.plans:
+        count = len(plan.selection[2])
+        if count >= 8:
+            width = int(min(count, max(8, round(percent / 100.0 * count))))
+            work += range_frequency_plan(len(plan.selection[0]) * len(plan.selection[1]), count, width)["transform_cells"]
+    return self._submit_plot_preparation(request, lambda cancel: prepare_range_frequency(request, cancel),
+                                  publish, cells=work)
+
+
+def _display_panels(self, panels, skipped, datasets, reference, unit):
     if not panels:
         detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
         self._show_plot_status(f"No range–frequency map could be formed.{detail}")
@@ -216,7 +306,7 @@ def render(self) -> None:
             coordinates[0, :, 0], coordinates[:, 0, 1],
             mesh.get_array().reshape(panel["image"].T.shape),
         )
-        self._attach_native_image_snapshot(mesh, panel["native_snapshot"])
+        self._attach_native_image_snapshot(mesh, panel["snapshot"])
         meshes.append(mesh)
         band_label = ("full selected band" if panel['width'] == panel['count']
                       else f"sub-band {panel['width']}/{panel['count']} samples")

@@ -32,7 +32,7 @@ class EngineeringCut:
 
 
 def dataset_cut(dataset, axis="frequency", *, azimuth_index=0, elevation_index=0,
-                frequency_index=0, polarization="HH", label="Dataset"):
+                frequency_index=0, polarization="HH", label="Dataset", sweep_indices=None):
     """Read one physical cut, preferring authoritative raw complex samples."""
     numeric_axes = ("azimuth", "elevation", "frequency")
     if axis not in numeric_axes:
@@ -40,7 +40,12 @@ def dataset_cut(dataset, axis="frequency", *, azimuth_index=0, elevation_index=0
     labels = [str(value).upper() for value in dataset.polarizations]
     pol_index = labels.index(str(polarization).upper())
     indices = [int(azimuth_index), int(elevation_index), int(frequency_index), pol_index]
-    indices[numeric_axes.index(axis)] = slice(None)
+    axis_values = np.asarray(dataset.get_axis(axis))
+    native_indices = (np.arange(len(axis_values), dtype=int) if sweep_indices is None
+                      else np.asarray(sweep_indices, dtype=int).reshape(-1))
+    if np.any((native_indices < 0) | (native_indices >= len(axis_values))):
+        raise IndexError('Selected cut index is outside the native axis')
+    indices[numeric_axes.index(axis)] = slice(None) if sweep_indices is None else native_indices
     selection = tuple(indices)
     field = np.array(dataset.rcs_slice(selection), dtype=complex, copy=True).reshape(-1)
     # In particular, sigma_2d raw amplitudes must first receive their native
@@ -53,7 +58,7 @@ def dataset_cut(dataset, axis="frequency", *, azimuth_index=0, elevation_index=0
     else:
         power = np.array(dataset.power[selection], dtype=float, copy=True).reshape(-1)
     power[authoritative] = np.abs(field[authoritative]) ** 2
-    x = np.array(dataset.get_axis(axis), dtype=float, copy=True)
+    x = np.array(axis_values if sweep_indices is None else axis_values[native_indices], dtype=float, copy=True)
     frequencies = x if axis == "frequency" else float(dataset.frequencies[frequency_index])
     with np.errstate(divide="ignore", invalid="ignore"):
         db = np.asarray(dataset.linear_to_default_db(power, frequencies, eps=0.), dtype=float)
@@ -80,7 +85,7 @@ def dataset_cut(dataset, axis="frequency", *, azimuth_index=0, elevation_index=0
                           dataset.default_log_unit(),
                           f"{label} | {polarization} | " + ", ".join(fixed),
                           declaration, notes, dataset.linear_quantity(), str(polarization), fixed_coordinates,
-                          np.arange(len(x), dtype=int))
+                          native_indices)
 
 
 def finite_runs(x, valid, *, maximum_gap=None, native_indices=None):

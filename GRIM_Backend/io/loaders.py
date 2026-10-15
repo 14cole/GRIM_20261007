@@ -67,7 +67,8 @@ def load_dataset(path: str, *, allow_legacy_pickle=False, max_output_bytes=None,
     """Load a supported file with an optional memory budget and native selection.
 
     Native selections use inclusive axis ranges in the file's declared units.
-    Disk storage and pre-load selection apply to .grim files. Other formats
+    Disk storage applies to .grim, .pio/.cmplx_di, and .ss files. Pre-load
+    coordinate selection applies to .grim files. Other formats
     accept the same memory-budget override through their existing readers.
     """
     from GRIM_Backend.datasets.load_policy import import_memory_budget
@@ -80,6 +81,12 @@ def load_dataset(path: str, *, allow_legacy_pickle=False, max_output_bytes=None,
             raise ValueError("Selection before loading is supported for .grim files")
         if storage not in {"memory", "disk"}:
             raise ValueError("storage must be memory or disk")
+        if str(path).lower().endswith((".pio", ".cmplx_di")):
+            return RcsGrid.load_pio(path, storage=storage, cache_dir=cache_dir,
+                                    max_output_bytes=max_output_bytes)
+        if str(path).lower().endswith(".ss"):
+            return RcsGrid.load_ss(path, storage=storage, cache_dir=cache_dir,
+                                   max_output_bytes=max_output_bytes)
         return _load_dataset_dispatch(path, allow_legacy_pickle=allow_legacy_pickle)
 
 

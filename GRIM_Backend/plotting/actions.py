@@ -220,8 +220,14 @@ def _selected_polarization_axis_availability(
 
 class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     def _cancel_plot_preparations(self):
+        from GRIM_Backend.plotting.modes.cdf_mode import clear_state
         canceled = False
         for context in getattr(self, "_plot_contexts", {}).values():
+            clear_state(context.plot_figure)
+            panel = getattr(context, 'inline_analysis', None)
+            if panel is not None:
+                panel._analysis_runner.cancel()
+                panel._cut_cache = {}
             canceled = context.session.cancel() or canceled
         if canceled:
             self.status.showMessage("Pending plot canceled because its inputs changed.")
@@ -429,6 +435,11 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
                 "Setting saved. Hold is on, so plot again to apply it to the held canvas."
             )
             return
+        if mode == 'cdf':
+            from GRIM_Backend.plotting.modes.cdf_mode import update_threshold
+            if update_threshold(self):
+                self._capture_successful_python_plot('cdf')
+                return
         self._render_plot_mode(mode)
 
     def _maybe_autoscale(self) -> None:
@@ -977,6 +988,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self._style_plot_axes()
 
     def _clear_plot(self) -> None:
+        from GRIM_Backend.plotting.modes.cdf_mode import clear_state
+        clear_state(self.plot_figure)
         context = getattr(self, "_plot_contexts", {}).get(getattr(self, "_active_plot_tab", None))
         if context is not None:
             context.session.disposed = False
@@ -1195,6 +1208,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     # --- renderer preflight, unit conversion, and display bounding ----------
 
     def _start_plot_render(self) -> None:
+        from GRIM_Backend.plotting.modes.cdf_mode import clear_state
+        if self.last_plot_mode != 'cdf':
+            clear_state(self.plot_figure)
         context = getattr(self, "_plot_contexts", {}).get(getattr(self, "_active_plot_tab", None))
         if context is not None:
             context.session.disposed = False
@@ -1301,6 +1317,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         figures.add(self.plot_figure)
         self._clear_plot_markers(redraw=False)
         for figure in figures:
+            cdf_mode.clear_state(figure)
             figure._grim_iq_held = None
             linked_cuts = getattr(figure, "_grim_linked_cuts", None)
             if linked_cuts is not None:
@@ -3225,7 +3242,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             "flip_x": bool(params["flip_x"]),
             "flip_y": bool(params["flip_y"]),
         }
-        for key in ("aperture_mode", "scene_half_extent_m", "composite_side", "native_diagnostics"):
+        for key in ("aperture_mode", "scene_half_extent_m", "composite_side", "native_diagnostics", "memory_limit_bytes", "memory_allow_exceed"):
             if key in params:
                 options[key] = params[key]
         return {
@@ -3368,7 +3385,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _plot_range_freq(self) -> None:
         self._set_compare_sector_controls_visible(False)
-        range_freq_mode.render(self)
+        if range_freq_mode.render(self):
+            return
         self._capture_successful_python_plot("range_freq")
         self._maybe_autoscale()
 

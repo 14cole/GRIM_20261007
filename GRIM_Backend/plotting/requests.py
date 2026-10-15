@@ -143,7 +143,6 @@ def prepare_sweep(request: PlotRequest, cancel=None) -> PlotResult:
 def prepare_cdf(request: PlotRequest, cancel=None) -> PlotResult:
     from . import distribution_analysis as distribution
     result = PlotResult(request, [])
-    retained_bytes = 0
     for plan in request.plans:
         check_cancel(cancel)
         for selection, label in distribution.groups(
@@ -153,16 +152,13 @@ def prepare_cdf(request: PlotRequest, cancel=None) -> PlotResult:
             if request.max_series is not None and len(result.items) >= request.max_series:
                 result.omitted += 1
                 continue
-            check_working_memory(retained_bytes + int(np.prod([len(v) for v in selection])) * 96,
-                                 "CDF population")
             curve = distribution.prepare_curve(
-                plan.name, plan.dataset, selection, label, request.options, scale=request.scale)
+                plan.name, plan.dataset, selection, label, request.options, scale=request.scale, cancel=cancel)
             check_cancel(cancel)
             if curve is None:
                 result.skipped.append(f"{plan.name} | {label}")
             else:
                 result.items.append(curve)
-                retained_bytes += sum(int(value.nbytes) for value in curve.values() if isinstance(value, np.ndarray))
     return result
 
 

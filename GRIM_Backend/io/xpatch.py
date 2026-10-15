@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
+import os
 
 
 BE_I4 = np.dtype(">i4")
@@ -233,8 +234,30 @@ def _restore_declared_azimuth_seam(values, start, stop, steps, atol=5e-5):
     return restored, bool(np.any(changed))
 
 
-def read_ss(path, verbose=True):
-    raw = np.fromfile(path, dtype=np.uint8)
+class _DeferredSsChannel:
+    """Read one bounded polarization slice from validated record offsets."""
+    dtype = np.dtype(np.complex64)
+
+    def __init__(self, raw, offsets, frequency_count, channel):
+        self.raw, self.offsets, self.channel = raw, offsets, channel
+        self.shape = (len(offsets), frequency_count)
+        self.ndim = 2
+        self.nbytes = 0  # The input mapping is not a retained decoded array.
+
+    def __getitem__(self, selection):
+        signal, frequencies = selection if isinstance(selection, tuple) else (selection, slice(None))
+        values = np.ndarray((self.shape[1], 2), dtype=BE_F4, buffer=self.raw,
+            offset=self.offsets[signal] + self.channel * 8, strides=(32, 4))[frequencies]
+        result = np.empty(values.shape[:-1], dtype=np.complex64)
+        result.real, result.imag = values[..., 0], values[..., 1]
+        return result
+
+
+def read_ss(path, verbose=True, *, _defer_samples=False):
+    # Header/framing parsing needs random offsets but not a resident file copy.
+    # The public default still returns ordinary decoded sample arrays.
+    raw = (np.memmap(path, mode="r", dtype=np.uint8)
+           if os.path.getsize(path) else np.empty(0, dtype=np.uint8))
     filesize = raw.size
     size_a = _table_bytes(HDRA)
     size_c = _table_bytes(HDRC)
@@ -332,6 +355,7 @@ def read_ss(path, verbose=True):
 
     ang = {"azinc": [], "elinc": [], "azobs": [], "elobs": []}
     pol = {"vv": [], "vh": [], "hv": [], "hh": []}
+    sample_offsets = []
     p, nsig, num_freqs_global = 0, 0, None
     while p < filesize:
         if filesize - p < 8:
@@ -393,12 +417,16 @@ def read_ss(path, verbose=True):
             raise ValueError(
                 f"{path}: record {nsig + 1} data extent does not match framing"
             )
-        chunk = np.frombuffer(raw[dstart:dstart + nbytes], BE_F4, 8 * num_freqs)
-        c = chunk[0::2] + 1j * chunk[1::2]
         for k in ang:
             ang[k].append(float(d[k][0]))
-        pol["vv"].append(c[0::4]); pol["vh"].append(c[1::4])
-        pol["hv"].append(c[2::4]); pol["hh"].append(c[3::4])
+        if _defer_samples:
+            sample_offsets.append(dstart)
+        else:
+            chunk = np.frombuffer(raw[dstart:dstart + nbytes], BE_F4, 8 * num_freqs)
+            c = np.empty(chunk.size // 2, dtype=np.complex64)
+            c.real, c.imag = chunk[0::2], chunk[1::2]
+            pol["vv"].append(c[0::4]); pol["vh"].append(c[1::4])
+            pol["hv"].append(c[2::4]); pol["hh"].append(c[3::4])
 
         nsig += 1
         p = record_end
@@ -468,10 +496,11 @@ def read_ss(path, verbose=True):
         "declared_azimuth_stop": declared_azimuth[1],
         "declared_azimuth_steps": declared_azimuth[2],
         "azimuth_seam_restored": azimuth_seam_restored,
-        "vv": np.asarray(pol["vv"]), "vh": np.asarray(pol["vh"]),
-        "hv": np.asarray(pol["hv"]), "hh": np.asarray(pol["hh"]),
-        "header_c": hdrc, "freq_axis_ok": match,
+        "header_c": {key: np.array(value, copy=True) for key, value in hdrc.items()}, "freq_axis_ok": match,
     }
+    result.update({name: (_DeferredSsChannel(raw, sample_offsets, nfa, channel)
+                         if _defer_samples else np.asarray(pol[name]))
+                   for channel, name in enumerate(("vv", "vh", "hv", "hh"))})
 
     if verbose:
         print(f"  signals           : {nsig}")
@@ -514,7 +543,15 @@ class XpatchFormatMixin:
     """Xpatch SS binary parsing and RCS grid loading."""
 
     @classmethod
-    def load_ss(cls, path, *, max_output_bytes=None):
+    def load_ss(cls, path, *, max_output_bytes=None, storage="memory", cache_dir=None):
+        """Load SS with bounded decoding into independent RAM or disk samples."""
+        from GRIM_Backend.io.binary_storage import binary_import_storage, loaded_binary_grid
+        with binary_import_storage(storage, cache_dir=cache_dir, max_output_bytes=max_output_bytes):
+            return loaded_binary_grid(cls._load_ss_bounded(path, storage=storage,
+                                      max_output_bytes=max_output_bytes), storage)
+
+    @classmethod
+    def _load_ss_bounded(cls, path, *, max_output_bytes, storage, _estimate_only=False):
         """Load an Xpatch SS signature into an RCS grid.
 
         Each signal supplies one azimuth/elevation look. Frequencies are in GHz, and
@@ -522,9 +559,11 @@ class XpatchFormatMixin:
         I/Q components. Xpatch stores calibrated scattering amplitudes, so
         |sample|^2 is 3-D RCS in square meters and the output quantity is sigma_3d/dBsm.
         """
-        from GRIM_Backend.datasets.memory import _checked_dense_import_allocation
+        from GRIM_Backend.io.binary_storage import BLOCK_CELLS, binary_import_allocation
+        from GRIM_Backend.datasets.result_storage import allocate_result
+        from GRIM_Backend.datasets.constants import _ADOPT_CLEAN_ARRAYS_TOKEN
 
-        data = read_ss(path, verbose=False)
+        data = read_ss(path, verbose=False, _defer_samples=True)
 
         az = np.round(np.asarray(data["az"], dtype=float), 4)
         el = np.round(np.asarray(data["el"], dtype=float), 4)
@@ -538,7 +577,7 @@ class XpatchFormatMixin:
             raise ValueError(
                 f"SS elevation axis has {el.size} signal values; expected {n_sig}"
             )
-        data_nf = int(np.asarray(data["vv"]).shape[1]) if n_sig else 0
+        data_nf = int(data["vv"].shape[1]) if n_sig else 0
         if not data.get("freq_axis_ok", True):
             raise ValueError(
                 "SS header-C looks mislocated (maxfreq != framing freq count), so the "
@@ -567,7 +606,7 @@ class XpatchFormatMixin:
         el_axis = np.asarray(sorted(set(el.tolist())), dtype=float)
         pols = np.asarray(["VV", "VH", "HV", "HH"], dtype=str)
         pol_data = [
-            np.asarray(data[name]) for name in ("vv", "vh", "hv", "hh")
+            data[name] for name in ("vv", "vh", "hv", "hh")
         ]
         expected_signal_shape = (n_sig, n_freq)
         for name, samples in zip(("VV", "VH", "HV", "HH"), pol_data):
@@ -629,41 +668,44 @@ class XpatchFormatMixin:
                 *pol_data,
             )
         )
-        allocation = _checked_dense_import_allocation(
-            shape,
-            (np.complex64,),
+        allocation = binary_import_allocation(
+            shape, np.complex64, storage=storage,
             source=f"SS import {path}",
             max_output_bytes=max_output_bytes,
-            resident_bytes=resident_bytes,
+            scratch_bytes=resident_bytes + min(n_freq, BLOCK_CELLS) * 64,
+            retained_metadata_bytes=az_axis.nbytes + el_axis.nbytes + freq.nbytes + pols.nbytes,
         )
-        field = np.full(shape, complex(np.nan, np.nan), dtype=np.complex64)
+        if _estimate_only:
+            return allocation
+        field = allocate_result(shape, np.complex64, fill=complex(np.nan, np.nan))
         has_finite_samples = False
         for s in range(n_sig):
             ai = az_index[float(az[s])]
             ei = el_index[float(el[s])]
             for pj, samples in enumerate(pol_data):
-                row = np.asarray(samples[s], dtype=np.complex64)
-                finite = np.isfinite(row.real) & np.isfinite(row.imag)
-                missing = np.isnan(row.real) & np.isnan(row.imag)
-                if np.any(~(finite | missing)):
-                    raise ValueError(
-                        f"SS {pols[pj]} signal {s + 1} contains an infinite "
-                        "or one-sided missing complex sample"
-                    )
-                if np.any(finite):
-                    finite_row = row[finite]
-                    real64 = finite_row.real.astype(np.float64)
-                    imag64 = finite_row.imag.astype(np.float64)
-                    sample_power = real64 * real64 + imag64 * imag64
-                    if np.any(sample_power > np.finfo(np.float32).max):
+                for first in range(0, n_freq, BLOCK_CELLS):
+                    stop = min(n_freq, first + BLOCK_CELLS)
+                    row = np.asarray(samples[s, first:stop], dtype=np.complex64)
+                    finite = np.isfinite(row.real) & np.isfinite(row.imag)
+                    missing = np.isnan(row.real) & np.isnan(row.imag)
+                    if np.any(~(finite | missing)):
                         raise ValueError(
-                            f"SS {pols[pj]} signal {s + 1} magnitude is too "
-                            "large for finite RCS power storage"
+                            f"SS {pols[pj]} signal {s + 1} contains an infinite "
+                            "or one-sided missing complex sample"
                         )
-                    # Copy source quadratures directly: a float32 phase round
-                    # trip can erase a small component near the negative real axis.
-                    field[ai, ei, finite, pj] = finite_row
-                    has_finite_samples = True
+                    if np.any(finite):
+                        finite_row = row[finite]
+                        real64 = finite_row.real.astype(np.float64)
+                        imag64 = finite_row.imag.astype(np.float64)
+                        sample_power = real64 * real64 + imag64 * imag64
+                        if np.any(sample_power > np.finfo(np.float32).max):
+                            raise ValueError(
+                                f"SS {pols[pj]} signal {s + 1} magnitude is too "
+                                "large for finite RCS power storage"
+                            )
+                        # Copy source quadratures directly without phase round trips.
+                        field[ai, ei, first:stop, pj][finite] = finite_row
+                        has_finite_samples = True
 
         if not has_finite_samples:
             raise ValueError("SS parsed, but no finite scattering samples were found")
@@ -685,7 +727,7 @@ class XpatchFormatMixin:
             pols,
             rcs=field,
             rcs_domain="complex_amplitude",
-            source_path=path,
+            source_path=str(path),
             history=(f"Loaded Xpatch .ss ({n_sig} signals, {n_freq} freqs, "
                      f"{ss_angle_source} angles, imono={ss_imono}"
                      f"{', restored +180 azimuth seam' if ss_azimuth_seam_restored else ''}"
@@ -695,6 +737,7 @@ class XpatchFormatMixin:
                 "rcs_log_unit": "dBsm", "rcs_linear_quantity": "sigma_3d",
             },
             extra=extra,
+            _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
         )
 
 

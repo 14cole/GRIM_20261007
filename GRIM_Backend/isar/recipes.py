@@ -29,7 +29,9 @@ def recipe_from_params(params):
             'aperture_mode': str(params.get('aperture_mode', 'auto')),
             'scene_half_extent_m': params.get('scene_half_extent_m'),
             'composite_side': int(params.get('composite_side', 1024)),
-            'native_diagnostics': bool(params.get('native_diagnostics', True))}}
+            'native_diagnostics': bool(params.get('native_diagnostics', True)),
+            'memory_limit_bytes': params.get('memory_limit_bytes'),
+            'memory_allow_exceed': bool(params.get('memory_allow_exceed', False))}}
 
 
 def save_recipe(path, recipe):
@@ -93,7 +95,7 @@ def recipe_arguments(dataset, recipe):
     options = dict(recipe.get('options', {}))
     allowed = {'window', 'reconstruction', 'length_unit', 'aperture_center_degrees', 'azimuth_target_degrees',
                'l1_strength', 'l1_iterations', 'flip_x', 'flip_y', 'aperture_mode', 'scene_half_extent_m',
-               'composite_side', 'native_diagnostics'}
+               'composite_side', 'native_diagnostics', 'memory_limit_bytes', 'memory_allow_exceed'}
     if set(options) - allowed:
         raise ValueError('Recipe contains unsupported formation options')
     options['window'] = _window_name(options.get('window', 'Hanning'))
@@ -107,7 +109,10 @@ def recipe_arguments(dataset, recipe):
     side = options.get('composite_side', 1024)
     if isinstance(side, bool) or not isinstance(side, int) or not 32 <= side <= 4096:
         raise ValueError('Invalid recipe composite grid size')
-    for key in ('flip_x', 'flip_y', 'native_diagnostics'):
+    from .memory import resolve_memory_limit
+    if options.get('memory_limit_bytes') is not None:
+        options['memory_limit_bytes'] = resolve_memory_limit(options['memory_limit_bytes'])
+    for key in ('flip_x', 'flip_y', 'native_diagnostics', 'memory_allow_exceed'):
         if key in options and not isinstance(options[key], bool):
             raise ValueError(f'Recipe {key} must be Boolean')
     center = options.get('aperture_center_degrees')

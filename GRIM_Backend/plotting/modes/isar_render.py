@@ -24,6 +24,10 @@ def render(self) -> None:
         return
     advanced = getattr(self, "isar_advanced", None)
     options = advanced.options() if advanced is not None else {}
+    # Freeze the automatic system-aware budget now; every band and replay
+    # uses the same captured choice rather than a moving available-RAM value.
+    options["memory_limit_bytes"] = computation.resolve_memory_limit(
+        options.get("memory_limit_bytes"), use_environment=False)
     image_mode = options.get("aperture_mode", "auto")
     composite_side = int(options.get("composite_side", computation._COMPOSITE_GRID_SIDE))
     use_composite = lambda span: image_mode == "composite" or (image_mode == "auto" and span > computation._COMPOSITE_SPAN_DEG)
@@ -288,10 +292,12 @@ def render(self) -> None:
         estimated_peak = max(estimated_peak, estimated_resident + working)
         estimated_resident += retained
     try:
-        computation._validate_isar_working_set(
-            estimated_peak,
-            operation="ISAR selection",
-        )
+        with computation.compute_memory_policy(options["memory_limit_bytes"],
+                allow_exceed=options.get("memory_allow_exceed", False)):
+            computation._validate_isar_working_set(
+                estimated_peak,
+                operation="ISAR selection",
+            )
     except ValueError as exc:
         self.status.showMessage(f"ISAR blocked: {exc}.")
         return

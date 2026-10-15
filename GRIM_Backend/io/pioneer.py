@@ -136,7 +136,15 @@ class PioFormatMixin:
     """Bounded PIO binary/text import and export for RcsGrid."""
 
     @classmethod
-    def load_pio(cls, path):
+    def load_pio(cls, path, *, storage="memory", cache_dir=None, max_output_bytes=None):
+        """Load PIO/CMPLX_DI into independent RAM or disk-backed samples."""
+        from GRIM_Backend.io.binary_storage import binary_import_storage, loaded_binary_grid
+        with binary_import_storage(storage, cache_dir=cache_dir, max_output_bytes=max_output_bytes):
+            return loaded_binary_grid(cls._load_pio_bounded(path, storage=storage,
+                                      max_output_bytes=max_output_bytes), storage)
+
+    @classmethod
+    def _load_pio_bounded(cls, path, *, storage, max_output_bytes, _estimate_only=False):
         """Load a Pioneer (.pio / .cmplx_di) file into an RcsGrid.
 
         File layout:
@@ -168,6 +176,9 @@ class PioFormatMixin:
         """
         from GRIM_Backend.datasets.constants import _ANGLE_UNITS, _FREQUENCY_UNITS
         from GRIM_Backend.io.pioneer import _pio_remove_closed_azimuth_endpoint
+        from GRIM_Backend.io.binary_storage import BLOCK_CELLS, binary_import_allocation
+        from GRIM_Backend.datasets.result_storage import allocate_result
+        from GRIM_Backend.datasets.constants import _ADOPT_CLEAN_ARRAYS_TOKEN
         header: dict[str, str] = {}
         footer: dict[str, str] = {}
         first_line: str = ""
@@ -287,13 +298,10 @@ class PioFormatMixin:
                     f"{payload_bytes} bytes at Offset={offset}, got {available}"
                 )
 
-            f.seek(offset, 0)
-            raw_buf = f.read(payload_bytes)
-            if len(raw_buf) != payload_bytes:
-                raise ValueError(
-                    f"PIO data block truncated: expected {payload_bytes} bytes, got {len(raw_buf)}"
-                )
-            rawdata = np.frombuffer(raw_buf, dtype=dtype, count=n_floats)
+            # The source mapping is temporary and read-only. Decoded samples
+            # are copied into independent managed destinations below.
+            rawdata = np.memmap(f, dtype=dtype, mode="r", offset=offset, shape=(n_floats,))
+            f.seek(payload_end, 0)
 
 
             footer_blob = f.read()
@@ -503,26 +511,36 @@ class PioFormatMixin:
                 )
             descending_axes[axis_name] = descending
 
-        if data_type == "complex":
-            real_samples = rawdata[0::2]
-            imag_samples = rawdata[1::2]
-            finite_pair = np.isfinite(real_samples) & np.isfinite(imag_samples)
-            missing_pair = np.isnan(real_samples) & np.isnan(imag_samples)
-            if np.any(~(finite_pair | missing_pair)):
-                raise ValueError(
-                    "PIO complex data contains an infinite or one-sided missing sample"
-                )
-            complex_arr = real_samples.astype(np.float64) + 1j * imag_samples.astype(np.float64)
-        else:
-            if np.any(np.isinf(rawdata)):
-                raise ValueError("PIO real data contains an infinite sample")
-            complex_arr = rawdata.astype(np.complex128)
-
-
         complex_dtype = np.complex128 if precision == "double" else np.complex64
-        data_2d = np.asarray(complex_arr, dtype=complex_dtype).reshape(
-            (int(xsize), int(ysize)), order="F"
-        )
+        allocation = binary_import_allocation((int(xsize), int(ysize)), complex_dtype,
+            storage=storage, source=f"PIO import {path}", max_output_bytes=max_output_bytes,
+            scratch_bytes=min(cell_count, BLOCK_CELLS) * 64 + 4 * (xvals.nbytes + yvals.nbytes) + 4096,
+            retained_metadata_bytes=xvals.nbytes + yvals.nbytes + 64)
+        if _estimate_only:
+            return allocation
+        data_2d = allocate_result((int(xsize), int(ysize)), complex_dtype, order="F")
+        output_flat = data_2d.reshape(-1, order="F")
+        for first in range(0, cell_count, BLOCK_CELLS):
+            last = min(cell_count, first + BLOCK_CELLS)
+            if data_type == "complex":
+                real_samples = rawdata[2 * first:2 * last:2]
+                imag_samples = rawdata[2 * first + 1:2 * last:2]
+                finite_pair = np.isfinite(real_samples) & np.isfinite(imag_samples)
+                missing_pair = np.isnan(real_samples) & np.isnan(imag_samples)
+                if np.any(~(finite_pair | missing_pair)):
+                    raise ValueError("PIO complex data contains an infinite or one-sided missing sample")
+                # Preserve the historical signed-zero and precision behavior.
+                converted = real_samples.astype(np.float64) + 1j * imag_samples.astype(np.float64)
+                del real_samples, imag_samples
+            else:
+                samples = rawdata[first:last]
+                if np.any(np.isinf(samples)):
+                    raise ValueError("PIO real data contains an infinite sample")
+                converted = samples.astype(np.complex128)
+                converted[~np.isfinite(converted)] = np.nan + 1j * np.nan
+                del samples
+            output_flat[first:last] = converted
+        del output_flat, rawdata
         if dropped_closing_azimuth:
             data_2d = data_2d[:-1, :]
 
@@ -636,6 +654,7 @@ class PioFormatMixin:
                 "azimuth": "deg", "elevation": "deg", "frequency": "GHz",
                 "rcs_log_unit": "dBsm", "rcs_linear_quantity": "sigma_3d",
             },
+            _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
         )
 
     def save_pio(self, path, *, el_idx=None, pol_idx=None, precision="single"):

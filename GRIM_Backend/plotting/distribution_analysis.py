@@ -7,6 +7,13 @@ from __future__ import annotations
 
 import numpy as np
 from .modes import common
+from GRIM_Backend.datasets.memory import _bounded_grid_selections
+from GRIM_Backend.datasets.reduction_workspace import workspace_array, BLOCK_CELLS
+
+
+def _cancel(cancel):
+    from .requests import check_cancel
+    check_cancel(cancel)
 
 
 def options(values=None):
@@ -47,34 +54,70 @@ def quadrature_weights(coordinates):
     return weights[inverse] / counts[inverse]
 
 
-def population(dataset, selection, *, scale="dbsm", weighting="samples"):
+def population(dataset, selection, *, scale="dbsm", weighting="samples", cancel=None):
     ai, ei, fi, pi = selection
     pi = int(np.asarray(pi).ravel()[0])
-    power = np.asarray(dataset.power[np.ix_(ai, ei, fi, [pi])][..., 0], dtype=float)
-    valid = np.isfinite(power) & (power >= 0.)
-    zero = valid & (power == 0.)
-    if scale == "linear":
-        display = power
-    else:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            display = np.asarray(dataset.linear_to_default_db(
-                np.where(valid, power, np.nan),
-                frequency_value=np.asarray(dataset.frequencies)[fi][None, None, :], eps=0.), dtype=float)
-        display[zero] = -np.inf
-    included = valid & (np.isfinite(display) | zero)
     selected_axes = {"samples": (), "azimuth": (0,), "frequency": (2,),
                      "azimuth_frequency": (0, 2), "all_axes": (0, 1, 2)}[weighting]
     coords = (np.asarray(dataset.azimuths)[ai], np.asarray(dataset.elevations)[ei], np.asarray(dataset.frequencies)[fi])
     # Each axis is normalized to prevent unit-dependent numerical overflow.
     ws = [quadrature_weights(v) if i in selected_axes else np.full(len(v), 1. / len(v))
           for i, v in enumerate(coords)]
-    grid_weights = ws[0][:, None, None] * ws[1][None, :, None] * ws[2][None, None, :]
-    values, weights = display[included], grid_weights[included]
-    order = np.argsort(values, kind="stable")
-    values, weights = values[order], weights[order]
-    counts = dict(selected=power.size, valid=values.size, zero=int(np.count_nonzero(zero)), excluded=int(power.size-values.size))
+    shape = (len(ai), len(ei), len(fi))
+    selected = int(np.prod(shape))
+    # Ordinals preserve stable ordering of equal levels without an O(N)
+    # argsort index or a second whole-population gather. Large workspaces are
+    # private mappings; quicksort needs only bounded stack space.
+    records = (workspace_array(selected, np.dtype([("value", "f8"), ("ordinal", "i8"), ("weight", "f8")]))
+               if weighting != "samples" else None)
+    sample_values = workspace_array(selected, np.float64) if records is None else records["value"]
+    count = zero_count = 0
+    coverage = zero_weight = 0.
+    indices = tuple(np.asarray(v) for v in (ai, ei, fi))
+    for block in _bounded_grid_selections(shape, BLOCK_CELLS):
+        _cancel(cancel)
+        selected_indices = tuple(v[part] for v, part in zip(indices, block))
+        power = np.asarray(dataset.power[np.ix_(*selected_indices, [pi])][..., 0], dtype=float)
+        valid = np.isfinite(power) & (power >= 0.)
+        zero = valid & (power == 0.)
+        if scale == "linear":
+            display = power
+        else:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                display = np.asarray(dataset.linear_to_default_db(
+                    np.where(valid, power, np.nan),
+                    frequency_value=np.asarray(dataset.frequencies)[selected_indices[2]][None, None, :], eps=0.), dtype=float)
+            display[zero] = -np.inf
+        included = valid & (np.isfinite(display) | zero)
+        grid_weights = ws[0][block[0]][:, None, None] * ws[1][block[1]][None, :, None] * ws[2][block[2]][None, None, :]
+        values, weights = display[included], grid_weights[included]
+        stop = count + values.size
+        sample_values[count:stop] = values
+        # Traversal uses C-order contiguous logical tiles. Compute native
+        # flattened order explicitly for shapes split on more than one axis.
+        if records is not None:
+            ordinal = ((np.arange(block[0].start, block[0].stop)[:, None, None] * shape[1]
+                        + np.arange(block[1].start, block[1].stop)[None, :, None]) * shape[2]
+                       + np.arange(block[2].start, block[2].stop)[None, None, :])
+            records["ordinal"][count:stop] = ordinal[included]
+            records["weight"][count:stop] = weights
+        count = stop
+        zero_count += int(np.count_nonzero(zero))
+        coverage += float(np.sum(weights))
+        zero_weight += float(np.sum(grid_weights[zero & included]))
+    _cancel(cancel)
+    if records is None:
+        values = sample_values[:count]
+        values.sort(kind="quicksort")
+        weights = np.broadcast_to(ws[0][0] * ws[1][0] * ws[2][0], (count,))
+    else:
+        records = records[:count]
+        records.sort(order=("value", "ordinal"), kind="quicksort")
+        values, weights = records["value"], records["weight"]
+    _cancel(cancel)
+    counts = dict(selected=selected, valid=count, zero=zero_count, excluded=selected-count)
     return {"values": values, "weights": weights, "counts": counts,
-            "coverage": float(np.sum(weights)), "zero_weight": float(np.sum(grid_weights[zero & included]))}
+            "coverage": coverage, "zero_weight": zero_weight}
 
 
 def groups(dataset, reference, selection, config, *, azimuths, frequencies):
@@ -104,15 +147,41 @@ def groups(dataset, reference, selection, config, *, azimuths, frequencies):
             yield (np.asarray(ai)[ag == a], ei, np.asarray(fi)[fg == f], pi), "; ".join(parts) or "All selected coordinates"
 
 
-def prepare_curve(name, dataset, selection, group, config, *, scale):
-    pop = population(dataset, selection, scale=scale, weighting=config["weighting"])
+def prepare_curve(name, dataset, selection, group, config, *, scale, cancel=None):
+    pop = population(dataset, selection, scale=scale, weighting=config["weighting"], cancel=cancel)
     values, weights = pop["values"], pop["weights"]
     if not len(values) or pop["coverage"] <= 0:
         return None
-    levels, starts = np.unique(values, return_index=True)
-    masses = np.add.reduceat(weights, starts)
-    cdf = np.cumsum(masses) / pop["coverage"] * 100.
-    exceed = np.cumsum(masses[::-1])[::-1] / pop["coverage"] * 100.
+    levels = workspace_array(len(values), np.float64)
+    masses = workspace_array(len(values), np.float64)
+    distinct = 0
+    for first in range(0, len(values), BLOCK_CELLS):
+        _cancel(cancel)
+        part = values[first:first + BLOCK_CELLS]
+        starts = np.r_[0, np.flatnonzero(part[1:] != part[:-1]) + 1]
+        block_levels = part[starts]
+        block_masses = np.add.reduceat(weights[first:first + BLOCK_CELLS], starts)
+        if distinct and block_levels[0] == levels[distinct - 1]:
+            masses[distinct - 1] += block_masses[0]
+            block_levels, block_masses = block_levels[1:], block_masses[1:]
+        stop = distinct + len(block_levels)
+        levels[distinct:stop], masses[distinct:stop] = block_levels, block_masses
+        distinct = stop
+    levels, masses = levels[:distinct], masses[:distinct]
+    cdf, exceed = workspace_array(distinct, np.float64), workspace_array(distinct, np.float64)
+    total = 0.
+    for first in range(0, distinct, BLOCK_CELLS):
+        _cancel(cancel)
+        part = np.cumsum(masses[first:first + BLOCK_CELLS]) + total
+        total = float(part[-1])
+        cdf[first:first + BLOCK_CELLS] = part / pop["coverage"] * 100.
+    total = 0.
+    for stop in range(distinct, 0, -BLOCK_CELLS):
+        _cancel(cancel)
+        first = max(0, stop - BLOCK_CELLS)
+        part = np.cumsum(masses[first:stop][::-1]) + total
+        total = float(part[-1])
+        exceed[first:stop] = part[::-1] / pop["coverage"] * 100.
     pi = int(np.asarray(selection[3]).ravel()[0])
     pol = dataset.polarizations[pi]
     unit = ({"sigma_3d": "m²", "sigma_2d": "m", "power_ratio": "dimensionless", "ratio": "dimensionless"}.get(str(dataset.linear_quantity()).lower(), "linear") if scale == "linear" else dataset.default_log_unit())
@@ -120,7 +189,8 @@ def prepare_curve(name, dataset, selection, group, config, *, scale):
     if weighted:
         median = levels[min(int(np.searchsorted(cdf, 50.)), len(levels)-1)]
     else:
-        median = float(np.median(values))
+        middle = len(values) // 2
+        median = float(values[middle]) if len(values) % 2 else float(np.mean([values[middle - 1], values[middle]]))
     counts = pop["counts"]
     label = (f"{name} | Pol {pol}, {counts['valid']:,} samples, "
              f"{'weighted P50' if weighted else 'median'} {median:.4g} {unit}")
@@ -134,21 +204,30 @@ def prepare_curve(name, dataset, selection, group, config, *, scale):
         details.append(f"{measure} hull quadrature; {100*pop['coverage']:.4g}% valid weight")
     if details:
         label += "\n" + "\n".join(details)
-    threshold = config["threshold"]
-    lookup = (100. * np.sum(weights[values <= threshold]) / pop["coverage"],
-              100. * np.sum(weights[values >= threshold]) / pop["coverage"])
     key = ("cdf", bool(config["exceedance"]), config["grouping"], group, config["weighting"],
            tuple(float(v) for v in dataset.azimuths[selection[0]]),
            tuple(float(v) for v in dataset.elevations[selection[1]]),
            tuple(float(v) for v in dataset.frequencies[selection[2]]), str(pol))
     # Sorted population is transient: retain only the distinct levels and mass.
     pop.pop("values"); pop.pop("weights")
-    return dict(dataset=dataset, name=name, pol=str(pol), group=group, unit=unit,
-                levels=levels, cdf=cdf, exceed=exceed, population=pop, label=label, key=key, lookup=lookup)
+    curve = dict(dataset=dataset, name=name, pol=str(pol), group=group, unit=unit,
+                 levels=levels, cdf=cdf, exceed=exceed, population=pop, label=label, key=key)
+    curve["lookup"] = threshold_lookup(curve, config["threshold"])
+    return curve
+
+
+def threshold_lookup(curve, threshold):
+    """Exact inclusive tails from retained distinct levels, in O(log N)."""
+    levels = curve["levels"]
+    right = int(np.searchsorted(levels, threshold, side="right"))
+    left = int(np.searchsorted(levels, threshold, side="left"))
+    below = float(curve["cdf"][right - 1]) if right else 0.
+    above = float(curve["exceed"][left]) if left < len(levels) else 0.
+    return below, above
 
 
 def bounds(curves, threshold=None):
-    finite = [c["levels"][np.isfinite(c["levels"])] for c in curves]
+    finite = [c["levels"][1:] if np.isneginf(c["levels"][0]) else c["levels"] for c in curves if len(c["levels"])]
     finite = [v for v in finite if v.size]
     low, high = (min(v[0] for v in finite), max(v[-1] for v in finite)) if finite else (-1., 1.)
     if threshold is not None:
@@ -159,11 +238,18 @@ def bounds(curves, threshold=None):
 
 def draw_values(curve, limits, *, exceedance=False):
     levels, pop = curve["levels"], curve["population"]
-    finite = np.isfinite(levels)
+    first = int(bool(len(levels) and np.isneginf(levels[0])))
     zero_percent = 100. * pop["zero_weight"] / pop["coverage"]
-    left = (100.-zero_percent if exceedance else zero_percent) if np.any(np.isneginf(levels)) else (100. if exceedance else 0.)
-    return (np.r_[limits[0], levels[finite], limits[1]],
-            np.r_[left, curve["exceed" if exceedance else "cdf"][finite], 0. if exceedance else 100.])
+    left = (100.-zero_percent if exceedance else zero_percent) if first else (100. if exceedance else 0.)
+    size = len(levels) - first + 2
+    x, y = workspace_array(size, np.float64), workspace_array(size, np.float64)
+    x[0], x[-1], y[0], y[-1] = limits[0], limits[1], left, 0. if exceedance else 100.
+    cumulative = curve["exceed" if exceedance else "cdf"]
+    for start in range(first, len(levels), BLOCK_CELLS):
+        stop = min(len(levels), start + BLOCK_CELLS)
+        target = slice(start - first + 1, stop - first + 1)
+        x[target], y[target] = levels[start:stop], cumulative[start:stop]
+    return x, y
 
 
 def y_label(config):

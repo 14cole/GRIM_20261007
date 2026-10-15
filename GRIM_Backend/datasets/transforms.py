@@ -1321,6 +1321,8 @@ def down_range_profile(
     polarization_index: int,
     gate: dict | None = None,
     max_sweeps: int = 360,
+    maximum_work_bytes: int = 32 * 1024**2,
+    cancel_check=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Median Hann-windowed down-range power over azimuth, for gate previews.
 
@@ -1336,21 +1338,39 @@ def down_range_profile(
     azimuths = np.unique(np.linspace(
         0, dataset.power.shape[0] - 1, min(max_sweeps, dataset.power.shape[0])
     ).round().astype(int))
-    field = np.asarray(
-        dataset.rcs_slice((azimuths, int(elevation_index), slice(None), int(polarization_index))),
-        dtype=np.complex128,
-    )
-    field = field[np.all(np.isfinite(field), axis=-1)]
-    if field.size == 0:
-        raise ValueError("no complete complex sweep for this elevation and polarization")
-    if _declared_time_sign(dataset) == "-jwt":
-        field = np.conj(field)
-    if gate is not None:
-        field = _gate_sweeps(field, frequencies, **gate)
+    from .reduction_workspace import workspace_array, BLOCK_CELLS
+    from GRIM_Backend.plotting.requests import check_cancel
     size = _gate_fft_size(count)
+    bytes_per_sweep = 48 * count + 80 * size
+    sweeps_per_block = max(1, int(maximum_work_bytes) // max(1, bytes_per_sweep))
+    profiles = workspace_array((len(azimuths), size), np.float64)
     window = np.hanning(count)
-    profile = np.abs(np.fft.ifft(field * window, n=size, axis=-1)) ** 2
-    profile = np.fft.fftshift(np.median(profile, axis=0))
+    conjugate = _declared_time_sign(dataset) == "-jwt"
+    read_field, _dtype = dataset._bounded_complex_slice_reader()
+    complete_count = 0
+    for first in range(0, len(azimuths), sweeps_per_block):
+        check_cancel(cancel_check)
+        field = np.asarray(read_field((azimuths[first:first + sweeps_per_block],
+            int(elevation_index), slice(None), int(polarization_index))), dtype=np.complex128)
+        field = field[np.all(np.isfinite(field), axis=-1)]
+        if not field.size:
+            continue
+        if conjugate:
+            field = np.conj(field)
+        if gate is not None:
+            field = _gate_sweeps(field, frequencies, **gate)
+        power = np.abs(np.fft.ifft(field * window, n=size, axis=-1)) ** 2
+        profiles[complete_count:complete_count + len(field)] = power
+        complete_count += len(field)
+    if not complete_count:
+        raise ValueError("no complete complex sweep for this elevation and polarization")
+    profile = np.empty(size, dtype=float)
+    columns = max(1, BLOCK_CELLS // complete_count)
+    for first in range(0, size, columns):
+        check_cancel(cancel_check)
+        stop = min(size, first + columns)
+        profile[first:stop] = np.median(profiles[:complete_count, first:stop], axis=0)
+    profile = np.fft.fftshift(profile)
     step = float(np.mean(np.diff(frequencies)))
     ranges = np.fft.fftshift(np.fft.fftfreq(size, d=step)) * (C0 / 2.0)
     return ranges, profile

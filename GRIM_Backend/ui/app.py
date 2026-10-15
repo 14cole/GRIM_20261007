@@ -472,6 +472,10 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_result_storage.setToolTip('Choose Auto, RAM, or Disk for new operation results.')
         self.btn_result_storage.clicked.connect(self._show_result_storage_options)
         ops_panel_layout.addWidget(self.btn_result_storage)
+        self.btn_storage_usage = QToolButton(text='Storage usage…')
+        self.btn_storage_usage.setToolTip('Inspect retained buffers, clear Undo, and clean abandoned temporary files.')
+        self.btn_storage_usage.clicked.connect(self._show_storage_usage)
+        ops_panel_layout.addWidget(self.btn_storage_usage)
 
         ops_scroll = QScrollArea()
         ops_scroll.setWidgetResizable(True)
