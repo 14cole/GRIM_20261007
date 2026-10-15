@@ -1,6 +1,7 @@
 import json
 import cmath
 import math
+import operator
 import os
 import tempfile
 from io import StringIO
@@ -201,24 +202,22 @@ def compute_dbke_from_linear(
         raise ValueError('frequency_value must be a positive finite frequency.')
     return 10.0 * math.log10(((2.0 * math.pi * freq_hz) / C0) * lin)
 
-def _build_grid_for_samples(
-    samples: 'List[Dict[str, Any]]',
-    polarization: 'str',
-    source_path: 'str' = '',
-    history: 'str' = '',
-    preserve_raw_complex_amplitude: 'bool' = True,
-    rcs_log_unit: 'str' = 'dBke',
-    rcs_linear_quantity: 'str' = 'sigma_2d',
-    solver_metadata_json: 'str' = '',
-) -> 'Dict[str, Any]':
-    if not samples:
-        raise ValueError('No samples available to export.')
-    linear_quantity = str(rcs_linear_quantity).strip().lower()
-    if linear_quantity not in {'sigma_2d', 'sigma_3d'}:
-        raise ValueError(
-            "rcs_linear_quantity must be 'sigma_2d' or 'sigma_3d'."
-        )
+_SAMPLE_VALUE_FIELDS = (
+    'theta_scat_deg', 'frequency_ghz', 'rcs_linear', 'rcs_amp_real', 'rcs_amp_imag',
+)
 
+
+def _validated_sample_rows(
+    samples: 'List[Dict[str, Any]]',
+    linear_quantity: 'str',
+) -> 'np.ndarray':
+    """Validate samples one row at a time; this is the reference error path.
+
+    Returns an ``(n, 5)`` float64 array of ``(theta_scat_deg, frequency_ghz,
+    rcs_linear, rcs_amp_real, rcs_amp_imag)``.  The vectorised builder calls it
+    only when a row failed its array checks, so the first invalid row is
+    reported with exactly the message this loop has always produced.
+    """
     validated_rows = np.empty((len(samples), 5), dtype=np.float64)
     for row_index, row in enumerate(samples):
         try:
@@ -268,65 +267,159 @@ def _build_grid_for_samples(
                 f"{expected_linear:.12g})."
             )
         validated_rows[row_index] = (az, freq, lin, amp_real, amp_imag)
+    return validated_rows
 
-    azimuths = np.asarray(sorted({row[0] for row in validated_rows}), dtype=float)
+
+def _sample_value_columns(
+    samples: 'List[Dict[str, Any]]',
+    linear_quantity: 'str',
+) -> 'List[np.ndarray]':
+    """Return validated float64 columns for the five exported sample values.
+
+    Compact run-owned tables hand over their columns without materialising a
+    dictionary per row; ordinary row sequences are read once per field.  The
+    validity checks of the per-row loop are evaluated as array masks, and any
+    failure defers to that loop so the reported row and message are unchanged.
+    """
+    from ghost_backend.twod.samples import sample_columns
+
+    count = len(samples)
+    columns = None
+    try:
+        native = sample_columns(samples)
+        if native is not None and all(key in native for key in _SAMPLE_VALUE_FIELDS):
+            columns = [
+                np.asarray(native[key], dtype=np.float64).reshape(-1)
+                for key in _SAMPLE_VALUE_FIELDS
+            ]
+        else:
+            columns = [
+                np.fromiter(
+                    map(operator.itemgetter(key), samples), dtype=np.float64, count=count
+                )
+                for key in _SAMPLE_VALUE_FIELDS
+            ]
+    except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
+        columns = None
+    if columns is not None and all(column.shape == (count,) for column in columns):
+        theta, frequency, linear, amp_real, amp_imag = columns
+        # A nonpositive frequency or overflow only marks the row invalid here;
+        # the row loop then reports it, so the arithmetic may not warn.
+        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            amp_abs2 = amp_real * amp_real + amp_imag * amp_imag
+            if linear_quantity == 'sigma_2d':
+                k0 = 2.0 * math.pi * frequency * 1.0e9 / C0
+                expected_linear = amp_abs2 / (4.0 * k0)
+            else:
+                expected_linear = 4.0 * math.pi * amp_abs2
+            consistency_tol = (
+                2.0e-8 * np.maximum(expected_linear, linear)
+                + np.finfo(float).tiny
+            )
+            invalid = ~np.isfinite(theta)
+            for column in (frequency, linear, amp_real, amp_imag):
+                invalid |= ~np.isfinite(column)
+            invalid |= (frequency <= 0.0) | (linear < 0.0)
+            invalid |= ~np.isfinite(amp_abs2) | ~np.isfinite(expected_linear)
+            invalid |= np.abs(linear - expected_linear) > consistency_tol
+        if not np.any(invalid):
+            return columns
+    rows = _validated_sample_rows(samples, linear_quantity)
+    return [rows[:, index] for index in range(5)]
+
+
+def _build_grid_for_samples(
+    samples: 'List[Dict[str, Any]]',
+    polarization: 'str',
+    source_path: 'str' = '',
+    history: 'str' = '',
+    preserve_raw_complex_amplitude: 'bool' = True,
+    rcs_log_unit: 'str' = 'dBke',
+    rcs_linear_quantity: 'str' = 'sigma_2d',
+    solver_metadata_json: 'str' = '',
+) -> 'Dict[str, Any]':
+    """Assemble one rectangular (angle x frequency) GRIM payload from samples.
+
+    Axes, grid placement, duplicate detection and completeness are computed
+    with array operations; a sweep of a million samples takes tens of
+    milliseconds instead of seconds.  Duplicate coordinates keep the first
+    sample and must agree with it in power (``EPS``) and phase (1e-5 rad), as
+    before.  Stored power and phase are float32; raw amplitudes stay float64.
+    """
+    if not samples:
+        raise ValueError('No samples available to export.')
+    linear_quantity = str(rcs_linear_quantity).strip().lower()
+    if linear_quantity not in {'sigma_2d', 'sigma_3d'}:
+        raise ValueError(
+            "rcs_linear_quantity must be 'sigma_2d' or 'sigma_3d'."
+        )
+
+    theta, frequency, linear, amp_real, amp_imag = _sample_value_columns(
+        samples, linear_quantity
+    )
+
+    azimuths = np.unique(theta)
     elevations = np.asarray([0.0], dtype=float)
-    frequencies = np.asarray(sorted({row[1] for row in validated_rows}), dtype=float)
+    frequencies = np.unique(frequency)
     polarization_label = _canonical_user_polarization_label(polarization)
     polarization_primary = _primary_alias_for_user_polarization(polarization_label)
     polarizations = np.asarray([polarization_primary], dtype=str)
 
     shape = (len(azimuths), len(elevations), len(frequencies), len(polarizations))
-    rcs_phase = np.full(shape, np.nan, dtype=np.float32)
-    rcs_power = np.full(shape, np.nan, dtype=np.float32)
+    cells = (
+        np.searchsorted(azimuths, theta) * len(frequencies)
+        + np.searchsorted(frequencies, frequency)
+    )
+    # The first sample at a coordinate is the stored one; later repeats are
+    # only checked against it (same policy as the historical row loop).
+    unique_cells, first = np.unique(cells, return_index=True)
+    with np.errstate(invalid='ignore'):
+        phase = np.arctan2(amp_imag, amp_real)
+    phase[(amp_real == 0.0) & (amp_imag == 0.0)] = 0.0
 
-
-    rcs_amp_real = np.full(shape, np.nan, dtype=np.float64) if preserve_raw_complex_amplitude else None
-    rcs_amp_imag = np.full(shape, np.nan, dtype=np.float64) if preserve_raw_complex_amplitude else None
-
-    az_index = {value: i for i, value in enumerate(azimuths)}
-    f_index = {value: i for i, value in enumerate(frequencies)}
-
-    for az, freq, lin, amp_real, amp_imag in validated_rows:
-        idx = (az_index[az], 0, f_index[freq], 0)
-        amp_value_raw = complex(amp_real, amp_imag)
-        phase_value = (
-            0.0 if amp_value_raw == 0.0j
-            else float(cmath.phase(amp_value_raw))
+    duplicates = np.ones(cells.size, dtype=bool)
+    duplicates[first] = False
+    if np.any(duplicates):
+        repeat = np.flatnonzero(duplicates)
+        origin = first[np.searchsorted(unique_cells, cells[repeat])]
+        stored_power = linear[origin].astype(np.float32).astype(np.float64)
+        power_conflict = np.abs(stored_power - linear[repeat]) > EPS
+        stored_phase = phase[origin].astype(np.float32).astype(np.float64)
+        two_pi = 2.0 * math.pi
+        diff_angle = (
+            np.remainder(phase[repeat] - stored_phase + math.pi, two_pi) - math.pi
         )
-
-        existing_power = rcs_power[idx]
-        if not np.isnan(existing_power):
-            if abs(existing_power - lin) > EPS:
+        phase_conflict = np.abs(diff_angle) > 1e-5
+        conflicts = np.flatnonzero(power_conflict | phase_conflict)
+        if conflicts.size:
+            row = repeat[conflicts[0]]
+            az, freq = theta[row], frequency[row]
+            if power_conflict[conflicts[0]]:
                 raise ValueError(
                     f'Duplicate sample conflict at az={az}, el=0, f={freq}, pol={polarization}.'
                 )
-            existing_phase = rcs_phase[idx]
-            if np.isfinite(existing_phase):
+            raise ValueError(
+                f'Duplicate amplitude conflict at az={az}, el=0, f={freq}, pol={polarization}.'
+            )
 
-
-                two_pi = 2.0 * math.pi
-                diff_angle = (phase_value - float(existing_phase) + math.pi) % two_pi - math.pi
-                if abs(diff_angle) > 1e-5:
-                    raise ValueError(
-                        f'Duplicate amplitude conflict at az={az}, el=0, f={freq}, pol={polarization}.'
-                    )
-            continue
-
-
-        rcs_power[idx] = 0.0 if lin == 0.0 else float(lin)
-        rcs_phase[idx] = phase_value
-        if preserve_raw_complex_amplitude:
-            rcs_amp_real[idx] = float(amp_value_raw.real)
-            rcs_amp_imag[idx] = float(amp_value_raw.imag)
+    rcs_phase = np.full(shape, np.nan, dtype=np.float32)
+    rcs_power = np.full(shape, np.nan, dtype=np.float32)
+    rcs_power.flat[unique_cells] = linear[first]
+    rcs_phase.flat[unique_cells] = phase[first]
+    rcs_amp_real = rcs_amp_imag = None
+    if preserve_raw_complex_amplitude:
+        rcs_amp_real = np.full(shape, np.nan, dtype=np.float64)
+        rcs_amp_imag = np.full(shape, np.nan, dtype=np.float64)
+        rcs_amp_real.flat[unique_cells] = amp_real[first]
+        rcs_amp_imag.flat[unique_cells] = amp_imag[first]
 
     missing = np.argwhere(~np.isfinite(rcs_power))
     if missing.size:
-        first = tuple(int(value) for value in missing[0])
+        first_missing = tuple(int(value) for value in missing[0])
         raise ValueError(
             "Solver samples do not form a complete rectangular "
             f"(angle x frequency x polarization) grid: {len(missing)} cell(s) "
-            f"are missing; first missing index is {first}."
+            f"are missing; first missing index is {first_missing}."
         )
     if not np.all(np.isfinite(rcs_phase)):
         raise ValueError("Solver sample phases are not finite after grid construction.")
