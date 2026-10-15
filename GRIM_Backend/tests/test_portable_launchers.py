@@ -21,11 +21,10 @@ class PortableLauncherTests(unittest.TestCase):
         self.assertGreater(system_launcher, active_environment, relative_path)
 
     def test_windows_launchers_share_repository_environment_priority(self) -> None:
+        # GRIM's own launchers (Setup_GRIM.bat, Launch_GRIM.bat and the offline
+        # pair) run the embedded python_env interpreter instead and are covered
+        # by test_online_setup.py and test_offline_setup.py.
         for relative_path in (
-            "Build_GRIM_Release.bat",
-            "Launch_GRIM_GUI.bat",
-            "Launch_GRIM_Diagnostics.bat",
-            "Launch_PowerPoint_Image_Imprinter.bat",
             "tools/FREDDY/Launch_FREDDY_GUI.bat",
             "tools/GHOST/Launch_GHOST_GUI.bat",
         ):

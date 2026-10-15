@@ -1,7 +1,7 @@
 # GRIM application
 
-Backend module locations and Python entry points are listed in the
-[backend guide](BACKEND.md).
+The Python entry points for a source checkout are listed under
+[Running from a development checkout](#running-from-a-development-checkout).
 
 GRIM is the host application for this distribution. Its desktop tabs are
 **Plotting | ISAR | FREDDY | GHOST | Assembly | PPT | Python**. GHOST and FREDDY remain
@@ -33,13 +33,45 @@ The [setup instructions](../offline%20packages/README.txt) include
 the optional manual wheel download command. Keep the sibling `tools` directory in the
 distribution for FREDDY and GHOST.
 
-For an existing development checkout, run GRIM from the repository root
-after an editable installation:
+## Running from a development checkout
+
+GRIM is not a pip package: there is no `pyproject.toml`, no editable install,
+and no `grim` console script. A checkout runs straight from the source tree in
+either of two ways.
+
+1. With the same embedded runtime as the distribution: extract the embedded
+   Python into `GRIM_Backend/python_env`, double-click **Setup_GRIM.bat**, then
+   use **Launch_GRIM.bat** (or the offline pair in `GRIM_Backend`). Setup
+   accepts any 64-bit CPython 3.11 or newer in `python_env`, so a development
+   interpreter can stand in for the release runtime.
+2. With any Python 3.11 or newer that already has the packages from
+   [requirements.txt](../offline%20packages/requirements.txt) installed
+   (NumPy, SciPy, Matplotlib, PySide6, psutil, and pywin32 for PowerPoint
+   export). Run the entry point script directly from the repository root:
+
+   ```powershell
+   python GRIM_Backend/run_gui.py
+   ```
+
+   `run_gui.py`, `run_headless.py` (`GRIM_Backend.scripting.cli`),
+   `run_diagnostics.py` (`GRIM_Backend.execution.diagnostics`), and
+   `run_image_imprinter.py` (`GRIM_Backend.reports.image_imprinter`) each put
+   the repository root on `sys.path` when run as a script, so nothing needs to
+   be installed. Keep the sibling `tools` directory next to `GRIM_Backend` so
+   the FREDDY and GHOST tabs find their files.
+
+Run the test suite from the repository root with `pytest` installed in that
+Python:
 
 ```powershell
-py -m pip install -e .
-grim
+python -m pytest GRIM_Backend/tests -q -p no:cacheprovider --basetemp=<scratch dir>
 ```
+
+`--basetemp` gives the run its own writable temporary directory (pytest's
+default per-user temp root is not writable on every machine, and two runs must
+not share one). `-p no:cacheprovider` stops pytest from writing
+`.pytest_cache`. The suite takes several minutes; tests of the Windows batch
+launchers skip on other platforms.
 
 ## Reading and comparing complex returns
 
@@ -908,11 +940,13 @@ a failed export does not leave a partial report folder.
 
 The slide preview and PNG export use GRIM's normal NumPy/Matplotlib/PySide
 dependencies; neither requires `python-pptx`, PowerPoint, or a template.
-PowerPoint export currently requires Windows, desktop Microsoft PowerPoint, and the
-optional bridge installed with:
+PowerPoint export currently requires Windows, desktop Microsoft PowerPoint, and
+the `pywin32` COM bridge. The distribution's setup installs `pywin32` from
+[requirements.txt](../offline%20packages/requirements.txt); a development
+interpreter that lacks it needs:
 
 ```powershell
-py -m pip install -e ".[powerpoint]"
+python -m pip install pywin32
 ```
 
 ## GHOST integration

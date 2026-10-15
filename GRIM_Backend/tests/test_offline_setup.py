@@ -253,7 +253,12 @@ def test_batch_missing_runtime_from_path_with_spaces(tmp_path, filename):
     backend.mkdir(parents=True)
     source = Path(offline.__file__).parent / filename
     shutil.copy2(source, backend / filename)
-    result = subprocess.run([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", filename],
+    # Invoke by full path: when NoDefaultCurrentDirectoryInExePath is set, cmd.exe
+    # refuses to run a batch file from the current directory by bare name. Pass
+    # the command line as one string; list2cmdline would backslash-escape the
+    # inner quotes, which cmd.exe does not treat as C-runtime quoting.
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = subprocess.run(f'"{comspec}" /d /s /c ""{backend / filename}""',
                             cwd=backend, input="\n", capture_output=True, text=True, timeout=20)
     assert result.returncode == 1
     assert "python_env" in result.stdout and "python.exe" in result.stdout

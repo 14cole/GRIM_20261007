@@ -67,9 +67,11 @@ echo ERROR: No preferred Python interpreter could import the FREDDY GUI.
 echo.
 if exist "%FREDDY_LAUNCH_LOG%" type "%FREDDY_LAUNCH_LOG%"
 echo.
-echo From the repository root, create the shared environment and install with:
+echo The FREDDY tab inside GRIM uses GRIM's own environment: run Setup_GRIM.bat
+echo in the repository root, then Launch_GRIM.bat. To use this launcher on its
+echo own, create the shared environment from the repository root with:
 echo     py.exe -3 -m venv .venv
-echo     .venv\Scripts\python.exe -m pip install -e .
+echo     .venv\Scripts\python.exe -m pip install -r "GRIM_Backend\offline packages\requirements.txt"
 echo.
 pause
 exit /b 1
