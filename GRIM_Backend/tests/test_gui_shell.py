@@ -1342,6 +1342,55 @@ class UnifiedGuiShellTest(unittest.TestCase):
         self.assertFalse(self.window._dataset_row_is_dirty(0))
         self.assertFalse(self.window._dataset_row_is_dirty(1))
 
+    def test_memory_budget_review_can_continue_and_load_in_the_same_window(self) -> None:
+        from GRIM_Backend.ui.load_options import LoadOptionsDialog
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _grid(2.0).save(os.path.join(tmp, "budget.grim"))
+            reviews = []
+            def continue_once(dialog):
+                reviews.append(dialog)
+                dialog._continue_once()
+                return QDialog.Accepted
+            with mock.patch.object(LoadOptionsDialog, "exec", new=continue_once):
+                grim_cut_dataset_mixin.DatasetOpsMixin._handle_files_dropped(self.window, [path], load_options={"max_output_bytes": 1})
+                deadline = time.monotonic() + 10
+                while (self.window.table.rowCount() == 0 or self.window._background_job_active()) and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                self.app.processEvents()
+            self.assertEqual(len(reviews), 1)
+            self.assertEqual(self.window.table.rowCount(), 1)
+            self.assertEqual(float(self.window.table.item(0, 0).data(Qt.UserRole).power.item()), 4.0)
+            self.assertNotIn("allow_exceed", self.window._current_load_options())
+
+    def test_memory_review_retry_is_queued_if_another_job_starts(self) -> None:
+        from GRIM_Backend.ui.load_options import LoadOptionsDialog
+        self.window._ensure_background_worker_state()
+        self.window._pending_memory_review = {'paths': ['queued.grim'], 'options': {},
+                                             'plan': {'serial_peak_bytes': 10, 'budget_bytes': 1}}
+        def continue_once(dialog):
+            dialog._continue_once()
+            return QDialog.Accepted
+        with mock.patch.object(LoadOptionsDialog, 'exec', new=continue_once), \
+             mock.patch.object(self.window, '_start_dataset_import_batch', return_value=False):
+            self.assertFalse(self.window._review_pending_load_memory())
+        self.assertEqual(self.window._pending_import_batches[0], (('queued.grim',), 0))
+        self.assertTrue(self.window._queued_import_options[('queued.grim',)]['allow_exceed'])
+
+    def test_region_load_stays_unsaved_and_records_its_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            values = np.arange(4, dtype=float).reshape(2, 1, 2, 1) + 1j
+            grid = RcsGrid([0, 10], [0], [9, 10], ["VV"], rcs=values)
+            path = grid.save(os.path.join(tmp, "region.grim"))
+            grim_cut_dataset_mixin.DatasetOpsMixin._handle_files_dropped(self.window, [path], load_options={
+                "storage": "disk", "selection": {"frequency": [10, 10]}})
+            self._wait_for_background()
+            loaded = self.window.table.item(0, 0).data(Qt.UserRole)
+            np.testing.assert_array_equal(loaded.rcs, values[:, :, 1:2])
+            self.assertTrue(self.window._dataset_row_is_dirty(0))
+            self.assertIn("selection={'frequency': [10, 10]}", self.window.python_recorder.script)
+            self.assertEqual(self.window.table.item(0, 1).text(), "Unsaved")
+
     def test_dataset_loader_always_finishes_after_pool_setup_failure(self) -> None:
         worker = grim_cut_dataset_mixin._DatasetLoadWorker(
             [(0, "first.grim"), (1, "second.grim")]
@@ -1930,7 +1979,7 @@ class UnifiedGuiShellTest(unittest.TestCase):
         np.testing.assert_array_equal(result.azimuths, [-180.0, -90.0, 0.0, 90.0])
         np.testing.assert_array_equal(result.rcs_power[:, 0, 0, 0], [3.0, 2.0, 1.0, 4.0])
         self.assertTrue(np.all(np.isnan(result.rcs_phase)))
-        self.assertIn("exact waterline azimuth relabel", result.history)
+        self.assertIn("exact waterline relabel: azimuth=-turntable", result.history)
         self.assertNotIn("inverse-mapped complex Jones", result.history)
         self.assertIn("created 1 dataset", self.window.status.currentMessage())
 

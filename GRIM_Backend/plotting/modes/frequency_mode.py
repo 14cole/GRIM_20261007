@@ -121,113 +121,89 @@ def render(self) -> None:
         )
         return
     self._configure_line_budget(sum(len(sel[2]) * (len(sel[1]) if individual else 1) for _, _, sel in plans))
-    try:
-        common.validate_synchronous_plot_workload(
-            operation="Frequency sweep",
-            peak_slice_cells=peak_slice_cells,
-            total_cells=total_cells,
-        )
-    except ValueError as exc:
-        self.status.showMessage(f"Plot blocked: {exc}.")
-        return
-    def series_for(plan):
-        series = _frequency_series(
-            self,
+    from ..requests import PlotPlan, PlotRequest, prepare_sweep
+    request = PlotRequest("frequency", reference,
+        tuple(PlotPlan(name, dataset, (sel[1], sel[2], sel[0], sel[3])) for name, dataset, sel in plans),
+        phase=self._button_checked(self.btn_phase), scale=self._plot_scale_mode(),
+        options=dict(config, pbp=pbp_active, pbp_percentiles=self._pbp_percentiles() if pbp_active else None),
+        selectors={"azimuth": az_values, "frequency": freq_values},
+        max_series=None if pbp_active else common.MAX_LINE_SERIES, preserve_zeros=pbp_active)
+
+    def publish(result):
+        if not self._prepare_line_plot_axes(
+            "frequency",
+            "rectilinear",
             reference,
-            plan[1],
-            plan[0],
-            freq_values,
-            az_values,
-            elev_values,
-            polarization,
-            selection=plan[2],
-        )
-        assert series is not None
-        return series
+            datasets,
+        ):
+            return
 
-    if not self._prepare_line_plot_axes(
-        "frequency",
-        "rectilinear",
-        reference,
-        datasets,
-    ):
-        return
+        self.plot_figure.set_layout_engine("constrained")
+        self.plot_figure._grim_analysis_constrained_layout = True
 
-    self.plot_figure.set_layout_engine("constrained")
-    self.plot_figure._grim_analysis_constrained_layout = True
-
-    rendered = 0
-    omitted = 0
-    bands = self._new_pbp_bands(datasets) if pbp_active else None
-    for plan in plans:
-        name, dataset, selection = plan
-        line_breaks = common.selection_breaks(reference, dataset, "frequency", selection[0], freq_values) if bands is None else ()
-        candidates = len(selection[2]) * (len(selection[1]) if individual else 1)
-        if bands is None and rendered >= common.MAX_LINE_SERIES:
-            omitted += candidates
-            continue
-        series = series_for(plan)
-        for candidate_index, (x_values, display, label, trace_key) in enumerate(series):
-            if not np.any(np.isfinite(display) | ((bands is not None) & np.isneginf(display))):
-                continue
+        rendered, omitted = result.series_count if pbp_active else len(result.items), result.omitted
+        bands = self._new_pbp_bands(datasets) if pbp_active else None
+        if bands is not None:
+            for plan, envelope in result.envelopes:
+                bands.accept_prepared(plan, envelope)
+            # Preserve the same engineering notes as synchronous PBP.
+            notice = self._new_pbp_envelope()
+            notice.close()
+        for plan, (x_values, display, label, trace_key) in result.items:
+            dataset, selection = plan.dataset, plan.selection
             if bands is not None:
-                bands.update(dataset, display, polarization=(
-                    dataset.polarizations[selection[3][0]]
-                ))
-                rendered += 1
-            elif rendered < common.MAX_LINE_SERIES:
+                bands.update(dataset, display, polarization=dataset.polarizations[selection[3][0]])
+            else:
+                line_breaks = common.selection_breaks(reference, dataset, "frequency", selection[2], freq_values)
                 self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
-                                        dataset=dataset, trace_key=trace_key,
-                                        break_before=line_breaks)
-                rendered += 1
-                if rendered >= common.MAX_LINE_SERIES:
-                    omitted += candidates - candidate_index - 1
-                    break
+                    dataset=dataset, trace_key=trace_key, break_before=line_breaks)
 
-    if bands is not None:
-        elev_name = self._plot_axis_name(reference, "elevation")
-        elev_unit = self._plot_axis_unit(reference, "elevation")
-        az_name = self._plot_axis_name(reference, "azimuth")
-        az_unit = self._plot_axis_unit(reference, "azimuth")
-        elev_label = (
-            f"{elev_values[0]:g}-{elev_values[-1]:g} {elev_unit}"
-            if elev_values.size > 1
-            else f"{elev_values[0]:g} {elev_unit}"
-        )
-        pol_label = f"Pol {polarization[0]}, " if len(polarization) == 1 else ""
-        bands.draw(
-            freq_values,
-            f"{pol_label}{elev_name} {elev_label}, "
-            f"{sweep_analysis.statistic_name(config, phase=self._button_checked(self.btn_phase))} over {az_name} ({az_values[0]:g},{az_values[-1]:g}) {az_unit}",
-            polar=False,
-            break_before=common.selection_breaks(reference, reference, "frequency",
-                self._axis_selection_for_dataset(reference, reference, "frequency", freq_values), freq_values),
-        )
+        if bands is not None:
+            elev_name = self._plot_axis_name(reference, "elevation")
+            elev_unit = self._plot_axis_unit(reference, "elevation")
+            az_name = self._plot_axis_name(reference, "azimuth")
+            az_unit = self._plot_axis_unit(reference, "azimuth")
+            elev_label = (
+                f"{elev_values[0]:g}-{elev_values[-1]:g} {elev_unit}"
+                if elev_values.size > 1
+                else f"{elev_values[0]:g} {elev_unit}"
+            )
+            pol_label = f"Pol {polarization[0]}, " if len(polarization) == 1 else ""
+            bands.draw(
+                freq_values,
+                f"{pol_label}{elev_name} {elev_label}, "
+                f"{sweep_analysis.statistic_name(config, phase=self._button_checked(self.btn_phase))} over {az_name} ({az_values[0]:g},{az_values[-1]:g}) {az_unit}",
+                polar=False,
+                break_before=common.selection_breaks(reference, reference, "frequency",
+                    self._axis_selection_for_dataset(reference, reference, "frequency", freq_values), freq_values),
+            )
 
-    if rendered == 0:
-        detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
-        self._show_plot_status(
-            "No compatible data for the selected frequency, azimuth, "
-            f"elevation, and polarization values.{detail}"
-        )
-        return
-    if omitted:
-        self._note_plot_render(
-            f"Displayed {rendered} series; {omitted} further candidate series were not evaluated. "
-            "Narrow azimuth/elevation selections to show the rest."
-        )
+        if rendered == 0:
+            detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
+            self._show_plot_status(
+                "No compatible data for the selected frequency, azimuth, "
+                f"elevation, and polarization values.{detail}"
+            )
+            return
+        if omitted:
+            self._note_plot_render(
+                f"Displayed {rendered} series; {omitted} further candidate series were not evaluated. "
+                "Narrow azimuth/elevation selections to show the rest."
+            )
 
-    self.plot_ax.set_xlabel(self._plot_axis_label(reference, "frequency"))
-    self.plot_ax.set_ylabel(self._display_axis_label(datasets, tag=sweep_analysis.axis_tag(config, phase=self._button_checked(self.btn_phase))))
-    self._update_legend_visibility()
-    self.spin_plot_xmin.blockSignals(True)
-    self.spin_plot_xmax.blockSignals(True)
-    common.set_spin_value(self.spin_plot_xmin, float(freq_values[0]))
-    common.set_spin_value(self.spin_plot_xmax, float(freq_values[-1]))
-    self.spin_plot_xmin.blockSignals(False)
-    self.spin_plot_xmax.blockSignals(False)
-    self._apply_plot_limits()
-    status = "Frequency plot updated."
-    if skipped:
-        status = f"{status[:-1]} Skipped: {', '.join(skipped)}."
-    self._show_plot_status(status)
+        self.plot_ax.set_xlabel(self._plot_axis_label(reference, "frequency"))
+        self.plot_ax.set_ylabel(self._display_axis_label(datasets, tag=sweep_analysis.axis_tag(config, phase=self._button_checked(self.btn_phase))))
+        self._update_legend_visibility()
+        self.spin_plot_xmin.blockSignals(True)
+        self.spin_plot_xmax.blockSignals(True)
+        common.set_spin_value(self.spin_plot_xmin, float(freq_values[0]))
+        common.set_spin_value(self.spin_plot_xmax, float(freq_values[-1]))
+        self.spin_plot_xmin.blockSignals(False)
+        self.spin_plot_xmax.blockSignals(False)
+        self._apply_plot_limits()
+        status = "Frequency plot updated."
+        if skipped:
+            status = f"{status[:-1]} Skipped: {', '.join(skipped)}."
+        self._show_plot_status(status)
+
+    return self._submit_plot_preparation(request, lambda cancel: prepare_sweep(request, cancel), publish, cells=total_cells)

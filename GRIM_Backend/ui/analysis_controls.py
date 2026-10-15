@@ -435,6 +435,11 @@ class PlotSliderBar(QFrame):
     def stop_play(self) -> None:
         self.btn_play.setChecked(False)
 
+    def stop_interaction(self) -> None:
+        """End playback and any delayed scrub when its canvas is hidden."""
+        self.stop_play()
+        self._debounce.stop()
+
     def _value_changed(self, value: int) -> None:
         self._show_label(value)
         self._debounce.start()

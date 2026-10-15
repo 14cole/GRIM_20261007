@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from .session import PlotSession
 from typing import Any
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -88,3 +89,4 @@ class PlotContext:
     plot_slider: Any = None
     spatial_overlays: Any = None
     inline_analysis: Any = None
+    session: PlotSession = field(default_factory=PlotSession)

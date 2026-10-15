@@ -9,6 +9,11 @@ import tempfile
 
 import numpy as np
 
+from GRIM_Backend.datasets.memory import _bounded_grid_selections
+from GRIM_Backend.io.samples import construct_parsed_grid, parsed_sample_memory
+
+_CSV_BLOCK_CELLS = 65_536
+
 
 FLAT_CSV_SCHEMA = "grim.flat-rcs.v1"
 
@@ -222,6 +227,10 @@ def _available_memory_bytes():
 
 
 def _allocation_budget_bytes():
+    from GRIM_Backend.datasets.load_policy import current_import_memory_budget
+    captured = current_import_memory_budget()
+    if captured is not None:
+        return captured, 'the selected load memory budget'
     declared = str(os.environ.get("GRIM_MAX_CSV_GRID_GB", "") or "").strip()
     if declared:
         try:
@@ -237,24 +246,18 @@ def _allocation_budget_bytes():
     return 2 * 1024 ** 3, "2 GiB fallback because available RAM is unknown"
 
 
-def _preflight_dense_grid(axis_lengths, record_count):
+class CsvMemoryLimitError(MemoryError, ValueError):
+    """Keep legacy ValueError compatibility while identifying budget failures."""
+
+
+def _preflight_dense_grid(axis_lengths, record_count, *, check_budget=True):
     cells = 1
     for length in axis_lengths:
         cells *= int(length)
-    float_bytes = np.dtype(np.float64).itemsize
-    line_bytes = np.dtype(np.int64).itemsize
-    bool_bytes = np.dtype(np.bool_).itemsize
-
-
-    dense_payload = cells * 2 * float_bytes
-    parser_peak = dense_payload + cells * line_bytes
-    constructor_peak = dense_payload + cells * (
-        float_bytes + bool_bytes + float_bytes + float_bytes
-    )
-    estimated_peak = max(parser_peak, constructor_peak)
-    budget, source = _allocation_budget_bytes()
-    if estimated_peak > budget:
-        raise ValueError(
+    dense_payload, estimated_peak = parsed_sample_memory(axis_lengths)
+    budget, source = _allocation_budget_bytes() if check_budget else (None, None)
+    if check_budget and estimated_peak > budget:
+        raise CsvMemoryLimitError(
             "flat CSV axes form a dense grid of {:,} cells ({} x {} x {} x {}), "
             "requiring about {:.2f} GiB peak for power/phase arrays; {} allows "
             "{:.2f} GiB. The file contains only {:,} row(s), so verify that the "
@@ -421,70 +424,70 @@ def _write_flat_csv_direct(
     if include_phase:
         header.append("phase_deg")
 
-    power_array = np.asarray(grid.power)
-    phase_array = np.asarray(grid.phase)
+    power_array = grid.power
+    phase_array = grid.phase if include_phase else None
     expected_shape = (
         len(grid.azimuths), len(grid.elevations), len(grid.frequencies),
         len(grid.polarizations),
     )
-    if power_array.shape != expected_shape or phase_array.shape != expected_shape:
+    if power_array.shape != expected_shape or (phase_array is not None and phase_array.shape != expected_shape):
         raise ValueError("dataset power/phase arrays do not match its four axes")
 
     with open(path, "w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream, delimiter=delimiter)
         writer.writerow(header)
-        for azimuth_index, azimuth in enumerate(grid.azimuths):
-            for elevation_index, elevation in enumerate(grid.elevations):
-                for frequency_index, frequency in enumerate(grid.frequencies):
-                    frequency_hz = float(frequency) * _FREQUENCY_FACTORS[frequency_unit]
-                    if not np.isfinite(frequency_hz) or frequency_hz <= 0.0:
-                        raise ValueError("flat CSV frequencies must be positive and finite")
-                    for polarization_index, polarization in enumerate(grid.polarizations):
-                        index = (
-                            azimuth_index, elevation_index, frequency_index,
-                            polarization_index,
-                        )
-                        power = float(power_array[index])
-                        row = [
-                            FLAT_CSV_SCHEMA,
-                            _finite_csv_number(azimuth), azimuth_unit,
-                            _finite_csv_number(elevation), elevation_unit,
-                            _finite_csv_number(frequency), frequency_unit,
-                            str(polarization), quantity, log_unit,
-                            angular_coordinate_system, gc_convention,
-                            _finite_csv_number(angular_roll_deg),
-                            _finite_csv_number(angular_tilt_deg),
-                            polarization_basis, time_convention, phase_reference,
-                            phase_wrap,
-                        ]
-                        for column in magnitude_columns:
-                            if not np.isfinite(power):
-                                row.append("")
-                            elif column == "magnitude_power_linear":
-                                row.append(_finite_csv_number(power))
-                            elif power == 0.0:
-                                row.append("-inf")
-                            elif column == "magnitude_dbke":
-                                wavelength = 299792458.0 / frequency_hz
-                                row.append(_finite_csv_number(
-                                    10.0 * np.log10(power * 2.0 * math.pi / wavelength)
-                                ))
-                            else:
-                                row.append(_finite_csv_number(10.0 * np.log10(power)))
-                        if include_phase:
-                            phase_rad = float(phase_array[index])
-                            if phase_wrap == "0_360":
-                                phase_deg = np.mod(np.degrees(phase_rad), 360.0)
-                            else:
-                                phase_deg = (
-                                    np.mod(np.degrees(phase_rad) + 180.0, 360.0)
-                                    - 180.0
+        for selection in _bounded_grid_selections(expected_shape, _CSV_BLOCK_CELLS):
+            power_block = np.asarray(power_array[selection])
+            phase_block = np.asarray(phase_array[selection]) if include_phase else None
+            for ai, azimuth in enumerate(grid.azimuths[selection[0]]):
+                for ei, elevation in enumerate(grid.elevations[selection[1]]):
+                    for fi, frequency in enumerate(grid.frequencies[selection[2]]):
+                        frequency_hz = float(frequency) * _FREQUENCY_FACTORS[frequency_unit]
+                        if not np.isfinite(frequency_hz) or frequency_hz <= 0.0:
+                            raise ValueError("flat CSV frequencies must be positive and finite")
+                        for pi, polarization in enumerate(grid.polarizations[selection[3]]):
+                            local_index = (ai, ei, fi, pi)
+                            power = float(power_block[local_index])
+                            row = [
+                                FLAT_CSV_SCHEMA,
+                                _finite_csv_number(azimuth), azimuth_unit,
+                                _finite_csv_number(elevation), elevation_unit,
+                                _finite_csv_number(frequency), frequency_unit,
+                                str(polarization), quantity, log_unit,
+                                angular_coordinate_system, gc_convention,
+                                _finite_csv_number(angular_roll_deg),
+                                _finite_csv_number(angular_tilt_deg),
+                                polarization_basis, time_convention, phase_reference,
+                                phase_wrap,
+                            ]
+                            for column in magnitude_columns:
+                                if not np.isfinite(power):
+                                    row.append("")
+                                elif column == "magnitude_power_linear":
+                                    row.append(_finite_csv_number(power))
+                                elif power == 0.0:
+                                    row.append("-inf")
+                                elif column == "magnitude_dbke":
+                                    wavelength = 299792458.0 / frequency_hz
+                                    row.append(_finite_csv_number(
+                                        10.0 * np.log10(power * 2.0 * math.pi / wavelength)
+                                    ))
+                                else:
+                                    row.append(_finite_csv_number(10.0 * np.log10(power)))
+                            if include_phase:
+                                phase_rad = float(phase_block[local_index])
+                                if phase_wrap == "0_360":
+                                    phase_deg = np.mod(np.degrees(phase_rad), 360.0)
+                                else:
+                                    phase_deg = (
+                                        np.mod(np.degrees(phase_rad) + 180.0, 360.0)
+                                        - 180.0
+                                    )
+                                row.append(
+                                    _finite_csv_number(phase_deg)
+                                    if np.isfinite(phase_rad) else ""
                                 )
-                            row.append(
-                                _finite_csv_number(phase_deg)
-                                if np.isfinite(phase_rad) else ""
-                            )
-                        writer.writerow(row)
+                            writer.writerow(row)
     return path
 
 
@@ -492,8 +495,9 @@ def write_flat_csv(grid, path, scale="linear", delimiter=",", include_phase=Fals
     """Atomically publish a versioned flat-RCS table.
 
     Validation, formatting, or I/O failures leave an existing destination
-    untouched.  The streaming implementation still retains only one CSV row
-    beyond the dataset arrays.
+    untouched. The streaming implementation retains one bounded sample block
+    and one formatted row beyond the dataset arrays. Phase is derived only
+    when the export includes it.
     """
 
     requested_path = os.fspath(path)
@@ -607,7 +611,7 @@ def _power_candidates(record, mode, quantity, frequency_unit, c0):
     return reference
 
 
-def load_flat_csv(path, grid_class, canonical_angular_coordinate_system, c0=299792458.0):
+def load_flat_csv(path, grid_class, canonical_angular_coordinate_system, c0=299792458.0, *, _estimate_only=False):
     """Load supported flat RCS tables into *grid_class*.
 
     ``canonical_angular_coordinate_system`` is accepted for caller
@@ -842,13 +846,20 @@ def load_flat_csv(path, grid_class, canonical_angular_coordinate_system, c0=2997
         len(frequency_values),
         len(polarization_order),
     )
-    _preflight_dense_grid(axis_lengths, record_count)
+    cells, dense_bytes, peak_bytes = _preflight_dense_grid(
+        axis_lengths, record_count, check_budget=not _estimate_only)
+    if _estimate_only:
+        return {'shape': axis_lengths, 'retained_bytes': dense_bytes,
+                'estimated_peak_bytes': peak_bytes, 'source_format': 'flat CSV'}
 
     azimuth_axis = np.asarray(sorted(azimuth_values), dtype=float)
     elevation_axis = np.asarray(sorted(elevation_values), dtype=float)
     frequency_axis = np.asarray(sorted(frequency_values), dtype=float)
     polarization_axis = np.asarray(polarization_order)
     shape = tuple(axis_lengths)
+    # The sorted arrays now own the coordinate values. Release discovery sets
+    # before building index maps and allocating sample buffers.
+    del azimuth_values, elevation_values, frequency_values
     power = np.full(shape, np.nan, dtype=np.float64)
     phase = np.full(shape, np.nan, dtype=np.float64)
     axis_maps = (
@@ -986,7 +997,10 @@ def load_flat_csv(path, grid_class, canonical_angular_coordinate_system, c0=2997
     )
     if inferred_frequency:
         history += "\nWARNING: " + inference_rule
-    return grid_class(
+    constructor = (construct_parsed_grid if hasattr(grid_class, "_complex_from_power_phase")
+                   else lambda cls, *args, **kwargs: cls(*args, **kwargs))
+    return constructor(
+        grid_class,
         azimuth_axis,
         elevation_axis,
         frequency_axis,

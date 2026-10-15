@@ -462,7 +462,9 @@ class TestCstIo(unittest.TestCase):
             loaded.rcs_phase[0, 0, 0, :2], np.deg2rad([90.0, -45.0])
         )
         self.assertEqual(loaded.extra["dense_import_allocation_bytes"], 24)
-        self.assertEqual(loaded.extra["dense_import_peak_bytes"], 108)
+        estimate = RcsGrid.load_theta_phi_txt(qualified_path, _estimate_only=True)
+        self.assertEqual(loaded.extra["dense_import_peak_bytes"], estimate["estimated_peak_bytes"])
+        self.assertGreater(estimate["estimated_peak_bytes"], estimate["retained_bytes"])
 
         explicit_path = self._write(rows, suffix=".txt")
         explicit = RcsGrid.load_theta_phi_txt(
@@ -530,13 +532,14 @@ class TestCstIo(unittest.TestCase):
             suffix=".txt",
             prefix="f=1GHz_",
         )
+        estimate = RcsGrid.load_theta_phi_txt(path, _estimate_only=True)
         with self.assertRaisesRegex(
             MemoryError, "legacy theta/phi TXT import.*dense grid.*exceeding"
         ):
-            RcsGrid.load_theta_phi_txt(path, max_output_bytes=195)
-        loaded = RcsGrid.load_theta_phi_txt(path, max_output_bytes=196)
+            RcsGrid.load_theta_phi_txt(path, max_output_bytes=estimate["estimated_peak_bytes"] - 1)
+        loaded = RcsGrid.load_theta_phi_txt(path, max_output_bytes=estimate["estimated_peak_bytes"])
         self.assertEqual(loaded.extra["dense_import_allocation_bytes"], 96)
-        self.assertEqual(loaded.extra["dense_import_peak_bytes"], 196)
+        self.assertEqual(loaded.extra["dense_import_peak_bytes"], estimate["estimated_peak_bytes"])
 
 
 if __name__ == "__main__":

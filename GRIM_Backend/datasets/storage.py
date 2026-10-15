@@ -15,6 +15,9 @@ from numpy.lib.mixins import NDArrayOperatorsMixin
 
 from GRIM_Backend.datasets.constants import _RAW_COMPLEX_VALIDATION_BLOCK_CELLS
 from GRIM_Backend.datasets.memory import _bounded_grid_selections
+from GRIM_Backend.datasets.result_storage import (
+    allocate_result, array_storage, copy_result, result_blocks, select_result, result_storage_mode,
+)
 
 
 def _readonly(value):
@@ -182,6 +185,14 @@ class GridStorageMixin:
     def storage_domain(self):
         return self._storage_domain
 
+    @property
+    def sample_storage(self):
+        """Actual backing of authoritative samples, independent of provenance."""
+        values = (self._power, self._phase) if self._legacy_samples else (
+            (self._complex,) if self._complex is not None else (self._power, self._phase))
+        kinds = {array_storage(value) for value in values if value is not None}
+        return next(iter(kinds)) if len(kinds) == 1 else "mixed"
+
     def phase_coverage(self):
         """Report the stored phase as ``"complete"``, ``"partial"`` or ``"none"``.
 
@@ -243,7 +254,7 @@ class GridStorageMixin:
             self.extra.pop(key, None)
 
     def _install_complex(self, field, *, domain="physical", copy=True):
-        self._complex = np.array(field, copy=copy)
+        self._complex = copy_result(field) if copy else np.asarray(field)
         _readonly(self._complex)
         self._power = self._phase = None
         self._legacy_samples = False
@@ -270,8 +281,10 @@ class GridStorageMixin:
                 expected_shape=power.shape, frequencies=self.frequencies,
                 rcs_power=power, rcs_phase=phase, units=self.units, extra=self.extra,
             )
-            exceptional_zero = (power == 0) & (~np.isfinite(phase) | (phase != 0))
-            if report["issues"] or np.any(exceptional_zero):
+            exceptional_zero = any(np.any((power[block] == 0) &
+                (~np.isfinite(phase[block]) | (phase[block] != 0)))
+                for block in result_blocks(power.shape))
+            if report["issues"] or exceptional_zero:
                 # Preserve contradictory inputs for audit/save validation;
                 # canonicalization must not silently repair their evidence.
                 self._power, self._phase = _readonly(power), _readonly(phase)
@@ -281,12 +294,13 @@ class GridStorageMixin:
             normalized_probe = self._authoritative_raw_amplitude_from_pair(pair, (0, 0, 0, 0))
             if normalized_probe is not None:
                 dtype = np.result_type(pair[0].dtype, pair[1].dtype, np.complex64)
-                raw = np.empty(power.shape, dtype=dtype)
-                raw.real, raw.imag = pair
+                raw = allocate_result(power.shape, dtype)
+                for block in result_blocks(power.shape):
+                    raw[block].real, raw[block].imag = pair[0][block], pair[1][block]
                 self._install_complex(raw, domain="raw_field", copy=False)
                 return
-        finite_power = np.isfinite(power)
-        if not np.any(np.isfinite(phase) & finite_power):
+        if not any(np.any(np.isfinite(phase[block]) & np.isfinite(power[block]))
+                   for block in result_blocks(power.shape)):
             self._power = _readonly(power)
             self._phase = None
             self._storage_kind = "power"
@@ -294,11 +308,13 @@ class GridStorageMixin:
         recoverable = self._recoverable_phase(power, phase)
         if recoverable:
             if prefer_complex and complex_input is not None:
-                field = np.array(complex_input, copy=True)
-                invalid = ~finite_power | ~np.isfinite(field.real) | ~np.isfinite(field.imag)
-                field[invalid] = np.nan + 1j * np.nan
+                field = copy_result(complex_input)
+                for block in result_blocks(power.shape):
+                    part = field[block]
+                    invalid = ~np.isfinite(power[block]) | ~np.isfinite(part.real) | ~np.isfinite(part.imag)
+                    part[invalid] = np.nan + 1j * np.nan
             else:
-                field = self._complex_from_power_phase(power, phase)
+                field = self._complex_from_power_phase(power, phase, _result=True)
             self._install_complex(field, copy=False)
             return
         self._power = _readonly(power)
@@ -308,26 +324,29 @@ class GridStorageMixin:
     def _recoverable_phase(self, power, phase):
         # Zero amplitude cannot encode either unknown phase or a supplied
         # nonzero phase. Unwrapped turn counts also require polar storage.
-        if np.any(np.isfinite(power) & ~np.isfinite(phase)):
-            return False
-        if np.any((power == 0) & (phase != 0)):
-            return False
         wrap = str(self.units.get("phase_wrap", "")).strip()
-        if wrap == "0_360":
-            return bool(np.all(~np.isfinite(phase) | ((phase >= 0) & (phase < 2 * np.pi))))
-        return bool(np.all(~np.isfinite(phase) | ((phase >= -np.pi) & (phase <= np.pi))))
+        for block in result_blocks(power.shape):
+            p, ph = power[block], phase[block]
+            if np.any(np.isfinite(p) & ~np.isfinite(ph)) or np.any((p == 0) & (ph != 0)):
+                return False
+            valid = ((ph >= 0) & (ph < 2 * np.pi)) if wrap == "0_360" else ((ph >= -np.pi) & (ph <= np.pi))
+            if not np.all(~np.isfinite(ph) | valid):
+                return False
+        return True
 
     def _wrapped_phase_values(self, phase):
-        phase = np.array(phase, copy=True)
-        finite = np.isfinite(phase)
+        phase = copy_result(phase)
         wrap = str(self.units.get("phase_wrap", "")).strip()
-        if wrap == "0_360":
-            outside = finite & ((phase < 0) | (phase >= 2 * np.pi))
-            phase[outside] = np.remainder(phase[outside], 2 * np.pi)
-            phase[phase >= 2 * np.pi] = 0
-        elif wrap == "-180_180":
-            outside = finite & ((phase < -np.pi) | (phase >= np.pi))
-            phase[outside] = np.remainder(phase[outside] + np.pi, 2 * np.pi) - np.pi
+        for block in result_blocks(phase.shape):
+            part = phase[block]
+            finite = np.isfinite(part)
+            if wrap == "0_360":
+                outside = finite & ((part < 0) | (part >= 2 * np.pi))
+                part[outside] = np.remainder(part[outside], 2 * np.pi)
+                part[part >= 2 * np.pi] = 0
+            elif wrap == "-180_180":
+                outside = finite & ((part < -np.pi) | (part >= np.pi))
+                part[outside] = np.remainder(part[outside] + np.pi, 2 * np.pi) - np.pi
         return phase
 
     @staticmethod
@@ -399,8 +418,8 @@ class GridStorageMixin:
             return
         # No derived cache survives mutable-array exposure. NumPy can then
         # freely produce writable views without an invalidation protocol.
-        power = np.array(self.power, copy=True)
-        phase = np.array(self.phase, copy=True)
+        power = copy_result(self.power)
+        phase = copy_result(self.phase)
         # A shallow copy previously shared its actual power/phase arrays.
         # Materializing those arrays must preserve that sharing relationship;
         # otherwise editing an engineer's source object leaves its GUI row
@@ -438,7 +457,13 @@ class GridStorageMixin:
         return digest.digest()
 
     def _ensure_legacy_source_current(self):
-        if self._legacy_samples and self._complex is not None:
+        # Bounded native loading can retain exact raw metadata beside a
+        # power/phase store instead of allocating a canonical complex copy.
+        # Those raw arrays are authority too and must be invalidated when
+        # mutable legacy components change, even without a complex store.
+        has_source = self._complex is not None or any(
+            key in self.extra for key in ("rcs_amp_real", "rcs_amp_imag"))
+        if self._legacy_samples and self._legacy_fingerprint is not None and has_source:
             if self._sample_fingerprint() != self._legacy_fingerprint:
                 self._complex = None
                 self._storage_domain = "physical"
@@ -480,19 +505,34 @@ class GridStorageMixin:
         selection = Ellipsis if selection is None else selection
 
         def changed(values):
-            result = np.asarray(values if transform is None else transform(values))
-            if result.flags.owndata and result.flags.writeable:
+            if transform is None:
+                return select_result(values, selection)
+            # A transform receives a read-only basic view where possible;
+            # allocator-aware take transforms return their final destination.
+            result = transform(values[selection])
+            if (array_storage(result) == "disk" and result.flags.writeable
+                    and not (isinstance(values, np.ndarray) and np.shares_memory(result, values))):
                 return result
-            return np.array(result, copy=True)
+            if result_storage_mode() == "memory" and result.flags.owndata and result.flags.writeable:
+                return result
+            return copy_result(result)
 
         if self._complex is not None:
             if self._storage_domain == "raw_field":
-                return {"rcs": changed(self._complex[selection]),
+                return {"rcs": changed(self._complex),
                         "rcs_storage_domain": "raw_field"}
-            return {"rcs": changed(self.rcs_slice(selection))}
-        result = {"rcs_power": changed(self._power[selection])}
+            if any(key in self.extra for key in ("rcs_amp_real", "rcs_amp_imag")):
+                reader, reader_dtype = self._bounded_complex_slice_reader()
+                class PhysicalSamples:
+                    shape = self.shape
+                    dtype = np.dtype(np.complex128 if reader_dtype == np.float64 else np.complex64)
+                    def __getitem__(self, key):
+                        return reader(key)
+                return {"rcs": changed(PhysicalSamples())}
+            return {"rcs": changed(self._complex)}
+        result = {"rcs_power": changed(self._power)}
         if self._phase is not None:
-            result["rcs_phase"] = changed(self._phase[selection])
+            result["rcs_phase"] = changed(self._phase)
         return result
 
     def native_sample_payload(self):
@@ -521,7 +561,7 @@ class GridStorageMixin:
         self._ensure_legacy_source_current()
         dtype = np.result_type(self.real_dtype, *(np.asarray(value).dtype for value in (power, phase) if value is not None))
         if self._complex is not None:
-            field = self.rcs
+            field = self._physical_result()
             complex_dtype = np.complex128 if np.dtype(dtype).itemsize > 4 else np.complex64
             selected = np.asarray(field[selection], dtype=complex_dtype)
             # Derive in the promoted precision as well as storing in it;
@@ -536,7 +576,8 @@ class GridStorageMixin:
             selected_phase = self._wrapped_phase_values(self._clean_phase(selected_phase))
             selected_phase[~np.isfinite(selected_power)] = np.nan
             if self._recoverable_phase(selected_power, selected_phase):
-                field = field.astype(complex_dtype, copy=False)
+                if field.dtype != complex_dtype:
+                    field = copy_result(field, dtype=complex_dtype)
                 replacement = self._complex_from_power_phase(selected_power, selected_phase)
                 if phase is None:
                     # A magnitude edit preserves the original complex
@@ -550,15 +591,16 @@ class GridStorageMixin:
                 self._clear_raw_storage_metadata()
                 self._install_complex(field, copy=False)
                 return
-        new_power = np.array(self.power, dtype=dtype, copy=True)
-        new_phase = np.array(self.phase, dtype=dtype, copy=True)
+        new_power = copy_result(self.power, dtype=dtype)
+        new_phase = copy_result(self.phase, dtype=dtype)
         if power is not None:
             new_power[selection] = power
         if phase is not None:
             new_phase[selection] = phase
         new_power = self._clean_power(new_power)
         new_phase = self._wrapped_phase_values(self._clean_phase(new_phase))
-        new_phase[~np.isfinite(new_power)] = np.nan
+        for block in result_blocks(new_power.shape):
+            new_phase[block][~np.isfinite(new_power[block])] = np.nan
         self._power, self._phase = new_power, new_phase
         self._complex = None
         self._legacy_samples = False
@@ -566,24 +608,35 @@ class GridStorageMixin:
         self._clear_raw_storage_metadata()
         self._canonicalize_samples()
 
+    def _physical_result(self, dtype=None):
+        reader, real_dtype = self._bounded_complex_slice_reader()
+        dtype = dtype or (np.complex128 if real_dtype == np.float64 else np.complex64)
+        result = allocate_result(self.shape, dtype)
+        for block in result_blocks(self.shape):
+            result[block] = reader(block)
+        return result
+
     def set_complex(self, selection, values):
         """Replace selected samples with known complex fields."""
         values = np.asarray(values)
-        field = self.rcs
-        field = field.astype(np.result_type(field.dtype, values.dtype), copy=False)
+        field_dtype = np.complex128 if self.real_dtype == np.float64 else np.complex64
+        field = self._physical_result(np.result_type(field_dtype, values.dtype))
         field[selection] = values
-        invalid = ~np.isfinite(field.real) | ~np.isfinite(field.imag)
-        field[invalid] = np.nan + 1j * np.nan
+        for block in result_blocks(field.shape):
+            part = field[block]
+            invalid = ~np.isfinite(part.real) | ~np.isfinite(part.imag)
+            part[invalid] = np.nan + 1j * np.nan
         if self._complex is not None:
             self._clear_raw_storage_metadata()
             self._install_complex(field, copy=False)
             return
-        new_power = np.array(self.power, dtype=field.real.dtype, copy=True)
-        new_phase = np.array(self.phase, dtype=field.real.dtype, copy=True)
+        new_power = copy_result(self.power, dtype=field.real.dtype)
+        new_phase = copy_result(self.phase, dtype=field.real.dtype)
         new_power[selection] = np.abs(values) ** 2
         new_phase[selection] = np.angle(values)
         self._power, self._phase = self._clean_power(new_power), self._clean_phase(new_phase)
-        self._phase[~np.isfinite(self._power)] = np.nan
+        for block in result_blocks(self.shape):
+            self._phase[block][~np.isfinite(self._power[block])] = np.nan
         self._complex = None
         self._legacy_samples = False
         self._storage_domain = "physical"

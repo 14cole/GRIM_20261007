@@ -275,7 +275,7 @@ def active_environment(backend: Path) -> Path:
                          "or Setup_GRIM_Offline.bat if wheels are already available.") from exc
 
 
-def setup(backend: Path, *, wheelhouse: Path | None = None) -> Path:
+def setup(backend: Path, *, wheelhouse: Path | None = None, acceptance_check=None) -> Path:
     """Install from local wheels; online setup can supply its fresh download set."""
     backend = backend.resolve()
     base = validate_base(backend)
@@ -294,6 +294,8 @@ def setup(backend: Path, *, wheelhouse: Path | None = None) -> Path:
             print("Installing compatible packages from local wheels...", flush=True)
             install_requirements(target, wheelhouse, requirements, pip_wheel, env)
             verify_environment(target, base, requested, env)
+            if acceptance_check is not None:
+                acceptance_check(target, base)
             publish_environment(backend, target, requirements, base)
         except BaseException:
             # Only this run's unique unpublished directory can be removed.

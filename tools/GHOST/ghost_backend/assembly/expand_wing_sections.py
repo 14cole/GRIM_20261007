@@ -462,8 +462,8 @@ def _load_base(path):
     from ghost_backend.assembly.fields import RADAR_COMPONENT_FIELD_DOMAIN
 
     with np.load(path, allow_pickle=False) as stored:
-        payload = {key: np.array(stored[key], copy=True) for key in stored.files}
-    from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples
+        payload = {key: stored[key] for key in stored.files}
+    from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples, raw_amplitude
     payload = decode_native_samples(payload, label=str(path))
     for key in ("azimuths", "elevations", "frequencies", "polarizations"):
         if key not in payload:
@@ -478,8 +478,7 @@ def _load_base(path):
             "3-D body), not an aspect-only or 2-D table."
         )
     if "rcs_amp_real" in payload and "rcs_amp_imag" in payload:
-        amp = (np.asarray(payload["rcs_amp_real"], dtype=float)
-               + 1j * np.asarray(payload["rcs_amp_imag"], dtype=float))
+        amp = raw_amplitude(payload)
     elif "rcs_power" in payload and "rcs_phase" in payload:
         amp = (np.sqrt(np.asarray(payload["rcs_power"], dtype=float)
                        / (4.0 * math.pi))

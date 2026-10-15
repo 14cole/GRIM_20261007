@@ -236,8 +236,10 @@ def test_decoder_expands_raw_field_without_a_second_complex_array(quantity):
     # a second full-grid complex128 copy alone would reach field.nbytes.
     assert peak < field.nbytes, (peak, field.nbytes)
     assert decoded["rcs_power"].dtype == decoded["rcs_phase"].dtype == np.float32
-    assert np.shares_memory(decoded["rcs_amp_real"], field)
-    assert np.shares_memory(decoded["rcs_amp_imag"], field)
+    # Compatibility components are lazy views; explicit ndarray conversion
+    # intentionally detaches a writable legacy component.
+    assert decoded["rcs_amp_real"].field is field
+    assert decoded["rcs_amp_imag"].field is field
     assert_within_version_one_tolerances(decoded, legacy)
     assert decoded["rcs_phase"][0, 0, 0, 0] == 0. and decoded["rcs_phase"][-1, -1, -1, -1] == 0.
     assert not VERSION_TWO_KEYS & set(decoded)

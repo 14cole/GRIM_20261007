@@ -1,9 +1,9 @@
 """Storage-layer efficiency contracts for canonical complex samples.
 
-These pin the allocation and validation behaviour that the complex-storage
+These pin the allocation and validation behavior that the complex-storage
 migration enables: power reads that never copy the field, single-copy
 advanced-index reads, exact rearrangements that adopt their fresh samples,
-raw solver subsets that stay raw, raw-pair checks that cost O(1) per read,
+raw solver subsets that stay raw, O(1) canonical raw-pair access,
 phase-availability answers that read no sample of canonical storage, native
 loads that adopt the decoded field, and phase reads with a single scratch mask.
 """
@@ -242,7 +242,7 @@ def test_frequency_relabel_rescales_raw_samples_and_keeps_the_physical_response(
     np.testing.assert_allclose(edited.rcs, before[:, :, order, :], rtol=8e-15, atol=0)
 
     # A relabel to a nonpositive frequency keeps the physical response and
-    # drops the raw encoding, which that frequency cannot normalise.
+    # drops the raw encoding, which that frequency cannot normalize.
     small = RcsGrid(np.arange(8.0), [0.0], np.array([0.04]), ["VV"], rcs=raw[:, :, :1, :],
                     rcs_storage_domain="raw_field", units=_sigma_units("sigma_2d"))
     result = small.round_frequencies(1)
@@ -304,7 +304,7 @@ def test_unusable_raw_pair_does_not_rescan_the_grid_on_every_read(monkeypatch):
     np.testing.assert_allclose(ds.power[2, 0, 1, 0], np.abs(field[2, 0, 1, 0]) ** 2, rtol=1e-12)
 
 
-def test_coverage_scan_for_an_authoritative_pair_is_memoised_until_arrays_change(monkeypatch):
+def test_external_authoritative_pair_is_rechecked_after_in_place_edits(monkeypatch):
     shape = (32, 1, 2, 1)
     raw = _field(shape)
     # Power deliberately disagrees with the pair, so GRIM keeps power/phase for
@@ -325,13 +325,13 @@ def test_coverage_scan_for_an_authoritative_pair_is_memoised_until_arrays_change
     first = ds.rcs_slice((3, 0, 0, 0))
     ds.rcs_slice((4, 0, 1, 0))
     ds._bounded_complex_slice_reader()
-    assert scans == []  # the construction-time verdict is reused
+    assert len(scans) >= 3  # mutable external arrays cannot use identity caching
     np.testing.assert_allclose(first, raw[3, 0, 0, 0] * np.sqrt(4 * np.pi), rtol=1e-15)
 
-    ds.extra["rcs_amp_real"] = ds.extra["rcs_amp_real"].copy()  # a replaced array is re-validated once
-    ds.rcs_slice((3, 0, 0, 0))
-    ds.rcs_slice((5, 0, 0, 0))
-    assert scans == [1]
+    ds.extra["rcs_amp_real"][3, 0, 0, 0] = np.nan
+    ds.extra["rcs_amp_imag"][3, 0, 0, 0] = np.nan
+    # Invalid raw coverage must fall back to the still-valid modeled sample.
+    np.testing.assert_allclose(ds.rcs_slice((3, 0, 0, 0)), first * np.sqrt(2), rtol=1e-15)
 
 
 def test_coherent_subtract_adopts_its_sanitized_output():
@@ -724,11 +724,11 @@ def test_overlap_reads_each_input_once(monkeypatch):
 
         monkeypatch.setattr(RcsGrid, name, counting)
     results = RcsGrid.overlap_many(*grids)
-    # One owned read per complex input (the physical one goes through
-    # rcs_slice inside _sample_kwargs) and one paired read for the polar
-    # input, which copies its two stored arrays once each.
+    # One bounded owned read per complex input directly from its canonical
+    # store, and one paired read for the polar input, which copies its two
+    # stored arrays once each. No extra physical-field materialization.
     assert reads.count("_sample_kwargs") == 2 and reads.count("power_phase_slice") == 1
-    assert reads.count("rcs_slice") == 1
+    assert reads.count("rcs_slice") == 0
     assert reads.count("power_slice") == 1 and reads.count("phase_slice") == 1
     assert results[1].storage_domain == "raw_field"
     missing = np.isnan(np.asarray(results[2].power))

@@ -81,75 +81,55 @@ def render(self) -> None:
         )
         return
     self._configure_line_budget(sum(len(plan[2]) * (len(plan[3]) if individual else 1) for plan in plans))
-    try:
-        common.validate_synchronous_plot_workload(
-            operation="Elevation sweep",
-            peak_slice_cells=peak_slice_cells,
-            total_cells=total_cells,
-        )
-    except ValueError as exc:
-        self.status.showMessage(f"Plot blocked: {exc}.")
-        return
-    az_bounds = (float(az_values[0]), float(az_values[-1]))
+    from ..requests import PlotPlan, PlotRequest, prepare_sweep
+    request = PlotRequest("elevation_sweep", reference,
+        tuple(PlotPlan(name, dataset, (az, el, fr, pol)) for name, dataset, fr, az, el, pol in plans),
+        phase=self._button_checked(self.btn_phase), scale=self._plot_scale_mode(),
+        options=config, selectors={"azimuth": az_values, "frequency": freq_values},
+        max_series=common.MAX_LINE_SERIES)
 
-    def series_for(plan):
-        return _series(self, reference, plan, p50_mode=p50_mode, az_bounds=az_bounds)
+    def publish(result):
+        if not self._prepare_line_plot_axes(
+            "elevation_sweep", "rectilinear", reference, datasets
+        ):
+            return
 
-    if not self._prepare_line_plot_axes(
-        "elevation_sweep", "rectilinear", reference, datasets
-    ):
-        return
+        self.plot_figure.set_layout_engine("constrained")
+        self.plot_figure._grim_analysis_constrained_layout = True
 
-    self.plot_figure.set_layout_engine("constrained")
-    self.plot_figure._grim_analysis_constrained_layout = True
+        rendered, omitted = len(result.items), result.omitted
+        for plan, (x_values, display, label, trace_key) in result.items:
+            line_breaks = common.selection_breaks(reference, plan.dataset, "elevation", plan.selection[1], elev_values)
+            self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
+                dataset=plan.dataset, trace_key=trace_key, break_before=line_breaks)
 
-    rendered = 0
-    omitted = 0
-    for plan in plans:
-        name, dataset, freq_indices = plan[0], plan[1], plan[2]
-        line_breaks = common.selection_breaks(reference, dataset, "elevation", plan[4], elev_values)
-        candidates = len(freq_indices) * (len(plan[3]) if individual else 1)
-        if rendered >= common.MAX_LINE_SERIES:
-            omitted += candidates
-            continue
-        series = series_for(plan)
-        for candidate_index, (x_values, display, label, trace_key) in enumerate(series):
-            if not np.any(np.isfinite(display)):
-                continue
-            if rendered < common.MAX_LINE_SERIES:
-                self._plot_bounded_line(self.plot_ax, x_values, display, label=label,
-                                        dataset=dataset, trace_key=trace_key,
-                                        break_before=line_breaks)
-                rendered += 1
-                if rendered >= common.MAX_LINE_SERIES:
-                    omitted += candidates - candidate_index - 1
-                    break
+        if rendered == 0:
+            detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
+            self._show_plot_status(
+                "No compatible data for the selected elevation, azimuth, "
+                f"frequency, and polarization values.{detail}"
+            )
+            return
+        if omitted:
+            self._note_plot_render(
+                f"Displayed {rendered} series; {omitted} further candidate series were not evaluated. "
+                "Narrow frequency selections to show the rest."
+            )
 
-    if rendered == 0:
-        detail = f" Skipped: {', '.join(skipped)}." if skipped else ""
-        self._show_plot_status(
-            "No compatible data for the selected elevation, azimuth, "
-            f"frequency, and polarization values.{detail}"
-        )
-        return
-    if omitted:
-        self._note_plot_render(
-            f"Displayed {rendered} series; {omitted} further candidate series were not evaluated. "
-            "Narrow frequency selections to show the rest."
-        )
+        self.plot_ax.set_xlabel(self._plot_axis_label(reference, "elevation"))
+        tag = sweep_analysis.axis_tag(config, phase=self._button_checked(self.btn_phase)) if p50_mode or config["mode"] != "median" else ""
+        self.plot_ax.set_ylabel(self._display_axis_label(datasets, tag=tag))
+        self._update_legend_visibility()
+        self.spin_plot_xmin.blockSignals(True)
+        self.spin_plot_xmax.blockSignals(True)
+        common.set_spin_value(self.spin_plot_xmin, float(elev_values[0]))
+        common.set_spin_value(self.spin_plot_xmax, float(elev_values[-1]))
+        self.spin_plot_xmin.blockSignals(False)
+        self.spin_plot_xmax.blockSignals(False)
+        self._apply_plot_limits()
+        status = "Elevation sweep plot updated."
+        if skipped:
+            status = f"{status[:-1]} Skipped: {', '.join(skipped)}."
+        self._show_plot_status(status)
 
-    self.plot_ax.set_xlabel(self._plot_axis_label(reference, "elevation"))
-    tag = sweep_analysis.axis_tag(config, phase=self._button_checked(self.btn_phase)) if p50_mode or config["mode"] != "median" else ""
-    self.plot_ax.set_ylabel(self._display_axis_label(datasets, tag=tag))
-    self._update_legend_visibility()
-    self.spin_plot_xmin.blockSignals(True)
-    self.spin_plot_xmax.blockSignals(True)
-    common.set_spin_value(self.spin_plot_xmin, float(elev_values[0]))
-    common.set_spin_value(self.spin_plot_xmax, float(elev_values[-1]))
-    self.spin_plot_xmin.blockSignals(False)
-    self.spin_plot_xmax.blockSignals(False)
-    self._apply_plot_limits()
-    status = "Elevation sweep plot updated."
-    if skipped:
-        status = f"{status[:-1]} Skipped: {', '.join(skipped)}."
-    self._show_plot_status(status)
+    return self._submit_plot_preparation(request, lambda cancel: prepare_sweep(request, cancel), publish, cells=total_cells)

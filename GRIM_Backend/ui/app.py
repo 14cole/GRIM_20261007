@@ -72,6 +72,7 @@ from GRIM_Backend.ui.dataset_actions import (
 from GRIM_Backend.plotting.actions import PlotOpsMixin
 from GRIM_Backend.reports.workspace import DatasetCatalogEntry, PptWorkspace
 from GRIM_Backend.plotting.models import PlotContext
+from GRIM_Backend.plotting.session import plot_context_facade
 from GRIM_Backend.ui.delta_map_controls import DeltaMapControls
 from GRIM_Backend.ui.spatial_overlays import SpatialOverlayPanel
 from GRIM_Backend.ui.responsive_controls import ResponsiveButtonPanel, ResponsiveControlTabs
@@ -211,6 +212,7 @@ def _extract_supported_drop_paths(mime: QMimeData) -> list[str]:
     return paths
 
 
+@plot_context_facade(PlotContext)
 class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
     @property
     def application_palette_menu(self):
@@ -466,6 +468,10 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         ops_panel_title = QLabel("Dataset Operations")
         ops_panel_title.setObjectName("plotTitle")
         ops_panel_layout.addWidget(ops_panel_title)
+        self.btn_result_storage = QToolButton(text='Result storage…')
+        self.btn_result_storage.setToolTip('Choose Auto, RAM, or Disk for new operation results.')
+        self.btn_result_storage.clicked.connect(self._show_result_storage_options)
+        ops_panel_layout.addWidget(self.btn_result_storage)
 
         ops_scroll = QScrollArea()
         ops_scroll.setWidgetResizable(True)
@@ -1080,6 +1086,12 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         self.btn_wedge_to_conic.clicked.connect(self._convert_wedge_to_conic_selected)
         self.btn_phase_center.clicked.connect(self._phase_center_selected)
         self.btn_dataset_load.clicked.connect(self._load_dataset_files)
+        load_menu = QMenu(self.btn_dataset_load)
+        load_menu.addAction('Load options…', self._show_load_options)
+        load_menu.addAction('Load a region from .grim…', self._load_native_region)
+        self.btn_dataset_load.setMenu(load_menu)
+        self.btn_dataset_load.setPopupMode(QToolButton.MenuButtonPopup)
+        self.btn_dataset_load.setToolTip('Load datasets. Use the arrow for memory, disk storage, and region options.')
         self.btn_dataset_save.clicked.connect(self._save_selected_datasets)
         self.btn_dataset_save_all.clicked.connect(self._save_all_datasets)
         self.btn_dataset_delete.clicked.connect(self._delete_selected_datasets)
@@ -2142,9 +2154,19 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
                     previous.inline_analysis.stop_region_selection()
                 previous.spatial_overlays.hide()
                 previous.spatial_overlays.stop_interaction()
-            for field in PlotContext.__dataclass_fields__:
-                if hasattr(self, field):
-                    setattr(previous, field, getattr(self, field))
+            if tab_key != self._active_plot_tab:
+                if previous.session.cancel():
+                    self.status.showMessage("Pending plot canceled after changing tabs.")
+                if previous.plot_slider is not None:
+                    previous.plot_slider.stop_interaction()
+                self._marker_drag = None
+                self._clear_zoom_box_drag()
+                self._clear_pan_drag(sync_limits=False)
+                for name in ("_autoplot_timer", "_hover_timer", "_plot_slider_refresh_timer"):
+                    timer = getattr(self, name, None)
+                    if timer is not None:
+                        timer.stop()
+                self._pending_hover = None
             if tab_key != self._active_plot_tab and previous.settings_frame.isVisible():
                 # A settings frame is a top-level popup.  Close the old tab's
                 # popup during a Plotting/ISAR switch so the two tabs'
@@ -2184,8 +2206,6 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         if tab_key == "isar":
             from GRIM_Backend.ui.isar_controls import sync_frequency_controls
             sync_frequency_controls(context, getattr(self, "active_dataset", None))
-        for field in PlotContext.__dataclass_fields__:
-            setattr(self, field, getattr(context, field))
 
         if self.inline_analysis is not None:
             resume = getattr(self.inline_analysis, "resume_interaction", None)
@@ -2204,6 +2224,13 @@ class GrimCutWindow(DatasetOpsMixin, PlotOpsMixin, QMainWindow):
         if tab_key is None:
             active = self._plot_contexts.get(self._active_plot_tab)
             if active is not None:
+                active.session.cancel()
+                if active.plot_slider is not None:
+                    active.plot_slider.stop_interaction()
+                for name in ("_autoplot_timer", "_hover_timer", "_plot_slider_refresh_timer"):
+                    timer = getattr(self, name, None)
+                    if timer is not None:
+                        timer.stop()
                 if active.inline_analysis is not None:
                     active.inline_analysis.stop_region_selection()
                 active.spatial_overlays.hide()

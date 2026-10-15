@@ -105,7 +105,7 @@ def from_grid(grid, out_path: 'str', *, amp: 'Optional[np.ndarray]' = None,
         raise ValueError(f"amp shape {a.shape} != grid shape {exp}.")
     with np.load(out, allow_pickle=False) as z:
         d = {k: z[k] for k in z.files}
-    from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples
+    from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples, encode_native_samples
     d = decode_native_samples(d, label=out)
     d["rcs_amp_real"] = a.real.astype(np.float64)
     d["rcs_amp_imag"] = a.imag.astype(np.float64)
@@ -113,7 +113,7 @@ def from_grid(grid, out_path: 'str', *, amp: 'Optional[np.ndarray]' = None,
     if history:
         d["history"] = str(d.get("history", "")) + f" | {history}"
     with open(out, "wb") as fh:
-        np.savez(fh, **d)
+        np.savez(fh, **encode_native_samples(d))
     return out
 
 

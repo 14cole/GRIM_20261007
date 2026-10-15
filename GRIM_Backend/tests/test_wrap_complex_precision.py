@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from GRIM_Backend.datasets.grid import RcsGrid
+from GRIM_Backend.datasets.operations import operation_events
 
 
 def _grid(azimuths, field, *, unit="deg", extra=None, **kwargs):
@@ -48,7 +49,15 @@ def test_wrap_preserves_exact_quadratures_and_native_roundtrip(tmp_path, dtype, 
     np.testing.assert_array_equal(result.phase, original_phase[order])
     assert report["merged_coordinate_count"] == 0
     assert report["discarded_conflict_cell_count"] == 0
-    assert result.history == source.history == "original"
+    assert source.history == "original"
+    assert result.history.startswith(source.history + "\n")
+    events = operation_events(result)
+    assert len(events) == 1
+    assert events[0]["operation"] == "wrap_azimuth"
+    assert events[0]["parameters"] == {
+        "mode": mode, "seam_conflict": "first", "return_report": True,
+    }
+    assert not operation_events(source)
     assert source.storage_kind == "complex"
     assert source.rcs.tobytes() == original.tobytes()
     np.testing.assert_array_equal(source.azimuths, azimuths)
@@ -61,6 +70,8 @@ def test_wrap_preserves_exact_quadratures_and_native_roundtrip(tmp_path, dtype, 
     restored = RcsGrid.load(result.save(tmp_path / "wrapped"))
     assert restored.rcs.dtype == np.dtype(dtype)
     assert restored.rcs.tobytes() == expected.tobytes()
+    assert restored.history == result.history
+    assert operation_events(restored) == events
 
 
 @pytest.mark.parametrize("dtype", [np.complex64, np.complex128])

@@ -104,7 +104,7 @@ def display_values(dataset, values, *, phase, scale, frequency, preserve_zeros=F
     return dataset.linear_to_default_db(np.where((values > 0.) | (preserve_zeros & (values == 0.)), values, np.nan), frequency_value=frequency, eps=0.)
 
 
-def iter_series(name, dataset, reference, selection, *, sweep_axis, config=None, phase=False, scale="dbsm", preserve_zeros=False):
+def iter_series(name, dataset, reference, selection, *, sweep_axis, config=None, phase=False, scale="dbsm", preserve_zeros=False, cancel=None):
     """Yield x, y, informative label and semantic identity for each cut."""
     config = options(config)
     az_idx, el_idx, fr_idx, pol_idx = selection
@@ -128,21 +128,34 @@ def iter_series(name, dataset, reference, selection, *, sweep_axis, config=None,
         # does not force calculation of every unused cut.
         az_groups = [(index, [native_index]) for index, native_index in enumerate(az_idx)] if individual else [(None, az_idx)]
         for az_position, group in az_groups:
-            selection_key = np.ix_(group, [fixed_index], fr_idx, [pol_idx]) if sweep_axis == "frequency" else np.ix_(group, el_idx, [fixed_index], [pol_idx])
-            raw = dataset.rcs_slice(selection_key) if phase else dataset.power[selection_key]
-            block = raw[:, 0, :, 0] if sweep_axis == "frequency" else raw[:, :, 0, 0]
-            if individual:
-                if phase:
-                    valid = np.isfinite(block[0]) & (np.abs(block[0]) > 0.)
-                    reduced = np.where(valid, np.degrees(np.angle(block[0])), np.nan)
+            # Every reduced output coordinate is independent. Tile the sweep
+            # dimension while retaining every azimuth contributing to its exact
+            # statistic; this changes allocation size, never the population.
+            from .requests import check_cancel
+            width = max(1, common.REDUCTION_BLOCK_CELLS // max(1, len(group)))
+            reduced, count = np.empty(len(sweep_idx)), np.empty(len(sweep_idx), dtype=np.intp)
+            for start in range(0, len(sweep_idx), width):
+                check_cancel(cancel)
+                stop = min(len(sweep_idx), start + width)
+                selected_sweep = np.asarray(sweep_idx)[start:stop]
+                selection_key = np.ix_(group, [fixed_index], selected_sweep, [pol_idx]) if sweep_axis == "frequency" else np.ix_(group, selected_sweep, [fixed_index], [pol_idx])
+                raw = dataset.rcs_slice(selection_key) if phase else dataset.power[selection_key]
+                block = raw[:, 0, :, 0] if sweep_axis == "frequency" else raw[:, :, 0, 0]
+                if individual:
+                    if phase:
+                        valid = np.isfinite(block[0]) & (np.abs(block[0]) > 0.)
+                        values = np.where(valid, np.degrees(np.angle(block[0])), np.nan)
+                    else:
+                        valid = np.isfinite(block[0]) & (block[0] >= 0.)
+                        values = np.where(valid, block[0], np.nan)
+                    counts = valid.astype(int)
                 else:
-                    valid = np.isfinite(block[0]) & (block[0] >= 0.)
-                    reduced = np.where(valid, block[0], np.nan)
-                count = valid.astype(int)
+                    values, counts = reduce_phase(block, config) if phase else reduce_power(block, config)
+                reduced[start:stop], count[start:stop] = values, counts
+            if individual:
                 description = f"{'Az' if az_name == 'Azimuth' else az_name} {az_display[az_position]:.6g} {az_unit}"
                 az_identity = (float(az_native[az_position]),)
             else:
-                reduced, count = reduce_phase(block, config) if phase else reduce_power(block, config)
                 description = short_statistic(config, phase=phase)
                 az_identity = tuple(float(value) for value in az_native)
             display = display_values(dataset, reduced, phase=phase, scale=scale, frequency=frequency, preserve_zeros=preserve_zeros)

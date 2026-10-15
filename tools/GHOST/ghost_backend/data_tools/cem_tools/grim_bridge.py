@@ -1,7 +1,9 @@
 """Adapter to the standalone GRIM viewer's dataset readers and writers."""
 
 import importlib.util
+import json
 import os
+import re
 from pathlib import Path
 import sys
 from typing import Any
@@ -148,7 +150,7 @@ def _write_table(grid: 'Any', destination: 'Path', delimiter: 'str') -> 'Path':
 
 
 def _safe_token(value: 'object') -> 'str':
-    return str(value).replace(" ", "").replace("/", "-")
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '-', str(value).replace(" ", "")).rstrip('.') or 'channel'
 
 
 def export_dataset(
@@ -214,11 +216,17 @@ def export_dataset(
     split = len(grid.elevations) * len(grid.polarizations) > 1
     for ie, elevation in enumerate(grid.elevations):
         for ip, polarization in enumerate(grid.polarizations):
-            suffix = f"_EL{_safe_token(elevation)}_{_safe_token(polarization)}" if split else ""
-            target = base.with_name(base.stem + suffix + extension)
+            # OUT historically identifies the channel through its filename.
+            # Replace any old channel token before adding the actual channel,
+            # including for single-channel exports.
+            stem = re.sub(r"(?<![A-Za-z0-9])(HH|VV|HV|VH)(?![A-Za-z0-9])", "", base.stem, flags=re.I).strip("_-")
+            suffix = f"_EL{_safe_token(elevation)}" if split else ""
+            suffix += f"_{_safe_token(polarization)}"
+            target = base.with_name((stem or "dataset") + suffix + extension)
             _available_path(target, overwrite)
             with target.open("w", encoding="utf-8") as stream:
                 stream.write("# frequency_GHz azimuth_deg rcs_dBke phase_deg\n")
+                stream.write("# polarization: " + json.dumps(str(polarization), ensure_ascii=True) + "\n")
                 stream.writelines(_out_rows(grid, ie, ip))
             outputs.append(target)
     return tuple(outputs)
@@ -231,7 +239,7 @@ def _out_rows(grid: 'Any', elevation_index: 'int', polarization_index: 'int'):
     arithmetic, same ``.17g`` formatting), but the cut's power and phase are
     read once through the dataset's derived accessors instead of touching
     the legacy ``rcs_power``/``rcs_phase`` attributes per cell.  Those legacy
-    reads materialise and hash whole-grid arrays, and every later sample
+    reads materialize and hash whole-grid arrays, and every later sample
     read on that dataset re-hashes them.
     """
     selection = (slice(None), elevation_index, slice(None), polarization_index)
@@ -242,8 +250,20 @@ def _out_rows(grid: 'Any', elevation_index: 'int', polarization_index: 'int'):
         power, phase = grid.power[selection], grid.phase[selection]
     power = np.asarray(power, dtype=np.float64)
     phase = np.asarray(phase, dtype=np.float64)
-    azimuths = [float(value) for value in np.asarray(grid.azimuths).tolist()]
-    for iff, frequency in enumerate(grid.frequencies):
+    units = dict(getattr(grid, "units", {}) or {})
+    angle_unit = str(units.get("azimuth") or "deg").strip().lower() or "deg"
+    if angle_unit in {"deg", "degree", "degrees"}:
+        azimuths = np.asarray(grid.azimuths, dtype=float)
+    elif angle_unit in {"rad", "radian", "radians"}:
+        azimuths = np.degrees(np.asarray(grid.azimuths, dtype=float))
+    else:
+        raise CemToolError(f"unsupported OUT azimuth unit: {angle_unit!r}")
+    frequency_unit = str(units.get("frequency") or "GHz").strip().lower() or "ghz"
+    frequency_scale = {"hz": 1e-9, "khz": 1e-6, "mhz": 1e-3, "ghz": 1.}.get(frequency_unit)
+    if frequency_scale is None:
+        raise CemToolError(f"unsupported OUT frequency unit: {frequency_unit!r}")
+    frequencies = np.asarray(grid.frequencies, dtype=float) * frequency_scale
+    for iff, frequency in enumerate(frequencies):
         frequency = float(frequency)
         wavelength = 299_792_458.0 / (frequency * 1e9)
         dbke = 10.0 * np.log10(power[:, iff] * 2.0 * np.pi / wavelength)

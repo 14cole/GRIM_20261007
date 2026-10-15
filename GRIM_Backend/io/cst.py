@@ -2,24 +2,124 @@
 from __future__ import annotations
 
 import csv
+import itertools
+import sys
 import os
 import re
 
 import numpy as np
 
+from GRIM_Backend.io.samples import construct_parsed_grid, parsed_sample_memory
+
+
+class _DelimitedRows:
+    """Repeatable CSV rows with bounded text memory and stable source checks."""
+
+    def __init__(self, path):
+        self.path = path
+        self.signature = self._signature()
+        with open(path, "r", newline="", encoding="utf-8-sig") as stream:
+            sample = stream.read(8192)
+        try:
+            self.delimiter = csv.Sniffer().sniff(sample, delimiters=",\t;").delimiter
+        except csv.Error:
+            self.delimiter = max((",", "\t", ";"), key=sample.count)
+
+    def _signature(self):
+        stat = os.stat(self.path)
+        return stat.st_size, stat.st_mtime_ns
+
+    def check_unchanged(self):
+        if self._signature() != self.signature:
+            raise ValueError("table changed during import; reload the completed file")
+
+    def __iter__(self):
+        self.check_unchanged()
+        with open(self.path, "r", newline="", encoding="utf-8-sig") as stream:
+            yield from csv.reader(stream, delimiter=self.delimiter)
+        self.check_unchanged()
+
+    def __getitem__(self, selection):
+        if isinstance(selection, slice):
+            return itertools.islice(iter(self), selection.start or 0,
+                                    selection.stop, selection.step or 1)
+        return next(itertools.islice(iter(self), selection, selection + 1))
+
+    def __bool__(self):
+        return next(iter(self), None) is not None
+
 
 def _read_cst_delimited_rows(path):
-    """Read a CST text export while retaining any leading metadata rows."""
+    """Compatibility materializer; production imports use repeatable rows."""
+    return list(_DelimitedRows(path))
 
-    with open(path, "r", newline="", encoding="utf-8-sig") as stream:
-        sample = stream.read(8192)
-        stream.seek(0)
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
-            delimiter = dialect.delimiter
-        except csv.Error:
-            delimiter = max((",", "\t", ";"), key=sample.count)
-        return list(csv.reader(stream, delimiter=delimiter))
+
+def _vendor_import_allocation(shape, *, source, max_output_bytes,
+                              extra_working_bytes=0, sample_dtype=np.float64,
+                              duplicate_bytes_per_cell=8):
+    """Include typed duplicate tracking and sample canonicalization in planning."""
+    from GRIM_Backend.datasets.memory import _checked_dense_import_allocation
+
+    dense_bytes, peak_bytes = parsed_sample_memory(
+        shape, sample_dtype=sample_dtype,
+        duplicate_bytes_per_cell=duplicate_bytes_per_cell,
+        extra_working_bytes=extra_working_bytes,
+    )
+    resident = peak_bytes - dense_bytes
+    return _checked_dense_import_allocation(
+        shape, (sample_dtype, sample_dtype), source=source,
+        max_output_bytes=max_output_bytes, resident_bytes=resident,
+    )
+
+
+def _vendor_estimate(allocation, source_format):
+    return {"shape": allocation["shape"],
+            "retained_bytes": allocation["dense_bytes"],
+            "estimated_peak_bytes": allocation["peak_bytes"],
+            "source_format": source_format}
+
+
+def estimate_vendor_text_import(path):
+    """Plan recognized SENTRi/CST files without retaining rows or sample arrays.
+
+    Return None for other table formats. Unsupported or malformed vendor tables
+    keep their normal format errors instead of using a misleading file-size cap.
+    """
+    from GRIM_Backend.datasets.grid import RcsGrid
+
+    if RcsGrid.has_SENTRi_signature(path):
+        return RcsGrid.read_SENTRi(path, max_output_bytes=sys.maxsize,
+                                  _estimate_only=True)
+    recognized = str(path).lower().endswith(".cst_data")
+    if not recognized:
+        for row in itertools.islice(_DelimitedRows(path), 256):
+            tokens = {_cst_compact_header(value) for value in row}
+            frequency = any(_cst_frequency_unit(value) for value in row)
+            spherical = any("theta" in token for token in tokens) and any(
+                "phi" in token for token in tokens)
+            flat = any(token.startswith("elevation") for token in tokens) and any(
+                token.startswith("azimuth") for token in tokens)
+            physics = any(token in {"iq", "complexiq", "complexsample", "complexamplitude"}
+                          or (("rcs" in token or "magnitude" in token)
+                              and ("dbsm" in token or "dbm2" in token))
+                          for token in tokens)
+            if frequency and physics and (spherical or flat):
+                recognized = True
+                break
+    if not recognized and not str(path).lower().endswith(".csv"):
+        legacy_required = {"thetadeg", "phideg", "absthetadbm2", "phasethetadeg",
+                           "absphidbm2", "phasephideg"}
+        with open(path, "r", encoding="utf-8-sig") as stream:
+            for line in itertools.islice(stream, 256):
+                tokens = {_cst_compact_header(token).replace("dbsm", "dbm2")
+                          for token in re.split(r"[,\s]+", line.strip())}
+                if legacy_required.issubset(tokens):
+                    return RcsGrid.load_theta_phi_txt(
+                        path, max_output_bytes=sys.maxsize, _estimate_only=True)
+    if not recognized:
+        return None
+    return RcsGrid.read_CST(path, max_output_bytes=sys.maxsize,
+                            _estimate_only=True)
 
 
 def _cst_compact_header(value):
@@ -113,7 +213,7 @@ class CstFormatMixin:
     """CST and theta/phi table readers for RcsGrid."""
 
     @classmethod
-    def read_CST(cls, path, *, max_output_bytes=None):
+    def read_CST(cls, path, *, max_output_bytes=None, _estimate_only=False):
         """Read a supported CST RCS table into a physically tagged grid.
 
         Two schemas are recognized:
@@ -127,9 +227,9 @@ class CstFormatMixin:
         GRIM elevation with ``elevation = 90 - theta``.  Both forms use GRIM's
         canonical azimuth interval ``[-180, 180)``.
         """
-        from GRIM_Backend.io.cst import _cst_compact_header, _cst_frequency_unit, _read_cst_delimited_rows
+        from GRIM_Backend.io.cst import _cst_compact_header, _cst_frequency_unit
 
-        rows = _read_cst_delimited_rows(path)
+        rows = _DelimitedRows(path)
         if not rows:
             raise ValueError("CST table is empty")
 
@@ -182,7 +282,16 @@ class CstFormatMixin:
                     mapped,
                     tokens,
                     max_output_bytes=max_output_bytes,
+                    _estimate_only=_estimate_only,
                 )
+            # A spherical header selects the wide parser immediately instead
+            # of searching every numeric data row for a later flat header.
+            compact_tokens = [_cst_compact_header(cell) for cell in row]
+            if (any(_cst_frequency_unit(cell) for cell in row)
+                    and any(token.startswith("theta") for token in compact_tokens)
+                    and any(token.startswith("phi") for token in compact_tokens)
+                    and any("rcs" in token for token in compact_tokens)):
+                break
 
         if str(path).lower().endswith(".cst_data"):
             raise ValueError(
@@ -190,7 +299,8 @@ class CstFormatMixin:
                 "frequency, polarity, and magnitude(dBsm) and/or IQ columns."
             )
         return cls._read_cst_theta_phi_csv(
-            path, rows=rows, max_output_bytes=max_output_bytes
+            path, rows=rows, max_output_bytes=max_output_bytes,
+            _estimate_only=_estimate_only,
         )
 
     @classmethod
@@ -209,10 +319,10 @@ class CstFormatMixin:
         header_tokens,
         *,
         max_output_bytes=None,
+        _estimate_only=False,
     ):
         """Parse the row-per-polarization ``.cst_data`` schema."""
         from GRIM_Backend.datasets.constants import _ADOPT_CLEAN_ARRAYS_TOKEN
-        from GRIM_Backend.datasets.memory import _checked_dense_import_allocation
         from GRIM_Backend.io.cst import _cst_dbsm_to_power, _cst_frequency_scale_to_ghz, _cst_iq_to_power, _parse_cst_iq, _wrap_cst_azimuth_deg
         from GRIM_Backend.io.samples import _cst_samples_equivalent
 
@@ -250,182 +360,169 @@ class CstFormatMixin:
                 raise ValueError(f"line {line_no}: {key} cannot be +Inf")
             return float(value)
 
-        raw_records = []
-        pol_order = []
-        iq_validated = 0
-        iq_only = 0
-        iq_unparsed = 0
-
-        for row_idx, row in enumerate(rows[header_idx + 1 :], start=header_idx + 2):
-            if not row or all(not str(value).strip() for value in row):
-                continue
-
-            elevation = _required_float(row, "elevation", row_idx)
-            azimuth = _wrap_cst_azimuth_deg(
-                _required_float(row, "azimuth", row_idx)
-            )
-            raw_frequency = _required_float(row, "frequency", row_idx)
-            if raw_frequency <= 0.0:
-                raise ValueError(f"line {row_idx}: frequency must be positive")
-            polarization = _cell(row, "polarization").upper()
-            if not polarization:
-                raise ValueError(f"line {row_idx}: polarity is blank")
-
-            magnitude_dbsm = _optional_float(
-                row, "magnitude_dbsm", row_idx
-            ) if "magnitude_dbsm" in col_idx else None
-            phase_deg = _optional_float(
-                row, "phase_deg", row_idx
-            ) if "phase_deg" in col_idx else None
-
-            iq_text = _cell(row, "iq") if "iq" in col_idx else ""
-            iq_value = None
-            if iq_text:
-                try:
-                    iq_value = _parse_cst_iq(iq_text)
-                except ValueError as exc:
-                    if magnitude_dbsm is None:
-                        raise ValueError(f"line {row_idx}: {exc}") from exc
-                    iq_unparsed += 1
-
-            if magnitude_dbsm is None and iq_value is None:
-                raise ValueError(
-                    f"line {row_idx}: need a finite magnitude(dBsm) or parsable IQ sample"
-                )
-
-            if magnitude_dbsm is None:
-                power = _cst_iq_to_power(
-                    iq_value, context=f"line {row_idx} IQ"
-                )
-            else:
-                power = _cst_dbsm_to_power(
-                    magnitude_dbsm, context=f"line {row_idx} Magnitude(dBsm)"
-                )
-
-            if phase_deg is not None and not np.isfinite(phase_deg):
-                raise ValueError(f"line {row_idx}: phase_deg must be finite")
-            phase = (
-                float(np.deg2rad(phase_deg))
-                if phase_deg is not None
-                else float(np.angle(iq_value)) if iq_value is not None
-                else float("nan")
-            )
-
-            if iq_value is not None and magnitude_dbsm is not None:
-                iq_power = _cst_iq_to_power(
-                    iq_value, context=f"line {row_idx} IQ"
-                )
-                if power == 0.0:
-                    magnitude_matches = iq_power <= 1.0e-20
-                elif iq_power == 0.0:
-                    magnitude_matches = False
-                else:
-                    iq_dbsm = 10.0 * np.log10(iq_power)
-                    magnitude_matches = abs(iq_dbsm - magnitude_dbsm) <= 0.05
-                if not magnitude_matches:
-                    raise ValueError(
-                        f"line {row_idx}: IQ magnitude disagrees with "
-                        "Magnitude(dBsm) by more than 0.05 dB"
-                    )
-
-            if (
-                iq_value is not None
-                and phase_deg is not None
-                and abs(iq_value) > 1.0e-15
-            ):
-                phase_error = np.angle(np.exp(1j * (np.angle(iq_value) - phase)))
-                if abs(float(np.rad2deg(phase_error))) > 0.5:
-                    raise ValueError(
-                        f"line {row_idx}: IQ phase disagrees with Phase(deg) "
-                        "by more than 0.5 deg"
-                    )
-
-            if iq_value is not None:
-
-
-                power = _cst_iq_to_power(
-                    iq_value, context=f"line {row_idx} IQ"
-                )
-                phase = float(np.angle(iq_value))
-                if magnitude_dbsm is None and phase_deg is None:
-                    iq_only += 1
-                else:
-                    iq_validated += 1
-            if polarization not in pol_order:
-                pol_order.append(polarization)
-            raw_records.append(
-                (row_idx, azimuth, elevation, raw_frequency, polarization, power, phase)
-            )
-
-        if not raw_records:
-            raise ValueError("CST flat table contains no data rows")
-
         frequency_scale, _ = _cst_frequency_scale_to_ghz(
             header_tokens.get("frequency", "")
         )
+        counters = dict(iq_validated=0, iq_only=0, iq_unparsed=0)
 
-        records = []
-        seen = {}
-        for row_idx, azimuth, elevation, raw_frequency, polarization, power, phase in raw_records:
-            frequency = float(raw_frequency * frequency_scale)
-            if not np.isfinite(frequency) or frequency <= 0.0:
-                raise ValueError(
-                    f"line {row_idx}: frequency conversion to GHz did not "
-                    "produce a positive finite value"
-                )
-            key = (azimuth, elevation, frequency, polarization)
-            if key in seen:
-                prior_line, prior_power, prior_phase = seen[key]
-                if _cst_samples_equivalent(
-                    prior_power, prior_phase, power, phase
-                ):
+        def _records(*, coordinates_only=False):
+            for row_idx, row in enumerate(rows[header_idx + 1 :], start=header_idx + 2):
+                if not row or all(not str(value).strip() for value in row):
                     continue
-                raise ValueError(
-                    f"line {row_idx}: conflicting duplicate CST sample after "
-                    f"azimuth wrapping; first defined on line {prior_line}"
+
+                elevation = _required_float(row, "elevation", row_idx)
+                azimuth = _wrap_cst_azimuth_deg(
+                    _required_float(row, "azimuth", row_idx)
                 )
-            seen[key] = (row_idx, power, phase)
-            records.append(
-                (azimuth, elevation, frequency, polarization, power, phase)
-            )
+                raw_frequency = _required_float(row, "frequency", row_idx)
+                if raw_frequency <= 0.0:
+                    raise ValueError(f"line {row_idx}: frequency must be positive")
+                polarization = _cell(row, "polarization").upper()
+                if not polarization:
+                    raise ValueError(f"line {row_idx}: polarity is blank")
+                frequency = float(raw_frequency * frequency_scale)
+                if not np.isfinite(frequency) or frequency <= 0.0:
+                    raise ValueError(
+                        f"line {row_idx}: frequency conversion to GHz did not "
+                        "produce a positive finite value"
+                    )
+                if coordinates_only:
+                    yield row_idx, azimuth, elevation, frequency, polarization, None, None
+                    continue
+
+                magnitude_dbsm = _optional_float(
+                    row, "magnitude_dbsm", row_idx
+                ) if "magnitude_dbsm" in col_idx else None
+                phase_deg = _optional_float(
+                    row, "phase_deg", row_idx
+                ) if "phase_deg" in col_idx else None
+
+                iq_text = _cell(row, "iq") if "iq" in col_idx else ""
+                iq_value = None
+                if iq_text:
+                    try:
+                        iq_value = _parse_cst_iq(iq_text)
+                    except ValueError as exc:
+                        if magnitude_dbsm is None:
+                            raise ValueError(f"line {row_idx}: {exc}") from exc
+                        counters["iq_unparsed"] += 1
+
+                if magnitude_dbsm is None and iq_value is None:
+                    raise ValueError(
+                        f"line {row_idx}: need a finite magnitude(dBsm) or parsable IQ sample"
+                    )
+
+                if magnitude_dbsm is None:
+                    power = _cst_iq_to_power(
+                        iq_value, context=f"line {row_idx} IQ"
+                    )
+                else:
+                    power = _cst_dbsm_to_power(
+                        magnitude_dbsm, context=f"line {row_idx} Magnitude(dBsm)"
+                    )
+
+                if phase_deg is not None and not np.isfinite(phase_deg):
+                    raise ValueError(f"line {row_idx}: phase_deg must be finite")
+                phase = (
+                    float(np.deg2rad(phase_deg))
+                    if phase_deg is not None
+                    else float(np.angle(iq_value)) if iq_value is not None
+                    else float("nan")
+                )
+
+                if iq_value is not None and magnitude_dbsm is not None:
+                    iq_power = _cst_iq_to_power(
+                        iq_value, context=f"line {row_idx} IQ"
+                    )
+                    if power == 0.0:
+                        magnitude_matches = iq_power <= 1.0e-20
+                    elif iq_power == 0.0:
+                        magnitude_matches = False
+                    else:
+                        iq_dbsm = 10.0 * np.log10(iq_power)
+                        magnitude_matches = abs(iq_dbsm - magnitude_dbsm) <= 0.05
+                    if not magnitude_matches:
+                        raise ValueError(
+                            f"line {row_idx}: IQ magnitude disagrees with "
+                            "Magnitude(dBsm) by more than 0.05 dB"
+                        )
+
+                if (
+                    iq_value is not None
+                    and phase_deg is not None
+                    and abs(iq_value) > 1.0e-15
+                ):
+                    phase_error = np.angle(np.exp(1j * (np.angle(iq_value) - phase)))
+                    if abs(float(np.rad2deg(phase_error))) > 0.5:
+                        raise ValueError(
+                            f"line {row_idx}: IQ phase disagrees with Phase(deg) "
+                            "by more than 0.5 deg"
+                        )
+
+                if iq_value is not None:
 
 
-        rows.clear()
-        del raw_records, seen
+                    power = _cst_iq_to_power(
+                        iq_value, context=f"line {row_idx} IQ"
+                    )
+                    phase = float(np.angle(iq_value))
+                    if magnitude_dbsm is None and phase_deg is None:
+                        counters["iq_only"] += 1
+                    else:
+                        counters["iq_validated"] += 1
+                yield row_idx, azimuth, elevation, frequency, polarization, power, phase
 
-        azimuths = np.asarray(sorted({record[0] for record in records}), dtype=float)
-        elevations = np.asarray(sorted({record[1] for record in records}), dtype=float)
-        frequencies = np.asarray(sorted({record[2] for record in records}), dtype=float)
+        az_values, el_values, freq_values = set(), set(), set()
+        pol_order = []
+        for _, azimuth, elevation, frequency, polarization, _, _ in _records(coordinates_only=True):
+            az_values.add(azimuth)
+            el_values.add(elevation)
+            freq_values.add(frequency)
+            if polarization not in pol_order:
+                pol_order.append(polarization)
+        if not az_values:
+            raise ValueError("CST flat table contains no data rows")
+        azimuths = np.asarray(sorted(az_values), dtype=float)
+        elevations = np.asarray(sorted(el_values), dtype=float)
+        frequencies = np.asarray(sorted(freq_values), dtype=float)
         polarizations = np.asarray(pol_order, dtype=object)
-        shape = (
-            len(azimuths), len(elevations), len(frequencies), len(polarizations)
+        del az_values, el_values, freq_values
+        shape = (len(azimuths), len(elevations), len(frequencies), len(polarizations))
+        allocation = _vendor_import_allocation(
+            shape, source=f"CST flat import {path}", max_output_bytes=max_output_bytes,
         )
-        allocation = _checked_dense_import_allocation(
-            shape,
-            (np.float64, np.float64),
-            source=f"CST flat import {path}",
-            max_output_bytes=max_output_bytes,
-        )
+        if _estimate_only:
+            return _vendor_estimate(allocation, "CST flat cst_data")
         power = np.full(shape, np.nan, dtype=np.float64)
         phase = np.full(shape, np.nan, dtype=np.float64)
+        first_line = np.zeros(shape, dtype=np.uint64)
         az_index = {value: index for index, value in enumerate(azimuths.tolist())}
         el_index = {value: index for index, value in enumerate(elevations.tolist())}
         freq_index = {value: index for index, value in enumerate(frequencies.tolist())}
         pol_index = {str(value): index for index, value in enumerate(polarizations.tolist())}
-
-        for azimuth, elevation, frequency, polarization, sample_power, sample_phase in records:
-            index = (
-                az_index[azimuth], el_index[elevation], freq_index[frequency],
-                pol_index[polarization],
-            )
-            power[index] = sample_power
-            phase[index] = sample_phase
+        counters = dict(iq_validated=0, iq_only=0, iq_unparsed=0)
+        for row_idx, azimuth, elevation, frequency, polarization, sample_power, sample_phase in _records():
+            index = (az_index[azimuth], el_index[elevation], freq_index[frequency],
+                     pol_index[polarization])
+            if first_line[index]:
+                if _cst_samples_equivalent(power[index], phase[index], sample_power, sample_phase):
+                    continue
+                raise ValueError(
+                    f"line {row_idx}: conflicting duplicate CST sample after "
+                    f"azimuth wrapping; first defined on line {int(first_line[index])}"
+                )
+            first_line[index] = row_idx
+            power[index], phase[index] = sample_power, sample_phase
+        del first_line
+        iq_validated, iq_only, iq_unparsed = (
+            counters["iq_validated"], counters["iq_only"], counters["iq_unparsed"]
+        )
 
         iq_summary = (
             f"IQ validated={iq_validated}, IQ-only={iq_only}, "
             f"IQ-unparsed fallback={iq_unparsed}"
         )
-        return cls(
+        return construct_parsed_grid(cls,
             azimuths,
             elevations,
             frequencies,
@@ -460,7 +557,7 @@ class CstFormatMixin:
 
     @classmethod
     def _read_cst_theta_phi_csv(
-        cls, path, *, rows=None, max_output_bytes=None
+        cls, path, *, rows=None, max_output_bytes=None, _estimate_only=False
     ):
         """Load a theta/phi scattering CSV into an RcsGrid.
 
@@ -485,8 +582,7 @@ class CstFormatMixin:
             - Phase columns are interpreted as degrees and converted to radians.
         """
         from GRIM_Backend.datasets.constants import _ADOPT_CLEAN_ARRAYS_TOKEN
-        from GRIM_Backend.datasets.memory import _checked_dense_import_allocation
-        from GRIM_Backend.io.cst import _cst_dbsm_to_power, _cst_frequency_scale_to_ghz, _read_cst_delimited_rows, _wrap_cst_azimuth_deg
+        from GRIM_Backend.io.cst import _cst_dbsm_to_power, _cst_frequency_scale_to_ghz, _wrap_cst_azimuth_deg
         from GRIM_Backend.io.samples import _cst_samples_equivalent
 
         def _norm(text: str) -> str:
@@ -535,7 +631,7 @@ class CstFormatMixin:
         }
 
         if rows is None:
-            rows = _read_cst_delimited_rows(path)
+            rows = _DelimitedRows(path)
         if not rows:
             raise ValueError("CST theta/phi table is empty")
 
@@ -658,240 +754,158 @@ class CstFormatMixin:
                 "guessed and generic Abs(field) tables are not accepted."
             )
 
-        records = []
-        for row_index, row in enumerate(rows[data_start_idx:], start=data_start_idx):
-            line_no = row_index + 1
-            if not row or all(str(cell).strip() == "" for cell in row):
-                continue
+        def _records():
+            for row_index, row in enumerate(rows[data_start_idx:], start=data_start_idx):
+                line_no = row_index + 1
+                if not row or all(str(cell).strip() == "" for cell in row):
+                    continue
 
-            def _axis_cell(key: str) -> float:
-                idx = col_idx[key]
-                raw = row[idx] if idx < len(row) else ""
-                text = str(raw).strip()
-                if not text:
-                    raise ValueError(f"line {line_no}: {key} is blank")
-                try:
-                    value = float(text)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"line {line_no}: invalid {key} value {text!r}"
-                    ) from exc
-                if not np.isfinite(value):
-                    raise ValueError(f"line {line_no}: {key} must be finite")
-                return value
+                def _axis_cell(key: str) -> float:
+                    idx = col_idx[key]
+                    raw = row[idx] if idx < len(row) else ""
+                    text = str(raw).strip()
+                    if not text:
+                        raise ValueError(f"line {line_no}: {key} is blank")
+                    try:
+                        value = float(text)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"line {line_no}: invalid {key} value {text!r}"
+                        ) from exc
+                    if not np.isfinite(value):
+                        raise ValueError(f"line {line_no}: {key} must be finite")
+                    return value
 
-            f_hz = _axis_cell("frequency")
-            if f_hz <= 0.0:
-                raise ValueError(f"line {line_no}: frequency must be positive")
-            theta_deg = _axis_cell("theta_deg")
-            phi_deg = _axis_cell("phi_deg")
+                f_hz = _axis_cell("frequency")
+                if f_hz <= 0.0:
+                    raise ValueError(f"line {line_no}: frequency must be positive")
+                theta_deg = _axis_cell("theta_deg")
+                phi_deg = _axis_cell("phi_deg")
 
-            def _cell(key: str) -> float:
-                idx = col_idx.get(key, -1)
-                if idx < 0 or idx >= len(row):
-                    return float("nan")
-                text = str(row[idx]).strip()
-                if not text:
-                    return float("nan")
-                try:
-                    value = float(text)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"line {line_no}: invalid {key} value {text!r}"
-                    ) from exc
-                if key.startswith("phase_") and not np.isfinite(value):
-                    raise ValueError(f"line {line_no}: {key} must be finite")
-                if key.startswith("rcs_") and not (
-                    np.isfinite(value) or np.isneginf(value)
-                ):
-                    raise ValueError(
-                        f"line {line_no}: {key} must be finite or -Inf"
+                def _cell(key: str) -> float:
+                    idx = col_idx.get(key, -1)
+                    if idx < 0 or idx >= len(row):
+                        return float("nan")
+                    text = str(row[idx]).strip()
+                    if not text:
+                        return float("nan")
+                    try:
+                        value = float(text)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"line {line_no}: invalid {key} value {text!r}"
+                        ) from exc
+                    if key.startswith("phase_") and not np.isfinite(value):
+                        raise ValueError(f"line {line_no}: {key} must be finite")
+                    if key.startswith("rcs_") and not (
+                        np.isfinite(value) or np.isneginf(value)
+                    ):
+                        raise ValueError(
+                            f"line {line_no}: {key} must be finite or -Inf"
+                        )
+                    return value
+
+                yield (
+                        float(f_hz),
+                        float(theta_deg),
+                        float(phi_deg),
+                        _cell("rcs_vv_dbsm"),
+                        _cell("rcs_hv_dbsm"),
+                        _cell("rcs_vh_dbsm"),
+                        _cell("rcs_hh_dbsm"),
+                        _cell("phase_vv_deg"),
+                        _cell("phase_hv_deg"),
+                        _cell("phase_vh_deg"),
+                        _cell("phase_hh_deg"),
+                        int(line_no),
                     )
-                return value
-
-            records.append(
-                (
-                    float(f_hz),
-                    float(theta_deg),
-                    float(phi_deg),
-                    _cell("rcs_vv_dbsm"),
-                    _cell("rcs_hv_dbsm"),
-                    _cell("rcs_vh_dbsm"),
-                    _cell("rcs_hh_dbsm"),
-                    _cell("phase_vv_deg"),
-                    _cell("phase_hv_deg"),
-                    _cell("phase_vh_deg"),
-                    _cell("phase_hh_deg"),
-                    int(line_no),
-                )
-            )
-
-        if not records:
-            raise ValueError("CSV contains no data rows after the header")
-
-        freq_scale_to_ghz, _ = _infer_freq_scale_to_ghz(
-            header_tokens.get("frequency", "")
-        )
 
 
+        freq_scale_to_ghz, _ = _infer_freq_scale_to_ghz(header_tokens.get("frequency", ""))
         channel_specs = (
-            ("VV", 3, 7, "theta-theta"),
-            ("HV", 4, 8, "phi-theta"),
-            ("VH", 5, 9, "theta-phi"),
-            ("HH", 6, 10, "phi-phi"),
+            ("VV", 3, 7, "theta-theta"), ("HV", 4, 8, "phi-theta"),
+            ("VH", 5, 9, "theta-phi"), ("HH", 6, 10, "phi-phi"),
         )
 
-        def _has_magnitude(value):
-            return not bool(np.isnan(value))
+        def _normalized_records():
+            for record in _records():
+                f_ghz = float(record[0] * freq_scale_to_ghz)
+                if not np.isfinite(f_ghz) or f_ghz <= 0.0:
+                    raise ValueError(
+                        f"line {int(record[11])}: frequency conversion to GHz "
+                        "did not produce a positive finite value"
+                    )
+                theta_deg = float(record[1])
+                if theta_deg < -1.0e-9 or theta_deg > 180.0 + 1.0e-9:
+                    raise ValueError(
+                        f"line {int(record[11])}: standard CST theta must be "
+                        f"within [0, 180] deg, got {theta_deg:g}"
+                    )
+                yield (f_ghz, float(90.0 - theta_deg),
+                       _wrap_cst_azimuth_deg(record[2]), int(record[11]), record)
 
-        present_specs = [
-            spec for spec in channel_specs
-            if any(_has_magnitude(record[spec[1]]) for record in records)
-        ]
+        freq_values, el_values, az_values, present_channels = set(), set(), set(), set()
+        data_rows = 0
+        for f_ghz, elevation, azimuth, source_line, record in _normalized_records():
+            data_rows += 1
+            channels = [spec[0] for spec in channel_specs if not np.isnan(record[spec[1]])]
+            if channels:
+                freq_values.add(f_ghz)
+                el_values.add(elevation)
+                az_values.add(azimuth)
+                present_channels.update(channels)
+        if not data_rows:
+            raise ValueError("CSV contains no data rows after the header")
+        present_specs = [spec for spec in channel_specs if spec[0] in present_channels]
         if not present_specs:
             raise ValueError(
                 "CST theta/phi table parsed, but no finite RCS magnitude values were found"
             )
-
-        normalized_records = []
-        for record in records:
-            f_ghz = float(record[0] * freq_scale_to_ghz)
-            if not np.isfinite(f_ghz) or f_ghz <= 0.0:
-                raise ValueError(
-                    f"line {int(record[11])}: frequency conversion to GHz "
-                    "did not produce a positive finite value"
-                )
-            theta_deg = float(record[1])
-            if theta_deg < -1.0e-9 or theta_deg > 180.0 + 1.0e-9:
-                raise ValueError(
-                    f"line {int(record[11])}: standard CST theta must be "
-                    f"within [0, 180] deg, got {theta_deg:g}"
-                )
-            elevation_deg = float(90.0 - theta_deg)
-            azimuth_deg = _wrap_cst_azimuth_deg(record[2])
-            if any(_has_magnitude(record[spec[1]]) for spec in present_specs):
-                normalized_records.append(
-                    (f_ghz, elevation_deg, azimuth_deg, int(record[11]), record)
-                )
-
-        freqs = np.asarray(
-            sorted({record[0] for record in normalized_records}), dtype=float
-        )
-        elevs = np.asarray(
-            sorted({record[1] for record in normalized_records}), dtype=float
-        )
-        azims = np.asarray(
-            sorted({record[2] for record in normalized_records}), dtype=float
-        )
+        freqs = np.asarray(sorted(freq_values), dtype=float)
+        elevs = np.asarray(sorted(el_values), dtype=float)
+        azims = np.asarray(sorted(az_values), dtype=float)
         pols = np.asarray([spec[0] for spec in present_specs], dtype=object)
-
+        del freq_values, el_values, az_values, present_channels
+        shape = (len(azims), len(elevs), len(freqs), len(pols))
+        allocation = _vendor_import_allocation(
+            shape, source=f"CST wide import {path}", max_output_bytes=max_output_bytes,
+        )
+        if _estimate_only:
+            return _vendor_estimate(allocation, "CST wide theta/phi table")
+        power = np.full(shape, np.nan, dtype=np.float64)
+        phase = np.full(shape, np.nan, dtype=np.float64)
+        first_line = np.zeros(shape, dtype=np.uint64)
         f_idx = {float(value): index for index, value in enumerate(freqs.tolist())}
         el_idx = {float(value): index for index, value in enumerate(elevs.tolist())}
         az_idx = {float(value): index for index, value in enumerate(azims.tolist())}
         pol_idx = {str(value): index for index, value in enumerate(pols.tolist())}
-
-        def _dbsm_to_linear(
-            value: float, source_line_no: int, component_name: str
-        ) -> float:
-            return _cst_dbsm_to_power(
-                value,
-                context=(
-                    f"line {source_line_no} CST {component_name} magnitude"
-                ),
-            )
-
-        def _deg_to_rad(value: float) -> float:
-            if not np.isfinite(value):
-                return float("nan")
-            return float(np.deg2rad(value))
-
-
-        prepared_samples = []
-        seen = {}
-        for (
-            f_ghz,
-            elevation_deg,
-            azimuth_deg,
-            source_line_no,
-            source_record,
-        ) in normalized_records:
-            ai = az_idx[azimuth_deg]
-            ei = el_idx[elevation_deg]
-            fi = f_idx[f_ghz]
+        for f_ghz, elevation_deg, azimuth_deg, source_line_no, source_record in _normalized_records():
+            if not any(not np.isnan(source_record[spec[1]]) for spec in present_specs):
+                continue
             for pol_label, magnitude_index, phase_index, component_name in present_specs:
                 magnitude = source_record[magnitude_index]
-                if not _has_magnitude(magnitude):
+                if np.isnan(magnitude):
                     continue
-                sample_key = (azimuth_deg, elevation_deg, f_ghz, pol_label)
-                sample_power = _dbsm_to_linear(
-                    magnitude, source_line_no, component_name
+                sample_power = _cst_dbsm_to_power(
+                    magnitude, context=f"line {source_line_no} CST {component_name} magnitude"
                 )
-                sample_phase = _deg_to_rad(source_record[phase_index])
-                if sample_key in seen:
-                    prior_line_no, prior_power, prior_phase = seen[sample_key]
-                    if _cst_samples_equivalent(
-                        prior_power, prior_phase, sample_power, sample_phase
-                    ):
+                sample_phase = float(np.deg2rad(source_record[phase_index]))
+                index = (az_idx[azimuth_deg], el_idx[elevation_deg], f_idx[f_ghz], pol_idx[pol_label])
+                if first_line[index]:
+                    if _cst_samples_equivalent(power[index], phase[index], sample_power, sample_phase):
                         continue
                     raise ValueError(
-                        f"line {source_line_no}: conflicting duplicate CST "
-                        "theta/phi sample after "
+                        f"line {source_line_no}: conflicting duplicate CST theta/phi sample after "
                         "coordinate conversion: "
                         f"az={azimuth_deg:g}, el={elevation_deg:g}, "
                         f"f={f_ghz:g} GHz, component={component_name}; "
-                        f"first defined on line {prior_line_no}"
+                        f"first defined on line {int(first_line[index])}"
                     )
-                seen[sample_key] = (
-                    source_line_no,
-                    sample_power,
-                    sample_phase,
-                )
-                prepared_samples.append(
-                    (
-                        azimuth_deg,
-                        elevation_deg,
-                        f_ghz,
-                        pol_label,
-                        sample_power,
-                        sample_phase,
-                    )
-                )
+                first_line[index] = source_line_no
+                power[index], phase[index] = sample_power, sample_phase
+        del first_line
 
-        rows.clear()
-        del records, normalized_records, seen
-
-        shape = (len(azims), len(elevs), len(freqs), len(pols))
-        allocation = _checked_dense_import_allocation(
-            shape,
-            (np.float64, np.float64),
-            source=f"CST wide import {path}",
-            max_output_bytes=max_output_bytes,
-        )
-        power = np.full(shape, np.nan, dtype=np.float64)
-        phase = np.full(shape, np.nan, dtype=np.float64)
-        for (
-            azimuth_deg,
-            elevation_deg,
-            f_ghz,
-            pol_label,
-            sample_power,
-            sample_phase,
-        ) in prepared_samples:
-            index = (
-                az_idx[azimuth_deg],
-                el_idx[elevation_deg],
-                f_idx[f_ghz],
-                pol_idx[pol_label],
-            )
-            power[index] = sample_power
-            phase[index] = sample_phase
-
-        if not np.isfinite(power).any():
-            raise ValueError(
-                "CST theta/phi table parsed, but no finite RCS magnitude values were found"
-            )
-
-        return cls(
+        return construct_parsed_grid(cls,
             azims,
             elevs,
             freqs,
@@ -930,6 +944,7 @@ class CstFormatMixin:
         *,
         frequency_ghz=None,
         max_output_bytes=None,
+        _estimate_only=False,
     ):
         """Load whitespace-delimited theta/phi TXT format into an RcsGrid.
 
@@ -946,7 +961,6 @@ class CstFormatMixin:
             - abs(rcs) is loaded as a third polarization channel: TOTAL
         """
         from GRIM_Backend.datasets.constants import _ADOPT_CLEAN_ARRAYS_TOKEN
-        from GRIM_Backend.datasets.memory import _checked_dense_import_allocation
         from GRIM_Backend.io.cst import _cst_dbsm_to_power
         from GRIM_Backend.io.samples import _cst_samples_equivalent
 
@@ -1190,38 +1204,12 @@ class CstFormatMixin:
 
         azimuth_values = set()
         elevation_values = set()
-        seen_samples = {}
         data_row_count = 0
         for line_index, tokens in _iter_data_tokens():
-            theta_deg, phi_deg, sample_values = _parse_data_tokens(
-                tokens, line_index
-            )
+            theta_deg, phi_deg, _ = _parse_data_tokens(tokens, line_index)
             data_row_count += 1
             azimuth_values.add(theta_deg)
             elevation_values.add(phi_deg)
-            coordinate = (theta_deg, phi_deg)
-            for polarization, sample_power, sample_phase in sample_values:
-                if not np.isfinite(sample_power):
-                    continue
-                sample_key = coordinate + (polarization,)
-                prior = seen_samples.get(sample_key)
-                if prior is not None:
-                    prior_line, prior_power, prior_phase = prior
-                    if not _cst_samples_equivalent(
-                        prior_power, prior_phase, sample_power, sample_phase
-                    ):
-                        raise ValueError(
-                            f"line {line_index}: conflicting duplicate legacy "
-                            f"TXT sample at theta={theta_deg:g}, phi={phi_deg:g}, "
-                            f"polarization={polarization}; first defined on line "
-                            f"{prior_line}"
-                        )
-                else:
-                    seen_samples[sample_key] = (
-                        line_index,
-                        sample_power,
-                        sample_phase,
-                    )
 
         if data_row_count == 0:
             raise ValueError("TXT contains no data rows after header")
@@ -1230,21 +1218,23 @@ class CstFormatMixin:
         elevs = np.asarray(sorted(elevation_values), dtype=float)
         freqs = np.asarray([float(selected_frequency)], dtype=float)
         pols = np.asarray(["VV", "HH", "TOTAL"], dtype=str)
-        del azimuth_values, elevation_values, seen_samples
+        del azimuth_values, elevation_values
 
         shape = (len(azims), len(elevs), 1, len(pols))
-        resident_bytes = sum(
-            int(axis.nbytes) for axis in (azims, elevs, freqs, pols)
+        allocation = _vendor_import_allocation(
+            shape, source=f"legacy theta/phi TXT import {path}",
+            max_output_bytes=max_output_bytes, sample_dtype=np.float32,
+            duplicate_bytes_per_cell=24,
         )
-        allocation = _checked_dense_import_allocation(
-            shape,
-            (np.float32, np.float32),
-            source=f"legacy theta/phi TXT import {path}",
-            max_output_bytes=max_output_bytes,
-            resident_bytes=resident_bytes,
-        )
+        if _estimate_only:
+            return _vendor_estimate(allocation, "legacy theta/phi TXT")
         power = np.full(shape, np.nan, dtype=np.float32)
         phase = np.full(shape, np.nan, dtype=np.float32)
+        # Keep first-row values at original precision for duplicate comparisons.
+        # Output stays float32 and keeps the last equivalent row, as before.
+        first_power = np.full(shape, np.nan, dtype=np.float64)
+        first_phase = np.full(shape, np.nan, dtype=np.float64)
+        first_line = np.zeros(shape, dtype=np.uint64)
         el_idx = {float(v): i for i, v in enumerate(elevs.tolist())}
         az_idx = {float(v): i for i, v in enumerate(azims.tolist())}
         pol_idx = {str(v): i for i, v in enumerate(pols.tolist())}
@@ -1260,13 +1250,27 @@ class CstFormatMixin:
                 if not np.isfinite(sample_power):
                     continue
                 pi = pol_idx[polarization]
-                power[ai, ei, 0, pi] = sample_power
-                phase[ai, ei, 0, pi] = sample_phase
+                index = (ai, ei, 0, pi)
+                if first_line[index]:
+                    if not _cst_samples_equivalent(
+                        first_power[index], first_phase[index], sample_power, sample_phase
+                    ):
+                        raise ValueError(
+                            f"line {line_index}: conflicting duplicate legacy "
+                            f"TXT sample at theta={theta_deg:g}, phi={phi_deg:g}, "
+                            f"polarization={polarization}; first defined on line "
+                            f"{int(first_line[index])}"
+                        )
+                else:
+                    first_line[index] = line_index
+                    first_power[index], first_phase[index] = sample_power, sample_phase
+                power[index], phase[index] = sample_power, sample_phase
+        del first_line, first_power, first_phase
 
         if not np.isfinite(power).any():
             raise ValueError("TXT parsed, but no finite magnitude values were found")
 
-        return cls(
+        return construct_parsed_grid(cls,
             azims,
             elevs,
             freqs,

@@ -35,6 +35,40 @@ _CUT_CACHE_LOCK = threading.Lock()
 _CUT_CACHE_LIMIT = 16*1024**2
 
 
+def _response_sample_storage(path):
+    """Read only framing metadata; sample members remain streamed below."""
+    with np.load(path, allow_pickle=False) as archive:
+        def scalar(key, default=None):
+            if key not in archive:
+                return default
+            value = np.asarray(archive[key])
+            if value.size != 1:
+                raise ValueError(f"Response metadata {key} must be scalar.")
+            item = value.reshape(()).item()
+            return item.decode('utf-8') if isinstance(item, bytes) else item
+        version = scalar('grim_format_version', 1)
+        if isinstance(version, bool) or not isinstance(version, int) or version not in (1, 2):
+            raise ValueError(f"Unsupported response native version {version!r}.")
+        if version == 1:
+            return 'rcs_power.npy', False, 1.
+        kind, domain = scalar('storage_kind'), scalar('storage_domain')
+        expected = {'complex': {'rcs_complex'}, 'power': {'rcs_power'},
+                    'power_phase': {'rcs_power', 'rcs_phase'}}.get(kind)
+        if expected is None or set(archive.files) & {'rcs_complex', 'rcs_power', 'rcs_phase'} != expected:
+            raise ValueError('Response contains invalid or conflicting native sample arrays.')
+        if domain not in ('physical', 'raw_field') or (domain == 'raw_field' and kind != 'complex'):
+            raise ValueError('Response contains an invalid native sample domain.')
+        if domain == 'raw_field' and set(archive.files) & {'rcs_amp_real', 'rcs_amp_imag'}:
+            raise ValueError('Response contains duplicate raw complex sample arrays.')
+        if kind != 'complex':
+            return 'rcs_power.npy', False, 1.
+        # response_axes already established sigma_3d. Preserve the explicitly
+        # tagged legacy delta normalization used by existing Assembly files.
+        legacy_delta = scalar('power_domain') == 'delta_amp_sq' and scalar('rcs_domain') == 'delta'
+        factor = 4. * np.pi if domain == 'raw_field' and not legacy_delta else 1.
+        return 'rcs_complex.npy', True, factor
+
+
 def read_response_cut(path, *, frequency, elevation, polarization, cancel_check=lambda: False):
     """Bounded display cache. Publication still verifies full source hashes."""
     if cancel_check():
@@ -73,12 +107,13 @@ def _read_response_cut(path, *, frequency, elevation, polarization, cancel_check
             raise ValueError(f"{Path(path).name}: cut sample {value!r} is not stored exactly once.")
         return int(matches[0])
     ei, fi, pi = exact(el, elevation), exact(frequencies, frequency), exact(pol, polarization)
-    with zipfile.ZipFile(path) as archive, archive.open("rcs_power.npy") as stream:
+    member, complex_samples, power_factor = _response_sample_storage(path)
+    with zipfile.ZipFile(path) as archive, archive.open(member) as stream:
         version = np.lib.format.read_magic(stream)
         reader = np.lib.format.read_array_header_1_0 if version == (1, 0) else np.lib.format.read_array_header_2_0
         shape, fortran, dtype = reader(stream)
-        if tuple(shape) != (len(az), len(el), len(frequencies), len(pol)) or dtype.kind not in "fiu":
-            raise ValueError("Response power array does not match numeric 4-D axes.")
+        if tuple(shape) != (len(az), len(el), len(frequencies), len(pol)) or dtype.kind not in ("c" if complex_samples else "fiu"):
+            raise ValueError("Response sample array does not match numeric 4-D axes.")
         data_start = stream.tell()
         values = np.empty(len(az), float)
         for ai in range(len(az)):
@@ -97,7 +132,15 @@ def _read_response_cut(path, *, frequency, elevation, polarization, cancel_check
             raw = stream.read(dtype.itemsize)
             if len(raw) != dtype.itemsize:
                 raise ValueError("Truncated response power array.")
-            values[ai] = np.frombuffer(raw, dtype=dtype, count=1)[0]
+            sample = np.frombuffer(raw, dtype=dtype, count=1)[0]
+            if complex_samples:
+                if not ((np.isfinite(sample.real) and np.isfinite(sample.imag))
+                        or (np.isnan(sample.real) and np.isnan(sample.imag))):
+                    raise ValueError('Response contains an invalid complex sample.')
+                real, imag = float(sample.real), float(sample.imag)
+                values[ai] = (real*real + imag*imag) * power_factor
+            else:
+                values[ai] = sample
     if np.any(np.isinf(values)) or np.any(values < 0):
         raise ValueError("Response cut contains infinite or negative RCS power.")
     with np.errstate(divide="ignore", invalid="ignore"):

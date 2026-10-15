@@ -7,12 +7,49 @@ import math
 
 import numpy as np
 
+from GRIM_Backend.datasets.result_storage import (
+    allocate_result, copy_result, take_result, select_result,
+)
+
+from GRIM_Backend.datasets.operations import dataset_operation
+from GRIM_Backend.datasets.memory import _bounded_grid_selections
+
 from GRIM_Backend.datasets.constants import (
     C0,
     _ADOPT_CLEAN_ARRAYS_TOKEN,
     _ANGLE_UNITS,
     _FREQUENCY_UNITS,
 )
+
+
+_RESULT_BLOCK_CELLS = 65_536
+
+
+def _normalized_complex_result(grid):
+    """Read normalized I/Q into a managed array without materializing the grid."""
+    result = allocate_result(grid.power.shape, np.complex128)
+    for selection in _bounded_grid_selections(grid.power.shape, _RESULT_BLOCK_CELLS):
+        result[selection] = grid.rcs_slice(selection)
+    return result
+
+
+def _merge_interpolated_phase(power, phase, field):
+    """Apply coherent interpolation where phase exists, retaining power elsewhere."""
+    for selection in _bounded_grid_selections(power.shape, _RESULT_BLOCK_CELLS):
+        values = field[selection]
+        valid = np.isfinite(values.real) & np.isfinite(values.imag)
+        power_block, phase_block = power[selection], phase[selection]
+        power_block[valid] = np.abs(values[valid]) ** 2
+        phase_block[valid] = np.angle(values[valid])
+
+
+def _mask_result_axis(values, axis, excluded, missing):
+    for selection in _bounded_grid_selections(values.shape, _RESULT_BLOCK_CELLS):
+        mask = excluded[selection[axis]]
+        if np.any(mask):
+            block_selection = [slice(None)] * values.ndim
+            block_selection[axis] = mask
+            values[selection][tuple(block_selection)] = missing
 
 
 class GridAxesMixin:
@@ -44,15 +81,20 @@ class GridAxesMixin:
             # cannot encode solver-normalized amplitudes, so retain canonical
             # response samples instead and leave the frequency issue to Audit.
             if np.all(old > 0.0):
-                if raw_in_samples:
-                    field = np.asarray(samples["rcs"], dtype=np.complex128)
-                else:
-                    field = (np.asarray(extra["rcs_amp_real"], dtype=np.float64)
-                             + 1j * np.asarray(extra["rcs_amp_imag"], dtype=np.float64))
+                shape = samples["rcs"].shape if raw_in_samples else np.shape(extra["rcs_amp_real"])
+                field = allocate_result(shape, np.complex128)
                 k = 2.0 * np.pi * self._frequency_value_to_hz(old) / C0
-                field = field * (1.0 / (2.0 * np.sqrt(k)))[None, None, :, None]
-                invalid = ~np.isfinite(field.real) | ~np.isfinite(field.imag)
-                field[invalid] = np.nan + 1j * np.nan
+                normalization = 1.0 / (2.0 * np.sqrt(k))
+                for selection in _bounded_grid_selections(shape, _RESULT_BLOCK_CELLS):
+                    if raw_in_samples:
+                        values = np.asarray(samples["rcs"][selection], dtype=np.complex128)
+                    else:
+                        values = (np.asarray(extra["rcs_amp_real"][selection], dtype=np.float64)
+                                  + 1j * np.asarray(extra["rcs_amp_imag"][selection], dtype=np.float64))
+                    values = values * normalization[selection[2]][None, None, :, None]
+                    invalid = ~np.isfinite(values.real) | ~np.isfinite(values.imag)
+                    values[invalid] = np.nan + 1j * np.nan
+                    field[selection] = values
                 samples = {"rcs": field}
             elif raw_in_samples:
                 raise ValueError(
@@ -64,14 +106,20 @@ class GridAxesMixin:
                 "normalized response retained; raw solver encoding removed because relabeled frequencies are nonpositive"
             )
             return extra, samples
-        scale = np.sqrt(new / old)[None, None, :, None]
+        scale = np.sqrt(new / old)
         if raw_in_samples:
             field = samples["rcs"]
-            field *= scale
+            for selection in _bounded_grid_selections(field.shape, _RESULT_BLOCK_CELLS):
+                field[selection] *= scale[selection[2]][None, None, :, None]
             samples = dict(samples, rcs=field)
         else:
             for key in ("rcs_amp_real", "rcs_amp_imag"):
-                extra[key] = np.asarray(extra[key], dtype=np.float64) * scale
+                original = extra[key]
+                updated = allocate_result(np.shape(original), np.float64)
+                for selection in _bounded_grid_selections(updated.shape, _RESULT_BLOCK_CELLS):
+                    updated[selection] = (np.asarray(original[selection], dtype=np.float64)
+                                          * scale[selection[2]][None, None, :, None])
+                extra[key] = updated
         extra["frequency_relabel_normalization"] = (
             "raw sigma_2d solver amplitudes rescaled to preserve normalized response"
         )
@@ -104,6 +152,7 @@ class GridAxesMixin:
         ))
         return int(96 * largest + 64 * axis_cells + 4096)
 
+    @dataset_operation('edit_axis_value')
     def edit_axis_value(self, name, index, value):
         """Return a grid with one safely edited axis value.
 
@@ -202,7 +251,7 @@ class GridAxesMixin:
             new_text = f"{new_value:g}"
 
         samples = self._sample_kwargs(
-            transform=(lambda array: np.take(array, order, axis=axis_index))
+            transform=(lambda array: take_result(array, order, axis=axis_index))
             if reordered else None
         )
 
@@ -233,7 +282,7 @@ class GridAxesMixin:
                     extra_array.ndim >= 4
                     and tuple(extra_array.shape[:4]) == original_shape
                 ):
-                    edited_extra[key] = np.take(
+                    edited_extra[key] = take_result(
                         extra_array, order, axis=axis_index
                     )
                     continue
@@ -304,6 +353,7 @@ class GridAxesMixin:
         unit = self._supported_unit(axis_name, _ANGLE_UNITS, "deg")
         return float(np.deg2rad(numeric)) if unit == "rad" else numeric
 
+    @dataset_operation('align_to')
     def align_to(self, other, mode="exact"):
         """Align this grid to another grid's axes.
 
@@ -407,7 +457,7 @@ class GridAxesMixin:
                 **self._sample_kwargs(selection),
                 rcs_domain="power_phase",
                 extra=self._exact_transform_extra(
-                    lambda value: value[selection],
+                    lambda value: select_result(value, selection),
                     coordinate_change=("align-intersect-relabel" if relabeled else None),
                 ),
                 _adopt_clean_arrays=True,
@@ -430,8 +480,8 @@ class GridAxesMixin:
             if new.min() < old.min() or new.max() > old.max():
                 raise ValueError("interp would require extrapolation")
         complex_storage = self.storage_kind == "complex"
-        power_interp = None if complex_storage else np.array(self.power, copy=True)
-        complex_interp = np.asarray(self.rcs, dtype=np.complex128)
+        power_interp = None if complex_storage else copy_result(self.power)
+        complex_interp = _normalized_complex_result(self)
         for axis, old, new in steps:
             if power_interp is not None:
                 power_interp = self._interp_real_axis(
@@ -440,16 +490,13 @@ class GridAxesMixin:
             complex_interp = self._interp_complex_axis(
                 complex_interp, old, new, axis
             )
-        complex_valid = np.isfinite(complex_interp.real) & np.isfinite(
-            complex_interp.imag
-        )
         if complex_storage:
             samples = {"rcs": complex_interp}
         else:
-            phase_interp = np.full(power_interp.shape, np.nan, dtype=np.float64)
-            power_interp = np.asarray(power_interp, dtype=np.float64)
-            power_interp[complex_valid] = np.abs(complex_interp[complex_valid]) ** 2
-            phase_interp[complex_valid] = np.angle(complex_interp[complex_valid])
+            phase_interp = allocate_result(power_interp.shape, np.float64, fill=np.nan)
+            power_interp = (power_interp if power_interp.dtype == np.float64
+                            else copy_result(power_interp, dtype=np.float64))
+            _merge_interpolated_phase(power_interp, phase_interp, complex_interp)
             samples = {"rcs_power": power_interp, "rcs_phase": phase_interp}
         interp_extra = self._derived_response_extra(
             operation="align-interpolate", coherent=True
@@ -465,6 +512,7 @@ class GridAxesMixin:
             **samples,
             rcs_domain="power_phase",
             extra=interp_extra,
+            _adopt_clean_arrays=True,
         )
 
     @staticmethod
@@ -523,11 +571,20 @@ class GridAxesMixin:
             out=np.zeros_like(x_new, dtype=float),
             where=denom != 0.0,
         )
-        reshape = (len(x_new),) + (1,) * (moved.ndim - 1)
-        w = weight.reshape(reshape)
-        out = moved[left] * (1.0 - w) + moved[right] * w
-        return np.moveaxis(out.astype(moved.dtype, copy=False), 0, axis)
+        output_shape = list(np.shape(data))
+        output_shape[axis] = len(x_new)
+        output = allocate_result(output_shape, moved.dtype)
+        out = np.moveaxis(output, axis, 0)
+        for selection in _bounded_grid_selections(out.shape, _RESULT_BLOCK_CELLS):
+            targets = selection[0]
+            reshape = (targets.stop - targets.start,) + (1,) * (moved.ndim - 1)
+            w = weight[targets].reshape(reshape)
+            low = (left[targets],) + selection[1:]
+            high = (right[targets],) + selection[1:]
+            out[selection] = moved[low] * (1.0 - w) + moved[high] * w
+        return output
 
+    @dataset_operation('interpolate_axis')
     def interpolate_axis(self, axis_name, new_values, *, max_gap=None, support="interpolate"):
         """Linearly interpolate the grid onto new values along one numeric axis.
 
@@ -563,30 +620,25 @@ class GridAxesMixin:
             power_interp = self._interp_real_axis(
                 self.power, old_axes[axis_idx], new_arr, axis_idx
             )
-            power_interp = np.asarray(power_interp, dtype=np.float64)
-            phase_interp = np.full(power_interp.shape, np.nan, dtype=np.float64)
+            power_interp = (power_interp if power_interp.dtype == np.float64
+                            else copy_result(power_interp, dtype=np.float64))
+            phase_interp = allocate_result(power_interp.shape, np.float64, fill=np.nan)
         # Unknown phase cannot produce usable complex interpolation. Retained
         # raw amplitudes still take precedence even when rcs_phase is unknown.
         has_phase = self.phase_coverage() != "none"
         if has_phase or self._complete_authoritative_raw_arrays() is not None:
             complex_interp = self._interp_complex_axis(
-                np.asarray(self.rcs, dtype=np.complex128),
+                _normalized_complex_result(self),
                 old_axes[axis_idx], new_arr, axis_idx,
             )
-            complex_valid = np.isfinite(complex_interp.real) & np.isfinite(
-                complex_interp.imag
-            )
             if not complex_storage:
-                power_interp[complex_valid] = np.abs(complex_interp[complex_valid]) ** 2
-                phase_interp[complex_valid] = np.angle(complex_interp[complex_valid])
+                _merge_interpolated_phase(power_interp, phase_interp, complex_interp)
         if np.any(excluded):
-            selection = [slice(None)] * 4
-            selection[axis_idx] = excluded
             if complex_storage:
-                complex_interp[tuple(selection)] = np.nan + 1j * np.nan
+                _mask_result_axis(complex_interp, axis_idx, excluded, np.nan + 1j * np.nan)
             else:
-                power_interp[tuple(selection)] = np.nan
-                phase_interp[tuple(selection)] = np.nan
+                _mask_result_axis(power_interp, axis_idx, excluded, np.nan)
+                _mask_result_axis(phase_interp, axis_idx, excluded, np.nan)
         samples = ({"rcs": complex_interp} if complex_storage else
                    {"rcs_power": power_interp, "rcs_phase": phase_interp})
         coverage_values = complex_interp if complex_storage else power_interp
@@ -620,6 +672,7 @@ class GridAxesMixin:
             **samples,
             rcs_domain="power_phase",
             extra=interp_extra,
+            _adopt_clean_arrays=True,
         )
 
     @staticmethod
@@ -905,6 +958,7 @@ class GridAxesMixin:
             raise ValueError("at least one grid is required")
         return checked
 
+    @dataset_operation('axis_crop')
     def axis_crop(
         self,
         *,
@@ -986,7 +1040,7 @@ class GridAxesMixin:
             self.polarizations[p_idx],
             **self._sample_kwargs(selection),
             extra=self._exact_transform_extra(
-                lambda value: value[selection]
+                lambda value: select_result(value, selection)
             ),
             _adopt_clean_arrays=True,
         )
@@ -1136,6 +1190,7 @@ class GridAxesMixin:
         existing[take] = incoming[take]
         return conflict
 
+    @dataset_operation('mirror_about_azimuth')
     def mirror_about_azimuth(self, azimuth_deg: float):
         """Mirror azimuth axis about a reference angle and return a new grid.
 
@@ -1153,16 +1208,17 @@ class GridAxesMixin:
             np.array(self.elevations, copy=True),
             np.array(self.frequencies, copy=True),
             np.array(self.polarizations, copy=True),
-            **self._sample_kwargs(transform=lambda value: np.take(value, order, axis=0)),
+            **self._sample_kwargs(transform=lambda value: take_result(value, order, axis=0)),
             rcs_domain="power_phase",
             extra=self._exact_transform_extra(
-                lambda value: np.take(value, order, axis=0),
+                lambda value: take_result(value, order, axis=0),
                 coordinate_change="mirror-azimuth",
                 preserve_angular_contract=False,
             ),
             _adopt_clean_arrays=True,
         )
 
+    @dataset_operation('swap_elevation_azimuth')
     def swap_elevation_azimuth(self):
         """Swap the elevation and azimuth axes and return a new grid."""
         swapped_units = copy.deepcopy(self.units)
@@ -1186,6 +1242,7 @@ class GridAxesMixin:
             _adopt_clean_arrays=True,
         )
 
+    @dataset_operation('convert_axis_units')
     def convert_axis_units(
         self,
         *,
@@ -1251,6 +1308,7 @@ class GridAxesMixin:
             _adopt_clean_arrays=True,
         )
 
+    @dataset_operation('shift_azimuth')
     def shift_azimuth(self, delta_deg: float):
         """Shift azimuth axis by a constant offset and return a new grid."""
         delta = self._angle_value_from_degrees(delta_deg, "azimuth")
@@ -1269,6 +1327,7 @@ class GridAxesMixin:
             _adopt_clean_arrays=True,
         )
 
+    @dataset_operation('wrap_azimuth')
     def wrap_azimuth(
         self, mode: str, *, seam_conflict: str = "first", return_report=False
     ):
@@ -1321,8 +1380,8 @@ class GridAxesMixin:
             [wrapped[group[0]] for group in groups], dtype=float
         )
         output_shape = (len(groups),) + self.power.shape[1:]
-        output_power = np.full(output_shape, np.nan, dtype=self.power.dtype)
-        output_phase = np.full(output_shape, np.nan, dtype=self.phase.dtype)
+        output_power = allocate_result(output_shape, self.power.dtype, fill=np.nan)
+        output_phase = allocate_result(output_shape, self.phase.dtype, fill=np.nan)
         raw_pair = self._complete_authoritative_raw_arrays()
         preserve_raw = raw_pair is not None
         # Seam equivalence still uses the established power/phase tolerances,
@@ -1336,54 +1395,49 @@ class GridAxesMixin:
                     and payload["storage_domain"] == "physical"):
                 source_complex = payload["rcs_complex"]
         output_complex = (
-            np.full(output_shape, complex(np.nan, np.nan), dtype=source_complex.dtype)
+            allocate_result(output_shape, source_complex.dtype, fill=complex(np.nan, np.nan))
             if source_complex is not None else None
         )
         if preserve_raw:
             raw_real = np.asarray(raw_pair[0], dtype=np.float64)
             raw_imag = np.asarray(raw_pair[1], dtype=np.float64)
-            output_raw_real = np.full(output_shape, np.nan, dtype=np.float64)
-            output_raw_imag = np.full(output_shape, np.nan, dtype=np.float64)
+            output_raw_real = allocate_result(output_shape, np.float64, fill=np.nan)
+            output_raw_imag = allocate_result(output_shape, np.float64, fill=np.nan)
         conflicting_coordinates = 0
         discarded_cells = 0
         for output_index, group in enumerate(groups):
             context = f"azimuth wrap at {unique_vals[output_index]:.12g} {unit}"
-            group_conflict = np.zeros(output_shape[1:], dtype=bool)
-            # Source-axis order sets precedence: a later alias only fills
-            # cells the earlier sample left missing.
-            for source_index in sorted(group):
-                incoming_power = self.power[source_index]
-                if output_complex is not None:
-                    take = (
-                        ~np.isfinite(output_power[output_index])
-                        & np.isfinite(incoming_power)
-                    )
-                    output_complex[output_index][take] = source_complex[source_index][take]
-                group_conflict |= self._merge_equivalent_sample_blocks(
-                    output_power[output_index],
-                    output_phase[output_index],
-                    incoming_power,
-                    self.phase[source_index],
-                    context=context,
-                    keep_existing_on_conflict=keep_first,
-                )
-                if preserve_raw:
-                    group_conflict |= self._merge_equivalent_raw_blocks(
-                        output_raw_real[output_index],
-                        output_raw_imag[output_index],
-                        raw_real[source_index],
-                        raw_imag[source_index],
-                        context=context,
+            conflict_count = 0
+            for tile in _bounded_grid_selections(output_shape[1:], _RESULT_BLOCK_CELLS):
+                target = (output_index,) + tile
+                group_conflict = np.zeros(tuple(part.stop - part.start for part in tile), dtype=bool)
+                # Source-axis order preserves the earlier seam-alias precedence.
+                for source_index in sorted(group):
+                    source = (source_index,) + tile
+                    incoming_power = self.power[source]
+                    if output_complex is not None:
+                        take = ~np.isfinite(output_power[target]) & np.isfinite(incoming_power)
+                        output_complex[target][take] = source_complex[source][take]
+                    group_conflict |= self._merge_equivalent_sample_blocks(
+                        output_power[target], output_phase[target], incoming_power,
+                        self.phase[source], context=context,
                         keep_existing_on_conflict=keep_first,
                     )
-            conflict_count = int(np.count_nonzero(group_conflict))
+                    if preserve_raw:
+                        group_conflict |= self._merge_equivalent_raw_blocks(
+                            output_raw_real[target], output_raw_imag[target],
+                            raw_real[source], raw_imag[source], context=context,
+                            keep_existing_on_conflict=keep_first,
+                        )
+                conflict_count += int(np.count_nonzero(group_conflict))
             if conflict_count:
                 conflicting_coordinates += 1
                 discarded_cells += conflict_count
         if preserve_raw:
-            unmodeled = ~np.isfinite(output_power)
-            output_raw_real[unmodeled] = np.nan
-            output_raw_imag[unmodeled] = np.nan
+            for selection in _bounded_grid_selections(output_shape, _RESULT_BLOCK_CELLS):
+                unmodeled = ~np.isfinite(output_power[selection])
+                output_raw_real[selection][unmodeled] = np.nan
+                output_raw_imag[selection][unmodeled] = np.nan
         wrapped_extra = self._exact_transform_extra(
             coordinate_change="wrap-azimuth", preserve_raw=False
         )
@@ -1416,6 +1470,7 @@ class GridAxesMixin:
             rcs_domain="power_phase",
             history=history,
             extra=wrapped_extra,
+            _adopt_clean_arrays=True,
         )
         if not return_report:
             return result
@@ -1429,6 +1484,7 @@ class GridAxesMixin:
         }
         return result, report
 
+    @dataset_operation('wrap_phase')
     def wrap_phase(self, mode: str):
         """Wrap stored phase while preserving power and the complex field.
 
@@ -1478,6 +1534,7 @@ class GridAxesMixin:
             _adopt_clean_arrays=True,
         )
 
+    @dataset_operation('round_axes')
     def round_axes(
         self, decimals: int, *, azimuths=True, elevations=True, frequencies=True
     ):
@@ -1535,6 +1592,7 @@ class GridAxesMixin:
         """Round frequency coordinates without resampling or creating duplicates."""
         return self.round_axes(decimals, azimuths=False, elevations=False)
 
+    @dataset_operation('shift_elevation')
     def shift_elevation(self, delta_deg: float):
         """Shift elevation axis by a constant offset and return a new grid."""
         delta = self._angle_value_from_degrees(delta_deg, "elevation")

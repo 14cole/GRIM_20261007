@@ -201,9 +201,14 @@ class FlatCsvSchemaTest(unittest.TestCase):
             )
         self.assertEqual(actual_cells, cells)
         self.assertEqual(dense_payload, cells * 16)
-        # Two input float64 arrays + clean-power float64 + bool mask +
-        # float64 gather + float64 ufunc output = 41 bytes per dense cell.
-        self.assertEqual(estimated_peak, cells * 41)
+        # Include the retained components, complex result, bounded conversion
+        # workspace, and coordinate/parser bookkeeping. The old 41-byte rule
+        # missed complex-conversion copies and underestimated measured peaks.
+        self.assertGreaterEqual(estimated_peak, cells * (16 + 16 + 64))
+        _, _, large_peak = flat_schema._preflight_dense_grid(
+            (200, 100, 100, 1), 1, check_budget=False)
+        large_cells = 200 * 100 * 100
+        self.assertLess(large_peak, large_cells * 41)
 
     def test_dense_duplicate_tracker_preserves_first_line_diagnostics(self):
         identical = self._write(

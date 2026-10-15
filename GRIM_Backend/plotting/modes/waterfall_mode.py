@@ -8,7 +8,7 @@ from GRIM_Backend.plotting.image_grid import axis_support, image_grid, native_sa
 
 
 def render(self) -> None:
-    from GRIM_Backend.plotting.image_analysis import AXES, AXIS_ATTRIBUTES, ImageRecord, heatmap_display_plane, compact_metadata
+    from GRIM_Backend.plotting.image_analysis import AXES, AXIS_ATTRIBUTES, ImageRecord, compact_metadata
     self.last_plot_mode = "waterfall"
     self._start_plot_render()
     datasets = self._selected_datasets()
@@ -67,186 +67,204 @@ def render(self) -> None:
     try:
         if panel_count > common.MAX_WATERFALL_PANELS:
             raise ValueError(f"selection creates {panel_count} panels; select fewer cuts or use mean aggregation")
-        common.validate_synchronous_plot_workload(operation="Waterfall", peak_slice_cells=peak_cells, total_cells=total_source)
         common.validate_aggregate_image_cells(total_display, panel_count=panel_count, operation="Waterfall")
     except ValueError as exc:
         self.status.showMessage(f"Plot blocked: {exc}.")
         return
-    panels = []
-    for name, dataset, indices, pol_ids in plans:
-        nx = np.asarray(getattr(dataset, AXIS_ATTRIBUTES[x_axis])[indices[x_axis]])
-        ny = np.asarray(getattr(dataset, AXIS_ATTRIBUTES[y_axis])[indices[y_axis]])
-        x = self._plot_axis_values(reference, dataset, x_axis, nx)
-        y = self._plot_axis_values(reference, dataset, y_axis, ny)
-        x_width = native_sample_width(reference, dataset, x_axis)
-        y_width = native_sample_width(reference, dataset, y_axis)
-        for cut_index in ([None] if aggregate else indices[remaining]):
-            native_ids = [indices[axis] for axis in AXES] + [pol_ids]
-            display = heatmap_display_plane(dataset,native_ids,x_axis,y_axis,
-                remaining_index=cut_index,phase=phase,linear=self._plot_scale_is_linear())
-            display = np.where(np.isfinite(display), display, np.nan)
-            if not np.any(np.isfinite(display)):
-                continue
-            bx, by, bd = self._bounded_plot_image(x, y, display)
-            snapshot = self._native_image_snapshot(x, y, display, reduced=bd.shape != display.shape)
-            supported = image_grid(x, y, display.T, x_width=x_width, y_width=y_width,
-                target_shape=bd.T.shape, return_samples=snapshot is False)
-            x_edges, y_edges, drawn = supported[:3]
-            display_samples = supported[3] if snapshot is False else None
-            remaining_values = getattr(dataset, AXIS_ATTRIBUTES[remaining])[indices[remaining]]
-            unit = self._plot_axis_unit(reference, remaining)
-            label = (f"{'Circular phase mean' if phase else 'Mean linear display quantity'} over {len(remaining_values)} {remaining} samples"
-                     if aggregate else f"{remaining.capitalize()} {self._plot_axis_values(reference, dataset, remaining, [getattr(dataset, AXIS_ATTRIBUTES[remaining])[cut_index]])[0]:g} {unit}")
-            title = f"{name} | Pol {dataset.polarizations[pol_ids[0]]} | {label} | {self._display_unit([(name,dataset)])}"
-            short_label = f"Mean {remaining} (n={len(remaining_values)})" if aggregate else label
-            panels.append(dict(name=title, short_title=f"{name[:20]} | {dataset.polarizations[pol_ids[0]]}\n{short_label} | {self._display_unit([(name,dataset)])}",dataset=dataset, x=bx, y=by, display=bd, snapshot=snapshot,
-                native_x=x, native_y=y, native_display=display if snapshot is None else None, drawn=drawn,
-                x_edges=x_edges, y_edges=y_edges, x_width=x_width, y_width=y_width,
-                display_samples=display_samples,
-                metadata={"kind": "heatmap", "source_name":name, "polarization": str(dataset.polarizations[pol_ids[0]]),
-                    "frequency_aggregation":bool(aggregate and remaining == "frequency"),
-                    "remaining_selection": (remaining, "mean" if aggregate else float(getattr(dataset, AXIS_ATTRIBUTES[remaining])[cut_index]), common.axis_unit(dataset, remaining)),
-                    "coordinate_system": dataset.units.get("angular_coordinate_system", ""),
-                    "source_units": compact_metadata(dataset.units), "source_metadata": compact_metadata(dataset.extra),
-                    "frequency_values_hz": np.asarray(dataset._frequency_value_to_hz(dataset.frequencies[indices['frequency']])).tolist()}))
-    if not panels:
-        self._show_plot_status("No finite selected samples for this waterfall.")
-        return
-    old_cuts = getattr(self.plot_figure, "_grim_linked_cuts", None)
-    if old_cuts is not None:
-        old_cuts.disconnect()
-    self._remove_colorbar()
-    self._release_native_plot_samples()
-    self.plot_figure.clear()
-    self.plot_figure.set_facecolor(self._current_plot_bg())
-    self.plot_figure.set_layout_engine("constrained")
-    shared = self.chk_colorbar_shared.isChecked()
-    show_colorbar = self.chk_colorbar.isChecked()
-    colorbar_axes = []
-    cut_axes = [(None, None)] * len(panels)
-    if show_cuts:
-        # Each marginal shares a grid column/row and the physical axis of its
-        # image. Explicit colorbar slots keep colorbars from shrinking just
-        # the image and breaking that alignment after a draw or resize.
-        columns = min(3, int(np.ceil(np.sqrt(len(panels)))))
-        rows = int(np.ceil(len(panels) / columns))
-        outer = self.plot_figure.add_gridspec(
-            rows, columns + int(show_colorbar and shared),
-            width_ratios=[1.] * columns + ([.04] if show_colorbar and shared else []))
-        panel_grids = []
-        for index in range(len(panels)):
-            widths = [4.] + ([1.4] if show_vertical else [])
-            if show_colorbar and not shared:
-                widths.append(.16)
-            panel_grids.append(outer[index // columns, index % columns].subgridspec(
-                1 + int(show_horizontal), len(widths), width_ratios=widths,
-                height_ratios=[3., 1.] if show_horizontal else [1.]))
-        axes = [self.plot_figure.add_subplot(grid[0, 0]) for grid in panel_grids]
-        cut_axes = []
-        for ax, grid in zip(axes, panel_grids):
-            horizontal = self.plot_figure.add_subplot(grid[1, 0], sharex=ax) if show_horizontal else None
-            vertical = self.plot_figure.add_subplot(grid[0, 1], sharey=ax) if show_vertical else None
-            cut_axes.append((horizontal, vertical))
-            for cut in (horizontal, vertical):
-                if cut is not None:
-                    self._style_axes(cut)
-                    cut.tick_params(labelsize=7)
-            if show_colorbar and not shared:
-                colorbar_axes.append(self.plot_figure.add_subplot(grid[0, -1]))
-        if show_colorbar and shared:
-            colorbar_axes.append(self.plot_figure.add_subplot(outer[:, -1]))
-    else:
-        columns = min(3,int(np.ceil(np.sqrt(len(panels)))))
-        slots = self.plot_figure.subplots(int(np.ceil(len(panels)/columns)),columns,squeeze=False).ravel()
-        axes = list(slots[:len(panels)])
-        for extra in slots[len(panels):]:
-            self.plot_figure.delaxes(extra)
-    self.plot_axes, self.plot_ax = axes, axes[0]
-    zmin, zmax = self.spin_plot_zmin.value(), self.spin_plot_zmax.value()
-    limits = common.finite_data_limits(p["display"] for p in panels) if shared else None
-    vmin, vmax = (zmin, zmax) if zmin < zmax else (limits if limits else (None, None))
-    meshes, records = [], []
-    for panel_index,(ax, panel) in enumerate(zip(axes, panels),1):
-        self._style_axes(ax)
-        image = panel["drawn"]
-        mesh = ax.pcolormesh(panel["x_edges"], panel["y_edges"], image, shading="flat", cmap=self._effective_colormap(), vmin=vmin, vmax=vmax)
-        mesh._grim_rectilinear_data = (panel["x_edges"], panel["y_edges"], mesh.get_array().reshape(image.shape))
-        self._attach_native_image_snapshot(mesh, panel["snapshot"])
-        record_values = getattr(mesh, "_grim_native_rectilinear_data", None)
-        if record_values is not None:
-            rx, ry, rv = panel["native_x"], panel["native_y"], record_values[2]
-        elif panel["snapshot"] is False:
-            samples = panel["display_samples"]
-            rx, ry, rv = samples["x"], samples["y"], samples["values"]
-            panel["metadata"].update({key: samples[key] for key in ("x_cut_breaks", "y_cut_breaks")})
+    from ..requests import (PlotPlan, PlotRequest, PlotResult, check_cancel, prepare_waterfall_image)
+    request = PlotRequest("waterfall", reference,
+        tuple(PlotPlan(name, dataset, tuple(indices[axis] for axis in AXES) + (pol_ids,))
+              for name, dataset, indices, pol_ids in plans),
+        phase=phase, scale=self._plot_scale_mode(), options={"axes": (x_axis, y_axis)})
+    display_units = {id(dataset): self._display_unit([(name, dataset)]) for name, dataset in datasets}
+
+    def compute(cancel):
+        panels, notes = [], []
+        try:
+            for plan, (name, dataset, indices, pol_ids) in zip(request.plans, plans):
+                check_cancel(cancel)
+                nx = np.asarray(getattr(dataset, AXIS_ATTRIBUTES[x_axis])[indices[x_axis]])
+                ny = np.asarray(getattr(dataset, AXIS_ATTRIBUTES[y_axis])[indices[y_axis]])
+                x = common.values_for_display(reference, dataset, x_axis, nx)
+                y = common.values_for_display(reference, dataset, y_axis, ny)
+                x_width = native_sample_width(reference, dataset, x_axis)
+                y_width = native_sample_width(reference, dataset, y_axis)
+                for cut_index in ([None] if aggregate else indices[remaining]):
+                    prepared = prepare_waterfall_image(request, plan, x, y,
+                        remaining_index=cut_index, x_width=x_width, y_width=y_width, cancel=cancel)
+                    if prepared is None:
+                        continue
+                    snapshot = prepared["snapshot"]
+                    if snapshot is not None:
+                        notes.append("Image shows block maxima; native cell probes use original samples. Numerical exports use full data; figure exports use this display.")
+                    if snapshot is False:
+                        notes.append("Native image snapshot unavailable; hover shows displayed block maxima only.")
+                    remaining_values = getattr(dataset, AXIS_ATTRIBUTES[remaining])[indices[remaining]]
+                    unit = common.axis_unit(reference, remaining)
+                    label = (f"{'Circular phase mean' if phase else 'Mean linear display quantity'} over {len(remaining_values)} {remaining} samples"
+                             if aggregate else f"{remaining.capitalize()} {common.values_for_display(reference, dataset, remaining, [getattr(dataset, AXIS_ATTRIBUTES[remaining])[cut_index]])[0]:g} {unit}")
+                    title = f"{name} | Pol {dataset.polarizations[pol_ids[0]]} | {label} | {display_units[id(dataset)]}"
+                    short_label = f"Mean {remaining} (n={len(remaining_values)})" if aggregate else label
+                    panels.append(dict(name=title, short_title=f"{name[:20]} | {dataset.polarizations[pol_ids[0]]}\n{short_label} | {display_units[id(dataset)]}",dataset=dataset, **prepared,
+                        metadata={"kind": "heatmap", "source_name":name, "polarization": str(dataset.polarizations[pol_ids[0]]),
+                            "frequency_aggregation":bool(aggregate and remaining == "frequency"),
+                            "remaining_selection": (remaining, "mean" if aggregate else float(getattr(dataset, AXIS_ATTRIBUTES[remaining])[cut_index]), common.axis_unit(dataset, remaining)),
+                            "coordinate_system": dataset.units.get("angular_coordinate_system", ""),
+                            "source_units": compact_metadata(dataset.units), "source_metadata": compact_metadata(dataset.extra),
+                            "frequency_values_hz": np.asarray(dataset._frequency_value_to_hz(dataset.frequencies[indices['frequency']])).tolist()}))
+            check_cancel(cancel)
+            return PlotResult(request, panels, notes=list(dict.fromkeys(notes)))
+        except BaseException:
+            PlotResult(request, panels).close()
+            raise
+
+    def publish(result):
+        panels = result.items
+        for note in result.notes:
+            self._note_plot_render(note)
+        if not panels:
+            self._show_plot_status("No finite selected samples for this waterfall.")
+            return
+        old_cuts = getattr(self.plot_figure, "_grim_linked_cuts", None)
+        if old_cuts is not None:
+            old_cuts.disconnect()
+        self._remove_colorbar()
+        self._release_native_plot_samples()
+        self.plot_figure.clear()
+        self.plot_figure.set_facecolor(self._current_plot_bg())
+        self.plot_figure.set_layout_engine("constrained")
+        shared = self.chk_colorbar_shared.isChecked()
+        show_colorbar = self.chk_colorbar.isChecked()
+        colorbar_axes = []
+        cut_axes = [(None, None)] * len(panels)
+        if show_cuts:
+            # Each marginal shares a grid column/row and the physical axis of its
+            # image. Explicit colorbar slots keep colorbars from shrinking just
+            # the image and breaking that alignment after a draw or resize.
+            columns = min(3, int(np.ceil(np.sqrt(len(panels)))))
+            rows = int(np.ceil(len(panels) / columns))
+            outer = self.plot_figure.add_gridspec(
+                rows, columns + int(show_colorbar and shared),
+                width_ratios=[1.] * columns + ([.04] if show_colorbar and shared else []))
+            panel_grids = []
+            for index in range(len(panels)):
+                widths = [4.] + ([1.4] if show_vertical else [])
+                if show_colorbar and not shared:
+                    widths.append(.16)
+                panel_grids.append(outer[index // columns, index % columns].subgridspec(
+                    1 + int(show_horizontal), len(widths), width_ratios=widths,
+                    height_ratios=[3., 1.] if show_horizontal else [1.]))
+            axes = [self.plot_figure.add_subplot(grid[0, 0]) for grid in panel_grids]
+            cut_axes = []
+            for ax, grid in zip(axes, panel_grids):
+                horizontal = self.plot_figure.add_subplot(grid[1, 0], sharex=ax) if show_horizontal else None
+                vertical = self.plot_figure.add_subplot(grid[0, 1], sharey=ax) if show_vertical else None
+                cut_axes.append((horizontal, vertical))
+                for cut in (horizontal, vertical):
+                    if cut is not None:
+                        self._style_axes(cut)
+                        cut.tick_params(labelsize=7)
+                if show_colorbar and not shared:
+                    colorbar_axes.append(self.plot_figure.add_subplot(grid[0, -1]))
+            if show_colorbar and shared:
+                colorbar_axes.append(self.plot_figure.add_subplot(outer[:, -1]))
         else:
-            rx, ry, rv = panel["native_x"], panel["native_y"], panel["native_display"].T
-        ds = panel["dataset"]
-        record = ImageRecord(panel["name"], rx, ry, rv, x_axis, y_axis,
-            self._plot_axis_unit(reference, x_axis), self._plot_axis_unit(reference, y_axis),
-            "phase" if phase else ds.linear_quantity() + ("_normalized_frequency_mean" if aggregate and remaining == "frequency" and ds.default_log_unit()=="dBke" and not self._plot_scale_is_linear() else ""), self._display_unit([(panel['name'], ds)]),
-            logarithmic=not phase and not self._plot_scale_is_linear(), phase=phase,
-            notes=("Display block maxima; native snapshot unavailable.",) if panel["snapshot"] is False else (), metadata=panel["metadata"])
-        mesh._grim_image_record = record
-        if panel["snapshot"] is not False:
-            # Native probes use the same local sample support as the display;
-            # no midpoint cell may turn an unmeasured sector into a return.
-            xs = axis_support(rx, width=panel["x_width"])
-            ys = axis_support(ry, width=panel["y_width"])
-            def probe(x, y, artist=mesh, xs=xs, ys=ys):
-                current = getattr(artist, "_grim_image_record", None)
-                ix, iy = xs.index(x), ys.index(y)
-                if current is None or ix is None or iy is None:
-                    return None
-                value = current.values[iy, ix]
-                return float(value) if np.isfinite(value) else None
-            mesh._grim_native_probe = probe
-        records.append(record)
-        meshes.append(mesh)
-        compact = show_cuts or len(panels)>1
-        ax.set_title((f"{panel_index} · " + panel["short_title"]) if compact else panel["name"], color=self._current_plot_text(),fontsize=9 if compact else 11)
-        ax.set_xlabel(self._plot_axis_label(reference, x_axis),fontsize=8 if compact else 10,labelpad=1)
-        ax.set_ylabel(self._plot_axis_label(reference, y_axis),fontsize=8 if compact else 10,labelpad=1)
-        ax.tick_params(labelsize=7 if compact else 10)
-        horizontal, vertical = cut_axes[panel_index - 1]
-        if horizontal is not None:
-            horizontal.set_xlabel(self._plot_axis_label(reference, x_axis), fontsize=8, labelpad=1)
-            ax.set_xlabel("")
-            ax.tick_params(labelbottom=False)
-        if vertical is not None:
-            # Keep one physical y scale beside the image; the shared scale
-            # still governs the vertical cut when limits or direction change.
-            vertical.tick_params(labelleft=False)
-    if show_colorbar:
-        if colorbar_axes:
-            self.plot_colorbars = ([self.plot_figure.colorbar(meshes[-1], cax=colorbar_axes[0])] if shared
-                else [self.plot_figure.colorbar(mesh, cax=cax) for mesh, cax in zip(meshes, colorbar_axes)])
-        else:
-            self.plot_colorbars = ([self.plot_figure.colorbar(meshes[-1], ax=axes)] if shared
-                else [self.plot_figure.colorbar(mesh, ax=ax) for mesh, ax in zip(meshes, axes)])
-        for index, colorbar in enumerate(self.plot_colorbars):
-            self._apply_colorbar_ticks(colorbar)
-            ds = datasets if shared else [(panels[index]["name"], panels[index]["dataset"])]
-            colorbar.set_label(self._display_axis_label(ds), color=self._current_plot_text())
-            colorbar.ax.tick_params(colors=self._current_plot_text())
-    if show_cuts or callable(getattr(controls, "bind", None)):
-        from GRIM_Backend.ui.image_analysis import LinkedImageCuts
-        def can_select():
-            busy = any(self._button_checked(getattr(self, role, None)) for role in ("btn_pan", "btn_zoom_box", "btn_markers"))
-            overlays = getattr(self, "spatial_overlays", None)
-            return not busy and not (overlays is not None and (
-                overlays.drawing is not None or overlays.drag is not None))
-        controller = LinkedImageCuts(self.plot_canvas,
-            list(zip(axes, cut_axes, records)), can_select=can_select)
-        self.plot_figure._grim_linked_cuts = controller
-        if callable(getattr(controls, "bind", None)):
-            controls.bind(controller)
-    for spin, value in ((self.spin_plot_xmin, min(p['x_edges'][0] for p in panels)),
-            (self.spin_plot_xmax, max(p['x_edges'][-1] for p in panels)),
-            (self.spin_plot_ymin, min(p['y_edges'][0] for p in panels)),
-            (self.spin_plot_ymax, max(p['y_edges'][-1] for p in panels))):
-        blocked = spin.blockSignals(True)
-        common.set_spin_value(spin, float(value))
-        spin.blockSignals(blocked)
-    self._apply_plot_limits()
-    self._show_plot_status("Waterfall updated." + (" Skipped: " + ", ".join(skipped) if skipped else ""))
+            columns = min(3,int(np.ceil(np.sqrt(len(panels)))))
+            slots = self.plot_figure.subplots(int(np.ceil(len(panels)/columns)),columns,squeeze=False).ravel()
+            axes = list(slots[:len(panels)])
+            for extra in slots[len(panels):]:
+                self.plot_figure.delaxes(extra)
+        self.plot_axes, self.plot_ax = axes, axes[0]
+        zmin, zmax = self.spin_plot_zmin.value(), self.spin_plot_zmax.value()
+        limits = common.finite_data_limits(p["display"] for p in panels) if shared else None
+        vmin, vmax = (zmin, zmax) if zmin < zmax else (limits if limits else (None, None))
+        meshes, records = [], []
+        for panel_index,(ax, panel) in enumerate(zip(axes, panels),1):
+            self._style_axes(ax)
+            image = panel["drawn"]
+            mesh = ax.pcolormesh(panel["x_edges"], panel["y_edges"], image, shading="flat", cmap=self._effective_colormap(), vmin=vmin, vmax=vmax)
+            mesh._grim_rectilinear_data = (panel["x_edges"], panel["y_edges"], mesh.get_array().reshape(image.shape))
+            self._attach_native_image_snapshot(mesh, panel["snapshot"])
+            record_values = getattr(mesh, "_grim_native_rectilinear_data", None)
+            if record_values is not None:
+                rx, ry, rv = panel["native_x"], panel["native_y"], record_values[2]
+            elif panel["snapshot"] is False:
+                samples = panel["display_samples"]
+                rx, ry, rv = samples["x"], samples["y"], samples["values"]
+                panel["metadata"].update({key: samples[key] for key in ("x_cut_breaks", "y_cut_breaks")})
+            else:
+                rx, ry, rv = panel["native_x"], panel["native_y"], panel["native_display"].T
+            ds = panel["dataset"]
+            record = ImageRecord(panel["name"], rx, ry, rv, x_axis, y_axis,
+                self._plot_axis_unit(reference, x_axis), self._plot_axis_unit(reference, y_axis),
+                "phase" if phase else ds.linear_quantity() + ("_normalized_frequency_mean" if aggregate and remaining == "frequency" and ds.default_log_unit()=="dBke" and not self._plot_scale_is_linear() else ""), self._display_unit([(panel['name'], ds)]),
+                logarithmic=not phase and not self._plot_scale_is_linear(), phase=phase,
+                notes=("Display block maxima; native snapshot unavailable.",) if panel["snapshot"] is False else (), metadata=panel["metadata"])
+            mesh._grim_image_record = record
+            if panel["snapshot"] is not False:
+                # Native probes use the same local sample support as the display;
+                # no midpoint cell may turn an unmeasured sector into a return.
+                xs = axis_support(rx, width=panel["x_width"])
+                ys = axis_support(ry, width=panel["y_width"])
+                def probe(x, y, artist=mesh, xs=xs, ys=ys):
+                    current = getattr(artist, "_grim_image_record", None)
+                    ix, iy = xs.index(x), ys.index(y)
+                    if current is None or ix is None or iy is None:
+                        return None
+                    value = current.values[iy, ix]
+                    return float(value) if np.isfinite(value) else None
+                mesh._grim_native_probe = probe
+            records.append(record)
+            meshes.append(mesh)
+            compact = show_cuts or len(panels)>1
+            ax.set_title((f"{panel_index} · " + panel["short_title"]) if compact else panel["name"], color=self._current_plot_text(),fontsize=9 if compact else 11)
+            ax.set_xlabel(self._plot_axis_label(reference, x_axis),fontsize=8 if compact else 10,labelpad=1)
+            ax.set_ylabel(self._plot_axis_label(reference, y_axis),fontsize=8 if compact else 10,labelpad=1)
+            ax.tick_params(labelsize=7 if compact else 10)
+            horizontal, vertical = cut_axes[panel_index - 1]
+            if horizontal is not None:
+                horizontal.set_xlabel(self._plot_axis_label(reference, x_axis), fontsize=8, labelpad=1)
+                ax.set_xlabel("")
+                ax.tick_params(labelbottom=False)
+            if vertical is not None:
+                # Keep one physical y scale beside the image; the shared scale
+                # still governs the vertical cut when limits or direction change.
+                vertical.tick_params(labelleft=False)
+        if show_colorbar:
+            if colorbar_axes:
+                self.plot_colorbars = ([self.plot_figure.colorbar(meshes[-1], cax=colorbar_axes[0])] if shared
+                    else [self.plot_figure.colorbar(mesh, cax=cax) for mesh, cax in zip(meshes, colorbar_axes)])
+            else:
+                self.plot_colorbars = ([self.plot_figure.colorbar(meshes[-1], ax=axes)] if shared
+                    else [self.plot_figure.colorbar(mesh, ax=ax) for mesh, ax in zip(meshes, axes)])
+            for index, colorbar in enumerate(self.plot_colorbars):
+                self._apply_colorbar_ticks(colorbar)
+                ds = datasets if shared else [(panels[index]["name"], panels[index]["dataset"])]
+                colorbar.set_label(self._display_axis_label(ds), color=self._current_plot_text())
+                colorbar.ax.tick_params(colors=self._current_plot_text())
+        if show_cuts or callable(getattr(controls, "bind", None)):
+            from GRIM_Backend.ui.image_analysis import LinkedImageCuts
+            def can_select():
+                busy = any(self._button_checked(getattr(self, role, None)) for role in ("btn_pan", "btn_zoom_box", "btn_markers"))
+                overlays = getattr(self, "spatial_overlays", None)
+                return not busy and not (overlays is not None and (
+                    overlays.drawing is not None or overlays.drag is not None))
+            controller = LinkedImageCuts(self.plot_canvas,
+                list(zip(axes, cut_axes, records)), can_select=can_select)
+            self.plot_figure._grim_linked_cuts = controller
+            context = getattr(self, "_plot_contexts", {}).get(getattr(self, "_active_plot_tab", None))
+            if context is not None:
+                context.session.own(controller)
+            if callable(getattr(controls, "bind", None)):
+                controls.bind(controller)
+        for spin, value in ((self.spin_plot_xmin, min(p['x_edges'][0] for p in panels)),
+                (self.spin_plot_xmax, max(p['x_edges'][-1] for p in panels)),
+                (self.spin_plot_ymin, min(p['y_edges'][0] for p in panels)),
+                (self.spin_plot_ymax, max(p['y_edges'][-1] for p in panels))):
+            blocked = spin.blockSignals(True)
+            common.set_spin_value(spin, float(value))
+            spin.blockSignals(blocked)
+        self._apply_plot_limits()
+        self._show_plot_status("Waterfall updated." + (" Skipped: " + ", ".join(skipped) if skipped else ""))
+
+    return self._submit_plot_preparation(request, compute, publish, cells=total_source)

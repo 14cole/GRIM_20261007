@@ -539,7 +539,8 @@ class CoreOperationTests(unittest.TestCase):
         np.testing.assert_allclose(wrapped.rcs_power.ravel(), [1.0, 2.0])
         self.assertEqual(report["merged_coordinate_count"], 1)
         self.assertEqual(report["conflicting_coordinate_count"], 0)
-        self.assertEqual(wrapped.history, equivalent.history)
+        self.assertIn('GRIM operation: wrap_azimuth', wrapped.history)
+        self.assertIsNone(equivalent.history)
 
         conflicting = _grid(
             [1.0, 2.0],

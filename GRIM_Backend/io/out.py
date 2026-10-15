@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from array import array
+import json
 import math
 import os
 import re
@@ -22,7 +23,8 @@ class OutFormatMixin:
         Parsing rules:
             - Lines starting with `#` (or text after `#`) are ignored.
             - Values are whitespace-delimited.
-            - Polarization is inferred from filename (`HH` or `VV`);
+            - An optional `# polarization: "VV"` comment declares the channel.
+            - Otherwise polarization is inferred from filename (`HH` or `VV`);
               if not present, polarization is `NA`.
             - The third column is interpreted as absolute dBke and converted to
               linear 2D scattering width using sigma_2d = (lambda / 2pi) * 10^(dBke/10).
@@ -42,10 +44,6 @@ class OutFormatMixin:
         pol_matches = set(
             re.findall(r"(?<![A-Z0-9])(HH|VV)(?![A-Z0-9])", stem_upper)
         )
-        if len(pol_matches) > 1:
-            raise ValueError(
-                f"OUT filename {file_name!r} ambiguously declares both HH and VV"
-            )
         pol_label = next(iter(pol_matches)) if pol_matches else "NA"
 
         # Parsing stays a plain Python loop (the format is text), but the
@@ -58,8 +56,23 @@ class OutFormatMixin:
         azimuth_column = array("d")
         dbke_column = array("d")
         phase_column = array("d")
+        declared_polarization = None
         with open(path, "r", encoding="utf-8-sig") as f:
             for line_no, raw_line in enumerate(f, start=1):
+                comment = raw_line.strip()
+                if comment.lower().startswith("# polarization:"):
+                    text = comment.split(":", 1)[1].strip()
+                    try:
+                        channel = json.loads(text)
+                    except (ValueError, TypeError):
+                        # Accept ordinary legacy comments such as VV. Empty
+                        # or malformed quoted comments remain ordinary comments.
+                        channel = text if text and text[:1] not in {'"', '[', '{'} else None
+                    if isinstance(channel, str) and channel.strip():
+                        channel = channel.strip()
+                        if declared_polarization is not None and declared_polarization != channel:
+                            raise ValueError(f"line {line_no}: conflicting OUT polarization comments")
+                        declared_polarization = channel
                 line = raw_line.split("#", 1)[0].strip()
                 if not line:
                     continue
@@ -101,11 +114,15 @@ class OutFormatMixin:
         record_count = len(freq_column)
         if not record_count:
             raise ValueError("OUT contains no data rows")
+        if declared_polarization is None and len(pol_matches) > 1:
+            raise ValueError(
+                f"OUT filename {file_name!r} ambiguously declares both HH and VV"
+            )
 
         frequencies = np.asarray(sorted(set(freq_column)), dtype=float)
         azimuths = np.asarray(sorted(set(azimuth_column)), dtype=float)
         elevations = np.asarray([0.0], dtype=float)
-        polarizations = np.asarray([pol_label], dtype=object)
+        polarizations = np.asarray([declared_polarization or pol_label], dtype=object)
 
         # Each record value is one of the sorted unique axis values, so its
         # insertion point is its axis index.

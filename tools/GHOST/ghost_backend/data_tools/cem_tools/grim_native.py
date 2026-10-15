@@ -15,7 +15,8 @@ from typing import Any, Iterable
 import numpy as np
 
 from .errors import CemToolError
-from .native_samples import decode_native_samples
+from .native_samples import SampleComponent, decode_native_samples, encode_native_samples, grid_blocks
+from .native_samples import raw_amplitude as native_raw_amplitude
 
 
 C0 = 299_792_458.0
@@ -524,7 +525,7 @@ def load_grim(path: 'str | os.PathLike[str]') -> 'dict[str, np.ndarray]':
         raise CemToolError(f"not a readable .grim file: {source}")
     try:
         with np.load(source, allow_pickle=False) as data:
-            payload = {key: np.array(data[key], copy=True) for key in data.files}
+            payload = {key: data[key] for key in data.files}
         payload = decode_native_samples(payload, label=source.name)
     except (OSError, ValueError, TypeError) as exc:
         raise CemToolError(f"cannot read {source.name}: {exc}") from exc
@@ -564,25 +565,19 @@ def load_grim(path: 'str | os.PathLike[str]') -> 'dict[str, np.ndarray]':
                 )
         payload[key] = axis
     shape = _grid_shape(payload)
-    for key in ("rcs_power", "rcs_phase"):
-        values = np.asarray(payload[key])
-        if values.shape != shape:
+    for key in ("rcs_power", "rcs_phase", "rcs_amp_real", "rcs_amp_imag"):
+        if key not in payload:
+            continue
+        if np.shape(payload[key]) != shape:
             raise CemToolError(
                 f"{source.name}: {key} shape {np.shape(payload[key])} != {shape}"
             )
-        if not np.all(np.isfinite(values)):
-            raise CemToolError(f"{source.name}: {key} contains nonfinite values")
-        if key == "rcs_power" and np.any(values < 0.0):
-            raise CemToolError(f"{source.name}: rcs_power contains negative values")
-    for key in ("rcs_amp_real", "rcs_amp_imag"):
-        if key in payload:
-            values = np.asarray(payload[key])
-            if values.shape != shape:
-                raise CemToolError(
-                    f"{source.name}: {key} shape {np.shape(payload[key])} != {shape}"
-                )
+        for selection in grid_blocks(shape):
+            values = np.asarray(payload[key][selection])
             if not np.all(np.isfinite(values)):
                 raise CemToolError(f"{source.name}: {key} contains nonfinite values")
+            if key == "rcs_power" and np.any(values < 0.0):
+                raise CemToolError(f"{source.name}: rcs_power contains negative values")
     return payload
 
 
@@ -603,7 +598,7 @@ def save_grim_atomic(
     )
     try:
         with os.fdopen(descriptor, "wb") as stream:
-            np.savez_compressed(stream, **payload)
+            np.savez_compressed(stream, **encode_native_samples(payload))
         os.replace(temporary, destination)
     except Exception:
         try:
@@ -620,10 +615,7 @@ def raw_amplitude(payload: 'dict[str, np.ndarray]', label: 'str') -> 'np.ndarray
             f"{label}: coherent operations require preserved "
             "rcs_amp_real/rcs_amp_imag arrays"
         )
-    amplitude = (
-        np.asarray(payload["rcs_amp_real"], dtype=np.float64)
-        + 1j * np.asarray(payload["rcs_amp_imag"], dtype=np.float64)
-    )
+    amplitude = native_raw_amplitude(payload)
     if not np.all(np.isfinite(amplitude)):
         raise CemToolError(f"{label}: raw complex amplitude is nonfinite")
     return amplitude
@@ -692,6 +684,8 @@ def _merge_metadata(
     first = payloads[0]
     merged: 'dict[str, Any]' = {}
     excluded = set(AXIS_KEYS) | {
+        "rcs_complex",
+        "grim_format_version", "storage_kind", "storage_domain",
         "rcs_power",
         "rcs_phase",
         "rcs_amp_real",
@@ -759,6 +753,20 @@ def join_payloads(
             "magnitude/phase-only datasets"
         )
     _critical_metadata_equal(payloads, labels)
+    # Native complex inputs already own one coherent field. Concatenate that
+    # field directly instead of expanding four compatibility components.
+    compact_sources = []
+    for payload in payloads:
+        components = [payload.get(key) for key in ("rcs_power", "rcs_phase", "rcs_amp_real", "rcs_amp_imag")]
+        if not all(isinstance(value, SampleComponent) and value._detached is None for value in components):
+            break
+        encoded = encode_native_samples(payload)
+        if encoded['storage_kind'] != 'complex':
+            break
+        compact_sources.append(encoded)
+    compact = len(compact_sources) == len(payloads) and len({str(p['storage_domain']) for p in compact_sources}) == 1
+    if compact:
+        payloads = compact_sources
     join_index = AXIS_KEYS.index(axis)
     for key_index, key in enumerate(AXIS_KEYS):
         if key_index == join_index:
@@ -785,18 +793,18 @@ def join_payloads(
     common_grid_keys = {
         key
         for key in payloads[0]
-        if np.asarray(payloads[0][key]).shape == _grid_shape(payloads[0])
+        if np.shape(payloads[0][key]) == _grid_shape(payloads[0])
         and all(
             key in payload
-            and np.asarray(payload[key]).shape == _grid_shape(payload)
+            and np.shape(payload[key]) == _grid_shape(payload)
             for payload in payloads
         )
     }
-    common_grid_keys.update({"rcs_power", "rcs_phase"})
+    common_grid_keys.update({"rcs_complex"} if compact else {"rcs_power", "rcs_phase"})
     merged_arrays: 'dict[str, np.ndarray]' = {}
     filled: 'dict[str, np.ndarray]' = {}
     for key in common_grid_keys:
-        dtype = np.result_type(*[np.asarray(payload[key]).dtype for payload in payloads])
+        dtype = np.result_type(*[getattr(payload[key], 'dtype', None) or np.asarray(payload[key]).dtype for payload in payloads])
         if np.issubdtype(dtype, np.floating):
             array = np.full(shape, np.nan, dtype=dtype)
         elif np.issubdtype(dtype, np.complexfloating):
@@ -842,6 +850,10 @@ def join_payloads(
     result = _merge_metadata(payloads, shape, history)
     result.update(axes)
     result.update(merged_arrays)
+    if compact:
+        result.update(grim_format_version=np.int16(2), storage_kind='complex',
+                      storage_domain=payloads[0]['storage_domain'])
+        return decode_native_samples(result)
     if "rcs_amp_real" in result and "rcs_amp_imag" in result:
         result["rcs_amp_real"] = np.asarray(result["rcs_amp_real"], np.float64)
         result["rcs_amp_imag"] = np.asarray(result["rcs_amp_imag"], np.float64)
@@ -868,9 +880,7 @@ def _normalization_per_frequency(
     factors = 1.0 / (4.0 * wave_numbers)
     for frequency_index, frequency in enumerate(frequencies):
         for payload, amplitude, label in zip(payloads, amplitudes, labels):
-            power = np.asarray(payload["rcs_power"], dtype=float)[
-                :, :, frequency_index, :
-            ]
+            power = np.asarray(payload["rcs_power"][:, :, frequency_index, :], dtype=float)
             with np.errstate(over="ignore", invalid="ignore"):
                 predicted = (
                     np.abs(amplitude[:, :, frequency_index, :]) ** 2

@@ -46,8 +46,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from GRIM_Backend.datasets.constants import C0, _ADOPT_CLEAN_ARRAYS_TOKEN
+from GRIM_Backend.datasets.constants import C0
 from GRIM_Backend.datasets.grid import RcsGrid
+from GRIM_Backend.datasets.operations import operation_recorded_here
 from GRIM_Backend.datasets.coordinates import wedge_to_conic_geometry_deg
 from GRIM_Backend.io.loaders import (
     SUPPORTED_EXTENSIONS,
@@ -63,6 +64,7 @@ from GRIM_Backend.datasets.transforms import (
     convert_extrusion,
     crop_dataset,
     decimate_axis,
+    duplicate_dataset,
     medianize_azimuth,
     offset_db,
     regrid_axis,
@@ -385,6 +387,34 @@ def _setting_flag(value) -> bool:
 
 
 class DatasetOpsMixin:
+    def _current_result_storage_options(self):
+        defaults = {'mode': 'auto', 'ram_budget_bytes': 256 * 1024**2}
+        try:
+            raw = self._settings.value('datasets/result-storage-v1', '')
+            saved = json.loads(str(raw)) if raw else {}
+            if not isinstance(saved, dict):
+                return defaults
+            mode = saved.get('mode', 'auto')
+            budget = saved.get('ram_budget_bytes', defaults['ram_budget_bytes'])
+            if mode not in {'auto', 'memory', 'disk'} or isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+                return defaults
+            defaults.update(mode=mode, ram_budget_bytes=budget)
+            if isinstance(saved.get('cache_dir'), str) and saved['cache_dir'].strip():
+                defaults['cache_dir'] = saved['cache_dir'].strip()
+        except (AttributeError, TypeError, ValueError):
+            pass
+        return defaults
+
+    def _show_result_storage_options(self):
+        from GRIM_Backend.ui.result_storage_options import ResultStorageDialog
+        dialog = ResultStorageDialog(self._current_result_storage_options(), parent=self)
+        try:
+            if dialog.exec() == QDialog.Accepted:
+                self._settings.setValue('datasets/result-storage-v1', json.dumps(dialog.options()))
+                self.status.showMessage('Operation result storage updated for new operations.')
+        finally:
+            dialog.deleteLater()
+
     def _preflight_derived_outputs(
         self,
         operation_name: str,
@@ -392,7 +422,7 @@ class DatasetOpsMixin:
         *,
         extra_bytes: int = 0,
     ) -> bool:
-        """Reject a derived-result batch whose conservative peak is unsafe.
+        """Offer a recoverable choice when a RAM result exceeds the estimate.
 
         ``plans`` contains ``(dataset, output_shape)`` pairs. The common
         estimator includes retained power/phase plus constructor and ufunc
@@ -409,15 +439,35 @@ class DatasetOpsMixin:
                 f"{operation_name} blocked: invalid output-size estimate ({exc})"
             )
             return False
+        return self._review_result_ram_estimate(operation_name, estimated_peak)
+
+    def _review_result_ram_estimate(self, operation_name, estimated_peak):
         limit = _derived_grid_memory_limit()
+        options = self._current_result_storage_options()
+        # The original estimate assumes every output and scratch array is in
+        # RAM. Managed allocations and each algorithm's scratch checks own
+        # admission for disk/auto; do not reject their mapped address space.
+        if options['mode'] != 'memory':
+            return True
         if estimated_peak <= limit:
             return True
-        self.status.showMessage(
-            f"{operation_name} blocked before allocation: estimated working set "
-            f"{_format_bytes(estimated_peak)} exceeds the current safety limit "
-            f"{_format_bytes(limit)}. Process fewer or smaller datasets."
-        )
-        return False
+        from GRIM_Backend.ui.result_storage_options import ResultStorageDialog
+        review = (f'{operation_name}: estimated RAM use {_format_bytes(estimated_peak)} '
+                  f'exceeds the current budget of {_format_bytes(limit)}. '
+                  'Choose Auto or Disk, or continue once with your selected settings.')
+        dialog = ResultStorageDialog(options, review=review, parent=self)
+        try:
+            if dialog.exec() != QDialog.Accepted:
+                self.status.showMessage(f'{operation_name} canceled before allocation.')
+                return False
+            chosen = dialog.options()
+            if chosen['mode'] == 'memory' and not chosen.get('allow_exceed'):
+                self.status.showMessage('Choose Auto or Disk, or Continue once to use RAM for this result.')
+                return False
+            self._pending_result_storage_override = chosen
+            return True
+        finally:
+            dialog.deleteLater()
 
     def _ensure_background_worker_state(self) -> None:
         if hasattr(self, "_background_worker_thread"):
@@ -478,6 +528,13 @@ class DatasetOpsMixin:
 
     def _try_start_background_job(self, job_name: str, worker: QObject) -> bool:
         self._ensure_background_worker_state()
+        if isinstance(worker, (_BackgroundCallableWorker, _JoinDatasetsWorker, _RangeCalibrationWorker)):
+            worker._result_storage_options = dict(
+                getattr(self, '_pending_result_storage_override', None)
+                or self._current_result_storage_options())
+            # An accepted one-time choice belongs to this attempted job, even
+            # if another worker started while the modal review was open.
+            self._pending_result_storage_override = None
         if bool(getattr(self, "_isar_busy", False)):
             self.status.showMessage(
                 "An ISAR reconstruction is still running. Please wait before "
@@ -541,6 +598,7 @@ class DatasetOpsMixin:
 
         self._ensure_background_worker_state()
         if self._background_job_active():
+            self._pending_result_storage_override = None
             active_name = self._background_worker_name or "Another background job"
             self.status.showMessage(f"{active_name} is still running. Please wait.")
             return False
@@ -648,6 +706,8 @@ class DatasetOpsMixin:
         self._active_import_keys.clear()
         self._update_dataset_action_states()
 
+        if self._review_pending_load_memory():
+            return
         if self._start_next_pending_import_batch():
             return
 
@@ -692,6 +752,7 @@ class DatasetOpsMixin:
                 try:
                     from GRIM_Backend.ui.table_import import create_table_import_dialog
                     dialog = create_table_import_dialog(self, path)
+                    dialog.configure_load_options(entry.get('load_options'), entry.get('max_output_bytes'))
                     if dialog.exec() != QDialog.Accepted:
                         self._import_cycle_results.append((f"Skipped {filename} (column labeling canceled).", False))
                         continue
@@ -722,11 +783,14 @@ class DatasetOpsMixin:
         paths, ignored = self._pending_import_batches.pop(0)
         for path in paths:
             self._queued_import_keys.discard(_target_path_key(path))
-        if self._start_dataset_import_batch(list(paths), ignored_count=ignored):
+        options = getattr(self, '_queued_import_options', {}).pop(tuple(paths), None)
+        if self._start_dataset_import_batch(list(paths), ignored_count=ignored, load_options=options):
             return True
         # Preserve the user's request if another operation started in the
         # narrow window between the idle check and QThread creation.
         self._pending_import_batches.insert(0, (paths, ignored))
+        if options is not None:
+            self._queued_import_options[tuple(paths)] = options
         self._queued_import_keys.update(_target_path_key(path) for path in paths)
         return False
 
@@ -742,6 +806,8 @@ class DatasetOpsMixin:
 
     def _on_load_worker_finished(self, summary: dict[str, object]) -> None:
         self._ensure_background_worker_state()
+        if summary.get('memory_review'):
+            self._pending_memory_review = summary['memory_review']
         loaded_entries_raw = summary.get("loaded", [])
         mapping_entries = [entry for entry in summary.get("mapping_required", []) if isinstance(entry, dict)]
         self._pending_table_mappings.extend(mapping_entries)
@@ -769,13 +835,15 @@ class DatasetOpsMixin:
                 dataset,
                 name,
                 history,
-                file_name=container_path,
+                file_name=container_path if not entry.get('load_options', {}).get('selection') else '',
+                dirty=True if entry.get('load_options', {}).get('selection') else None,
                 notify=False,
             )
             recorder = getattr(self, "python_recorder", None)
             if recorder is not None:
                 recorder.bind_loaded(
-                    DatasetReference(dataset_id, name, container_path)
+                    DatasetReference(dataset_id, name, container_path),
+                    load_options=entry.get('load_options'),
                 )
             loaded += 1
 
@@ -796,7 +864,7 @@ class DatasetOpsMixin:
             msg += f" Ignored {ignored} unsupported file(s)."
         if used_parallel and total_supported > 1:
             msg += " Loaded in parallel."
-        if loaded or failed or ignored or not mapping_entries:
+        if loaded or failed or ignored or (not mapping_entries and not summary.get('memory_review')):
             self._import_cycle_results.append((msg, bool(failed)))
         if mapping_entries:
             msg = f"{len(mapping_entries)} file(s) need column labels. Opening the import editor…"
@@ -957,7 +1025,7 @@ class DatasetOpsMixin:
         self.status.showMessage(message)
 
     def _start_dataset_import_batch(
-        self, paths: list[str], *, ignored_count: int = 0
+        self, paths: list[str], *, ignored_count: int = 0, load_options=None
     ) -> bool:
         """Start one already-filtered import batch.
 
@@ -968,7 +1036,8 @@ class DatasetOpsMixin:
         tasks = [(index, path) for index, path in enumerate(paths)]
         if not tasks:
             return False
-        worker = _DatasetLoadWorker(tasks, ignored_count=ignored_count)
+        options = self._current_load_options() if load_options is None else dict(load_options)
+        worker = _DatasetLoadWorker(tasks, ignored_count=ignored_count, load_options=options)
         worker.progress.connect(self._on_load_worker_progress)
         worker.finished.connect(self._on_load_worker_finished)
         self._active_import_keys = {_target_path_key(path) for path in paths}
@@ -978,8 +1047,11 @@ class DatasetOpsMixin:
         self.status.showMessage(f"Loading datasets... 0/{len(tasks)}")
         return True
 
-    def _handle_files_dropped(self, paths: list[str]) -> None:
+    def _handle_files_dropped(self, paths: list[str], *, load_options=None) -> None:
         self._ensure_background_worker_state()
+        options = self._current_load_options() if load_options is None else dict(load_options)
+        if not hasattr(self, '_queued_import_options'):
+            self._queued_import_options = {}
         accepted: list[str] = []
         ignored = 0
         already_pending = set(self._active_import_keys) | set(self._queued_import_keys)
@@ -1012,6 +1084,7 @@ class DatasetOpsMixin:
         if self._background_job_active() or self._pending_import_batches:
             batch = tuple(accepted)
             self._pending_import_batches.append((batch, ignored))
+            self._queued_import_options[batch] = options
             self._queued_import_keys.update(batch_keys)
             message = (
                 f"Queued {len(batch)} dataset import(s) as batch "
@@ -1023,15 +1096,92 @@ class DatasetOpsMixin:
             return
 
         self._import_cycle_results.clear()
-        if not self._start_dataset_import_batch(accepted, ignored_count=ignored):
+        if not self._start_dataset_import_batch(accepted, ignored_count=ignored, load_options=options):
             # A job can begin between the active check and thread startup. Keep
             # the user's files instead of losing that race.
             batch = tuple(accepted)
             self._pending_import_batches.insert(0, (batch, ignored))
+            self._queued_import_options[batch] = options
             self._queued_import_keys.update(batch_keys)
             self.status.showMessage(
                 f"Queued {len(batch)} dataset import(s); they will load automatically."
             )
+
+    def _current_load_options(self):
+        settings = getattr(self, '_settings', None)
+        try:
+            options = json.loads(str(settings.value('datasets/load-options-v1', '{}'))) if settings is not None else {}
+            if not isinstance(options, dict):
+                options = {}
+            cap = options.get('max_output_bytes')
+            from GRIM_Backend.datasets.load_policy import checked_import_budget
+            checked_import_budget(cap)
+            return {'storage': 'disk' if options.get('storage') == 'disk' else 'memory',
+                    **({'cache_dir': str(options['cache_dir'])} if options.get('cache_dir') else {}),
+                    **({'max_output_bytes': cap} if cap is not None else {})}
+        except (TypeError, ValueError):
+            return {'storage': 'memory'}
+
+    def _show_load_options(self):
+        from GRIM_Backend.ui.load_options import LoadOptionsDialog
+        dialog = LoadOptionsDialog(self._current_load_options(),
+                                   available_bytes=_available_memory_bytes(), parent=self)
+        try:
+            if dialog.exec() != QDialog.Accepted:
+                return
+            self._settings.setValue('datasets/load-options-v1', json.dumps(dialog.options()))
+            self.status.showMessage('Load options saved for files opened or dropped into GRIM.')
+        finally:
+            dialog.deleteLater()
+
+    def _review_pending_load_memory(self):
+        review = getattr(self, '_pending_memory_review', None)
+        self._pending_memory_review = None
+        if not review:
+            return False
+        from GRIM_Backend.ui.load_options import LoadOptionsDialog
+        dialog = LoadOptionsDialog(review.get('options'), review=review,
+                                   available_bytes=_available_memory_bytes(), parent=self)
+        try:
+            if dialog.exec() != QDialog.Accepted:
+                self._import_cycle_results.append(('Load canceled at memory options.', False))
+                return False
+            options = dialog.options()
+            if self._start_dataset_import_batch(review['paths'], load_options=options):
+                return True
+            # A queued solver/job can begin while the modal dialog processes
+            # events. Retain the approved retry just like any queued import.
+            batch = tuple(review['paths'])
+            self._pending_import_batches.insert(0, (batch, 0))
+            self._queued_import_keys.update(_target_path_key(path) for path in batch)
+            if not hasattr(self, '_queued_import_options'):
+                self._queued_import_options = {}
+            self._queued_import_options[batch] = options
+            self.status.showMessage(f'Queued {len(batch)} dataset import(s) with the selected load options.')
+            return False
+        finally:
+            dialog.deleteLater()
+
+    def _load_native_region(self):
+        from GRIM_Backend.datasets.memory import estimate_native_archive_allocation
+        from GRIM_Backend.ui.load_options import NativeRegionDialog
+        path, _ = QFileDialog.getOpenFileName(self, 'Choose a .grim dataset', '', 'GRIM files (*.grim)')
+        if not path:
+            return
+        try:
+            report = estimate_native_archive_allocation(path)
+        except (OSError, ValueError, MemoryError) as exc:
+            QMessageBox.information(self, 'Dataset could not be inspected', str(exc))
+            return
+        dialog = NativeRegionDialog(report, parent=self)
+        try:
+            if dialog.exec() != QDialog.Accepted:
+                return
+            options = self._current_load_options()
+            options['selection'] = dialog.selection
+            self._handle_files_dropped([path], load_options=options)
+        finally:
+            dialog.deleteLater()
 
     def _load_dataset_files(self) -> None:
         """Choose dataset files and route them through the drop/headless loader."""
@@ -1063,7 +1213,8 @@ class DatasetOpsMixin:
         inherited the source dataset's ``source_path`` metadata.
         """
 
-        durable_history = _append_provenance(dataset.history, history)
+        durable_history = (str(dataset.history or "") if operation_recorded_here(dataset)
+                           else _append_provenance(dataset.history, history))
         # A single in-memory RcsGrid may be published into more than one row
         # (for example, two Assembly branches).  Row provenance must not leak
         # from the first row into the second merely because both callers hand
@@ -1082,13 +1233,18 @@ class DatasetOpsMixin:
             name_item = QTableWidgetItem(name)
             name_item.setData(Qt.UserRole, row_dataset)
             dataset_id = uuid.uuid4().hex
+            recorder = getattr(self, 'python_recorder', None)
+            storage_options = getattr(row_dataset, '_operation_storage_options', None)
+            if recorder is not None and storage_options:
+                recorder.bind_result_storage(dataset_id, storage_options)
             name_item.setData(DATASET_ID_ROLE, dataset_id)
             name_item.setData(DATASET_DIRTY_ROLE, is_dirty)
             name_font = name_item.font()
             name_font.setBold(is_dirty)
             name_item.setFont(name_font)
             name_item.setToolTip(
-                "Unsaved derived dataset" if is_dirty else "Saved or loaded dataset"
+                ("Unsaved derived dataset" if is_dirty else "Saved or loaded dataset")
+                + f"\nSample storage: {getattr(row_dataset, 'sample_storage', 'memory')}"
             )
 
             source_path = ""
@@ -2424,14 +2580,7 @@ class DatasetOpsMixin:
         overlap_peak = sum(
             _derived_grid_peak_bytes(grid, upper_shape) for grid in grids
         ) + math.prod(upper_shape)
-        memory_limit = _derived_grid_memory_limit()
-        if overlap_peak > memory_limit:
-            self.status.showMessage(
-                "Overlap blocked before allocation: the common-grid upper-bound "
-                f"working set {_format_bytes(overlap_peak)} exceeds the current "
-                f"safety limit {_format_bytes(memory_limit)}. Select fewer or "
-                "smaller datasets."
-            )
+        if not self._review_result_ram_estimate('Overlap', overlap_peak):
             return
 
         def publish(overlap_grids) -> None:
@@ -2654,14 +2803,7 @@ class DatasetOpsMixin:
                 "Crop / Slice blocked: " + _compact_item_summary(plan_errors)
             )
             return
-        memory_limit = _derived_grid_memory_limit()
-        if estimated_peak > memory_limit:
-            self.status.showMessage(
-                "Crop / Slice blocked before allocation: estimated working set "
-                f"{_format_bytes(estimated_peak)} exceeds the current safety limit "
-                f"{_format_bytes(memory_limit)}. Tighten the ranges, increase stride, "
-                "or process fewer datasets."
-            )
+        if not self._review_result_ram_estimate('Crop / Slice', estimated_peak):
             return
 
         source_references = [
@@ -2838,14 +2980,7 @@ class DatasetOpsMixin:
                 construction_workspace,
             )
         estimated_peak = retained_output_bytes + per_dataset_workspace_bytes
-        memory_limit = _derived_grid_memory_limit()
-        if estimated_peak > memory_limit:
-            self.status.showMessage(
-                f"{operation_title} blocked before allocation: estimated working set "
-                f"{_format_bytes(estimated_peak)} exceeds the current safety "
-                f"limit {_format_bytes(memory_limit)}. Select fewer datasets or "
-                "use Stats with repetition across the original grid disabled."
-            )
+        if not self._review_result_ram_estimate(operation_title, estimated_peak):
             return
 
         source_references = [
@@ -3667,14 +3802,7 @@ class DatasetOpsMixin:
             shape = list(dataset.power.shape)
             shape[axis_index] = n
             estimated_peak += _derived_grid_peak_bytes(dataset, shape)
-        memory_limit = _derived_grid_memory_limit()
-        if estimated_peak > memory_limit:
-            self.status.showMessage(
-                "Regrid blocked before allocation: estimated working set "
-                f"{_format_bytes(estimated_peak)} exceeds the current safety "
-                f"limit {_format_bytes(memory_limit)}. Increase the step size "
-                "or process fewer datasets at once."
-            )
+        if not self._review_result_ram_estimate('Regrid', estimated_peak):
             return
 
         # Keep one compact native-unit start/step pair per dataset. The full
@@ -4063,13 +4191,7 @@ class DatasetOpsMixin:
             _derived_grid_peak_bytes(dataset, dataset.power.shape)
             for _name, dataset in datasets
         )
-        memory_limit = _derived_grid_memory_limit()
-        if estimated_peak > memory_limit:
-            self.status.showMessage(
-                "Wrap blocked before allocation: estimated working set "
-                f"{_format_bytes(estimated_peak)} exceeds the current safety limit "
-                f"{_format_bytes(memory_limit)}. Process fewer datasets at once."
-            )
+        if not self._review_result_ram_estimate('Wrap', estimated_peak):
             return
         source_references = [
             self._python_reference_for_dataset(dataset)
@@ -5099,15 +5221,8 @@ class DatasetOpsMixin:
                 "Medianize blocked before allocation: " + "; ".join(preflight_errors)
             )
             return
-        memory_limit = _derived_grid_memory_limit()
         peak_estimate += window_workspace
-        if peak_estimate > memory_limit:
-            self.status.showMessage(
-                "Medianize blocked before allocation: estimated working set "
-                f"{_format_bytes(peak_estimate)} exceeds the current safety "
-                f"limit {_format_bytes(memory_limit)}. Increase the slide size "
-                "or process fewer datasets at once."
-            )
+        if not self._review_result_ram_estimate('Medianize', peak_estimate):
             return
 
         source_references = [
@@ -5220,25 +5335,7 @@ class DatasetOpsMixin:
             copies = []
             total = len(datasets)
             for index, (name, dataset) in enumerate(datasets, start=1):
-                samples = dataset._sample_kwargs()
-                raw_in_samples = samples.get("rcs_storage_domain") == "raw_field"
-                duplicate = RcsGrid(
-                    dataset.azimuths.copy(),
-                    dataset.elevations.copy(),
-                    dataset.frequencies.copy(),
-                    dataset.polarizations.copy(),
-                    **samples,
-                    rcs_domain=dataset.rcs_domain,
-                    source_path=dataset.source_path,
-                    history=dataset.history,
-                    units=copy.deepcopy(dataset.units or {}),
-                    extra={
-                        key: copy.deepcopy(value)
-                        for key, value in (dataset.extra or {}).items()
-                        if not (raw_in_samples and key in ("rcs_amp_real", "rcs_amp_imag"))
-                    },
-                    _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
-                )
+                duplicate = duplicate_dataset(dataset)
                 copies.append((index - 1, name, duplicate))
                 progress(index, total, name)
             return copies

@@ -776,12 +776,11 @@ def read_unit_grims(results_dir: 'os.PathLike') -> 'List[Dict[str, Any]]':
         if legacy_match is None and dual_match is None:
             continue
         with np.load(str(p), allow_pickle=False) as stored:
-            from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples
+            from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples, raw_amplitude
             d = decode_native_samples({key: stored[key] for key in stored.files}, label=str(p))
             if not bool(d["raw_complex_amplitude_preserved"]):
                 raise ValueError(f"{p.name}: complex amplitudes were not preserved.")
-            amp = (np.asarray(d["rcs_amp_real"], float)
-                   + 1j * np.asarray(d["rcs_amp_imag"], float))
+            amp = raw_amplitude(d)
             if legacy_match is not None:
                 match = legacy_match
                 polarizations = [match.group("pol")]

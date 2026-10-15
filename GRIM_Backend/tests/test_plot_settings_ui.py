@@ -13,13 +13,17 @@ from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QScrollArea, QW
 
 import GRIM_Backend.ui.app as grim_cut_gui
 from GRIM_Backend.plotting.models import PlotContext
+from GRIM_Backend.plotting.session import plot_context_facade
 
 
+@plot_context_facade(PlotContext)
 class _SettingsBuilderWindow(QMainWindow):
     """Construct only the QWidget base needed by the settings/context builder."""
 
     _build_plot_left_context = grim_cut_gui.GrimCutWindow._build_plot_left_context
     _activate_plot_tab = grim_cut_gui.GrimCutWindow._activate_plot_tab
+    _clear_zoom_box_drag = grim_cut_gui.GrimCutWindow._clear_zoom_box_drag
+    _clear_pan_drag = grim_cut_gui.GrimCutWindow._clear_pan_drag
 
     def __init__(self) -> None:
         super().__init__()
@@ -132,9 +136,6 @@ class PlotSettingsUiTest(unittest.TestCase):
         self.window._active_plot_tab = "plotting"
         self.window._dataset_ops_panel = QWidget(self.window)
         self.window._dataset_ops_visible = False
-        for field in PlotContext.__dataclass_fields__:
-            setattr(self.window, field, getattr(self.plot_context, field))
-
         with mock.patch.object(self.window, "_move_shared_right_panel"):
             self.window._activate_plot_tab("isar")
 

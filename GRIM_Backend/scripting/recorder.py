@@ -149,7 +149,7 @@ try:
     import numpy as np
 
     from GRIM_Backend.datasets.api import RcsGrid
-    from GRIM_Backend.scripting.api import load_dataset
+    from GRIM_Backend.scripting.api import load_dataset, operation_result_storage
     from GRIM_Backend.scripting.workspace import (
         crop_dataset,
         coherent_divide,
@@ -183,6 +183,7 @@ except ModuleNotFoundError as exc:
         self._on_change = on_change
         self._lines: list[str] = []
         self._dataset_vars: dict[str, str] = {}
+        self._result_storage: dict[str, dict] = {}
         self._next_dataset = 1
         self._next_plot = 1
         self._current_plot_var: str | None = None
@@ -207,6 +208,7 @@ except ModuleNotFoundError as exc:
     def clear(self) -> None:
         self._lines.clear()
         self._dataset_vars.clear()
+        self._result_storage.clear()
         self._next_dataset = 1
         self._next_plot = 1
         self._current_plot_var = None
@@ -219,7 +221,7 @@ except ModuleNotFoundError as exc:
         self._dataset_vars[str(dataset_id)] = variable
         return variable
 
-    def bind_loaded(self, reference: DatasetReference) -> str | None:
+    def bind_loaded(self, reference: DatasetReference, *, load_options=None) -> str | None:
         existing = self._dataset_vars.get(reference.dataset_id)
         if existing is not None:
             return existing
@@ -227,10 +229,17 @@ except ModuleNotFoundError as exc:
             return None
         variable = self._new_dataset_var(reference.dataset_id)
         resolved = str(Path(reference.path).expanduser().resolve())
+        options = {key: value for key, value in (load_options or {}).items()
+                   if key in {'storage', 'selection', 'max_output_bytes', 'cache_dir'} and value is not None
+                   and not (key == 'storage' and value == 'memory')}
+        if (load_options or {}).get('allow_exceed'):
+            import sys
+            options['max_output_bytes'] = sys.maxsize
+        suffix = ''.join(f", {key}={_literal(value)}" for key, value in sorted(options.items()))
         self._lines.extend(
             [
                 f"# Load {_safe_comment(reference.name)}",
-                f"{variable} = load_dataset(Path({_literal(resolved)}))",
+                f"{variable} = load_dataset(Path({_literal(resolved)}){suffix})",
                 "",
             ]
         )
@@ -254,6 +263,24 @@ except ModuleNotFoundError as exc:
         )
         self._notify()
 
+    def bind_result_storage(self, dataset_id, options):
+        """Keep each output's captured allocation policy for script replay."""
+        self._result_storage[str(dataset_id)] = {
+            key: value for key, value in dict(options).items()
+            if key in {'mode', 'ram_budget_bytes', 'cache_dir', 'allow_exceed'} and value is not None
+        }
+
+    def _append_result_statement(self, outputs, statement):
+        options = next((self._result_storage[output.dataset_id] for output in outputs
+                        if output.dataset_id in self._result_storage), None)
+        if options:
+            context = _call_text('operation_result_storage', kwargs=options)
+            self._lines.append(f'with {context}:')
+            self._lines.extend('    ' + line if line else '' for line in statement.splitlines())
+        else:
+            self._lines.append(statement)
+        self._lines.append('')
+
     def record_method(
         self,
         output: DatasetReference,
@@ -272,7 +299,7 @@ except ModuleNotFoundError as exc:
         if comment:
             self._lines.append(f"# {_safe_comment(comment)}")
         call = _call_text(f"{source_var}.{method}", args, kwargs)
-        self._lines.extend([f"{output_var} = {call}", ""])
+        self._append_result_statement([output], f"{output_var} = {call}")
         self._notify()
         return output_var
 
@@ -295,7 +322,7 @@ except ModuleNotFoundError as exc:
             self._lines.append(f"# {_safe_comment(comment)}")
         call_args = tuple(_Code(str(variable)) for variable in variables) + tuple(args)
         call = _call_text(function, call_args, kwargs)
-        self._lines.extend([f"{output_var} = {call}", ""])
+        self._append_result_statement([output], f"{output_var} = {call}")
         self._notify()
         return output_var
 
@@ -318,7 +345,7 @@ except ModuleNotFoundError as exc:
             self._lines.append(f"# {_safe_comment(comment)}")
         call_args = tuple(_Code(str(variable)) for variable in variables) + tuple(args)
         call = _call_text(function, call_args, kwargs)
-        self._lines.extend([f"{', '.join(output_vars)} = {call}", ""])
+        self._append_result_statement(outputs, f"{', '.join(output_vars)} = {call}")
         self._notify()
         return output_vars
 
@@ -335,13 +362,8 @@ except ModuleNotFoundError as exc:
             self._skip_unbound(comment, sources)
             return None
         output_var = self._new_dataset_var(output.dataset_id)
-        self._lines.extend(
-            [
-                f"# {_safe_comment(comment)}",
-                f"{output_var} = {expression(tuple(str(v) for v in variables))}",
-                "",
-            ]
-        )
+        self._lines.append(f"# {_safe_comment(comment)}")
+        self._append_result_statement([output], f"{output_var} = {expression(tuple(str(v) for v in variables))}")
         self._notify()
         return output_var
 

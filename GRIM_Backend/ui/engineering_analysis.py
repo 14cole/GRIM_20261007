@@ -16,14 +16,14 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolb
 from matplotlib.widgets import SpanSelector
 
 from GRIM_Backend.plotting.engineering_tools import (
-    dataset_cut, measure_trace, phase_trace, phase_slope_fit, phase_residual,
-    channel_comparison, finite_runs,
+    dataset_cut, measure_trace, finite_runs,
 )
 from GRIM_Backend.plotting.modes.common import (
     axis_unit, convert_axis_values, decimate_line, insert_plot_breaks, singleton_line_markers,
 )
-from GRIM_Backend.datasets.metadata import canonical_time_convention
 from GRIM_Backend.ui.widgets import CollapsibleSection
+from GRIM_Backend.ui.analysis_presenter import EngineeringAnalysisPresenter
+from GRIM_Backend.plotting.analysis_results import number as _number, run_samples as _run_samples
 
 
 class ResultTable(QTableWidget):
@@ -50,10 +50,6 @@ class ResultTable(QTableWidget):
         QApplication.clipboard().setText(output.getvalue())
 
 
-def _number(value):
-    return "not defined" if value is None else f"{value:.9g}" if isinstance(value, (float, np.floating)) else str(value)
-
-
 def _with_run_breaks(x, y, runs):
     """Keep native samples and insert display/probe breaks between adjacent runs."""
     x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
@@ -62,15 +58,6 @@ def _with_run_breaks(x, y, runs):
                       and np.isfinite(x[run[0] - 1]) and np.isfinite(y[run[0] - 1])]
         x, y = insert_plot_breaks(boundaries, x, y)
     return x, y
-
-
-def _run_samples(label, x, y, unit, runs):
-    """Name independent branches while retaining masked/missing coordinates."""
-    if len(runs) <= 1:
-        return [(label, x, y, unit)]
-    boundaries = [0, *(int(run[0]) for run in runs[1:]), len(x)]
-    return [(f"{label} · Run {number}", x[start:stop], y[start:stop], unit)
-            for number, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:]), 1)]
 
 
 def _trace_sort_order(x):
@@ -101,7 +88,7 @@ class CompactNumberSpin(QDoubleSpinBox):
         return state, text, position
 
 
-class EngineeringAnalysisDialog(QDialog):
+class EngineeringAnalysisDialog(EngineeringAnalysisPresenter, QDialog):
     TAB_NAMES = {"measure": 0, "phase": 1, "polarization": 2}
 
     def __init__(self, owner):
@@ -598,136 +585,6 @@ class EngineeringAnalysisDialog(QDialog):
             self._panels["measure"][3].setText(str(exc))
             self.analysis_errors["measure"].setText(f"Marker unavailable: {exc}")
             self.analysis_errors["measure"].show()
-
-    def _analyze_phase(self):
-        cut = self._cut()
-        view = self.phase_view.currentData()
-        figure, canvas, table, note = self._panels["phase"]
-        figure.clear(); rows = [("Source A", cut.label, f"{cut.axis} ({cut.x_unit})"),
-                                ("Region", str(self._region()) if self._region() else "Full cut", cut.x_unit)]; samples = []
-        phases = phase_trace(cut.x, cut.field, floor_db=self.floor.value(), maximum_gap=self._maximum_gap(),
-                             region=self._region(), native_indices=cut.native_indices)
-        rows.append(("Usable phase samples", f"{phases['finite_count']} / {phases['total_count']}", f"mask: {self.floor.value():g} dB relative to cut peak"))
-        notes = list(cut.notes)
-        if view == "iq":
-            ax = figure.add_subplot(111)
-            for run in phases["runs"]:
-                self._display_line(ax, cut.field[run].real, cut.field[run].imag, label=None, split_gaps=False)
-                ax.plot(cut.field[run[0]].real, cut.field[run[0]].imag, "o", color="#2a9d8f")
-            from GRIM_Backend.plotting.iq_tools import field_unit
-            unit = field_unit(cut)
-            ax.set(xlabel=f"I: real field ({unit})", ylabel=f"Q: imaginary field ({unit})", title=cut.label)
-            ax.set_aspect("equal", adjustable="datalim"); ax.grid(True, alpha=.25)
-            notes.append("Green points begin each valid run. I/Q uses the normalized complex field, not a dB magnitude.")
-            selected = cut.field[phases["valid"]]
-            samples = [("I/Q", selected.real, selected.imag, unit)]
-        elif view == "residual":
-            reference = self._cut(reference=True)
-            rows.append(("Reference B", reference.label, f"{reference.axis} ({reference.x_unit})"))
-            report = phase_residual(cut, reference, floor_db=self.floor.value(), maximum_gap=self._maximum_gap(), region=self._region())
-            ax = figure.add_subplot(111)
-            self._display_line(ax, report["x"], np.rad2deg(report["phase_difference_rad"]), label="A − B")
-            ax.set(xlabel=f"{cut.axis} ({cut.x_unit})", ylabel="Wrapped phase difference (deg)", title=f"{cut.label}\nminus {reference.label}")
-            ax.grid(True, alpha=.25)
-            rows.extend((("Common / usable samples", f"{report['common_count']} / {report['valid_count']}", "physical coordinates; no interpolation"),
-                         ("Circular mean phase difference", _number(report["circular_mean_deg"]), "deg"),
-                         ("RMS wrapped phase difference", _number(report["rms_wrapped_deg"]), "deg")))
-            notes += ["Reference B: " + item for item in reference.notes]
-            notes.append("Phase conventions are not converted. A shared physical reference must be established before interpreting the difference.")
-            samples = [("Phase A-B", report["x"], np.rad2deg(report["phase_difference_rad"]), "deg")]
-        elif view == "slope":
-            if cut.axis != "frequency": raise ValueError("Select Frequency as the cut axis for a phase-slope fit.")
-            sign = self.phase_sign.currentData()
-            if sign == "auto":
-                declaration = canonical_time_convention(cut.time_convention)
-                sign = "-jwt" if declaration == "-jwt" else "+jwt"
-                recognized = declaration in {"+jwt", "-jwt"}
-                notes.append(f"Delay sign: exp({sign}), " + ("dataset declaration." if recognized else "explicit default assumption; no recognized declaration supplied."))
-            else: notes.append(f"Delay sign: user-selected exp({sign}).")
-            rows.append(("Time convention for delay", f"exp({sign})", notes[-1]))
-            scale = float(convert_axis_values([1.], "frequency", cut.x_unit, "Hz")[0])
-            report = phase_slope_fit(cut.x * scale, cut.field, floor_db=self.floor.value(),
-                                     region_hz=tuple(v * scale for v in self._region()) if self._region() else None,
-                                     maximum_gap_hz=self._maximum_gap() * scale if self._maximum_gap() else None,
-                                     time_sign=sign, native_indices=cut.native_indices)
-            top, bottom = figure.subplots(2, 1, sharex=True)
-            x = report["x_hz"] / scale
-            self._display_line(top, x, np.rad2deg(report["unwrapped"]), label="Local unwrapped phase", runs=report["runs"])
-            self._display_line(top, x, np.rad2deg(report["fitted"]), label="Fit", linestyle="--", runs=report["runs"])
-            self._display_line(bottom, x, np.rad2deg(report["residual"]), label="Fit residual", runs=report["runs"])
-            top.set(ylabel="Phase (deg)", title=cut.label); top.legend()
-            bottom.set(xlabel=f"Frequency ({cut.x_unit})", ylabel="Residual (deg)")
-            for fit in report["fits"]:
-                prefix = f"Run {fit['run']}"
-                rows.append((prefix + " support", str(fit["samples"]), f"{fit['start_hz']:.9g}…{fit['stop_hz']:.9g} Hz"))
-                if "note" in fit: rows.append((prefix, "no fit", fit["note"])); continue
-                for metric, unit in (("apparent_delay_s", "s"), ("slope_rad_per_hz", "rad/Hz"), ("r_squared", "R²"),
-                                     ("residual_rms_deg", "deg"), ("residual_max_deg", "deg"), ("alias_period_s", "s; uniform-grid phase alias period")):
-                    rows.append((prefix + " " + metric.replace("_", " "), _number(fit[metric]), unit))
-            notes.append(report["note"])
-            for label, values in (("Fit residual", report["residual"]),
-                                  ("Unwrapped phase", report["unwrapped"]), ("Fitted phase", report["fitted"])):
-                samples.extend(_run_samples(label, x, np.rad2deg(values), "deg", report["runs"]))
-        else:
-            top, bottom = figure.subplots(2, 1, sharex=True)
-            magnitude_runs = list(finite_runs(cut.x, np.isfinite(cut.db), maximum_gap=self._maximum_gap(),
-                                              native_indices=cut.native_indices))
-            self._display_line(top, cut.x, cut.db, label=cut.level_unit, runs=magnitude_runs)
-            self._display_line(bottom, cut.x, np.rad2deg(phases["wrapped"]), label="Wrapped", runs=phases["runs"])
-            self._display_line(bottom, cut.x, np.rad2deg(phases["unwrapped"]), label="Locally unwrapped", linestyle="--", runs=phases["runs"])
-            top.set(ylabel=cut.level_unit, title=cut.label)
-            bottom.set(xlabel=f"{cut.axis} ({cut.x_unit})", ylabel="Phase (deg)"); bottom.legend()
-            notes.append("Each finite, magnitude-qualified run is unwrapped independently; no phase continuity is assumed across gaps.")
-            samples = _run_samples("Magnitude", cut.x, cut.db, cut.level_unit, magnitude_runs)
-            for label, values in (("Wrapped phase", phases["wrapped"]), ("Unwrapped phase", phases["unwrapped"])):
-                samples.extend(_run_samples(label, cut.x, np.rad2deg(values), "deg", phases["runs"]))
-        rows.append(("Conventions and interpretation", " ".join(notes), "advisory"))
-        table.populate(rows); note.setText(" ".join(notes)); self._samples["phase"] = samples; canvas.draw_idle()
-
-    def _analyze_polarization(self):
-        available = [self.fixed["polarization"].itemText(i) for i in range(self.fixed["polarization"].count())]
-        if not available: raise ValueError("Select a dataset with polarization channels.")
-        view = self.pol_view.currentData()
-        pairs = [("HH", "VV"), ("HH", "HV"), ("VV", "VH")] if view == "ratios" else [
-            ("HV", "VH") if view == "reciprocity" else (self.pol_a.currentText(), self.pol_b.currentText())]
-        figure, canvas, table, note = self._panels["polarization"]
-        figure.clear(); top, bottom = figure.subplots(2, 1, sharex=True)
-        rows, samples = [], []
-        cuts = {channel: self._cut(polarization=channel) for channel in available if channel in {p for pair in pairs for p in pair}}
-        for channel, cut in cuts.items(): self._display_line(top, cut.x, cut.db, label=channel)
-        for left_name, right_name in pairs:
-            if left_name not in cuts or right_name not in cuts:
-                rows.append((left_name + "/" + right_name, "unavailable", "both labeled channels are required")); continue
-            left, right = cuts[left_name], cuts[right_name]
-            report = channel_comparison(left, right, floor_db=self.floor.value(), region=self._region())
-            label = left_name + (" − " if view == "phase" else " / ") + right_name
-            values = np.rad2deg(report["phase_difference_rad"]) if view == "phase" else report["ratio_db"]
-            self._display_line(bottom, report["x"], values, label=label)
-            finite = values[np.isfinite(values)]
-            rows.append((label + " finite samples", str(len(finite)), "common physical coordinates"))
-            # Wrapped angles have no meaningful ordinary median: 179 and -179
-            # degrees would misleadingly summarize as zero. The circular mean
-            # below also leaves an undefined direction explicitly unavailable.
-            if view != "phase":
-                rows.append((label + " median", _number(float(np.median(finite)) if len(finite) else None), "dB power ratio"))
-            rows.extend(((label + " phase difference", _number(report["circular_mean_deg"]), "deg; circular mean"),
-                         (label + " normalized complex mismatch", _number(report["normalized_complex_mismatch"]), "relative L2; requires shared phase conventions")))
-            samples.append((label, report["x"], values, "deg" if view == "phase" else "dB"))
-        example = next(iter(cuts.values()), self._cut())
-        rows.insert(0, ("Source", example.label, f"{example.axis} ({example.x_unit})"))
-        rows.insert(1, ("Region", str(self._region()) if self._region() else "Full cut", example.x_unit))
-        rows.insert(2, ("Magnitude mask", _number(self.floor.value()), "dB below each selected channel peak"))
-        rows.append(("Declared conventions", " ".join(example.notes), "advisory; no convention conversion"))
-        top.set(ylabel=example.level_unit, title=example.label.split(" | ")[0] + " — polarization cuts")
-        bottom.set(xlabel=f"{example.axis} ({example.x_unit})", ylabel="Phase difference (deg)" if view == "phase" else "Power ratio (dB)")
-        for ax in (top, bottom):
-            if ax.lines: ax.legend()
-            ax.grid(True, alpha=.25)
-        table.populate(rows)
-        note.setText("Ratios use linear power; channel phases use authoritative complex samples. Channel names are used as supplied. "
-                     "HV/VH equality is a diagnostic only under a reciprocal monostatic target and compatible polarization/phase conventions; "
-                     "it is not a pass/fail calibration verdict. " + " ".join(example.notes))
-        self._samples["polarization"] = samples; canvas.draw_idle()
 
     def _copy_samples(self, key):
         rows = self._samples.get(key, [])

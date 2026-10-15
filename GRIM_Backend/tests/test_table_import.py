@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 from pathlib import Path
 import tempfile
 import time
@@ -100,11 +101,62 @@ class MappedGridTests(unittest.TestCase):
             self.assertEqual(len(summaries), 1)
             self.assertEqual([len(summaries[0][k]) for k in ("loaded", "mapping_required", "failed")], [1, 1, 1])
 
+    def test_mapping_handoff_retains_effective_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'custom.dat'
+            source.write_text('1e9 0 90 2\n')
+            options = {'storage': 'disk', 'max_output_bytes': 123456789}
+            result = _load_dataset_path_task((0, str(source)), load_options=options,
+                                             max_output_bytes=987654321)
+            self.assertEqual(result['status'], 'mapping_required')
+            self.assertEqual(result['load_options'], options)
+            self.assertEqual(result['max_output_bytes'], 987654321)
+
 
 class TableImportDialogTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_memory_budget_retry_preserves_mapping_in_actual_conversion_thread(self):
+        from GRIM_Backend.datasets.load_policy import current_import_memory_budget
+        from GRIM_Backend.ui.load_options import LoadOptionsDialog
+        import GRIM_Backend.ui.table_import as importer
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'custom.asc'
+            source.write_text('frequency_Hz azimuth_rad phase_rad magnitude\n1e9 0 1.5707963267948966 2\n')
+            dialog = create_table_import_dialog(None, source)
+            dialog.configure_load_options({'max_output_bytes': 1}, 1)
+            dialog.magnitude_format.setCurrentText('RCS amplitude (sqrt(m²))')
+            original_mapping = dialog.snapshot()[2]
+            seen_budgets = []
+
+            def convert(*args, **kwargs):
+                seen_budgets.append(current_import_memory_budget())
+                return grid_from_mapped_rows(*args, **kwargs)
+
+            def continue_once(review):
+                self.assertEqual(review._original['max_output_bytes'], 1)
+                review._continue_once()
+                return QDialog.Accepted
+
+            try:
+                with mock.patch.object(importer, 'grid_from_mapped_rows', side_effect=convert), \
+                     mock.patch.object(LoadOptionsDialog, 'exec', new=continue_once):
+                    dialog.submit()
+                    deadline = time.monotonic() + 10
+                    while dialog.job is not None and time.monotonic() < deadline:
+                        self.app.processEvents()
+                        time.sleep(.005)
+                self.assertEqual(seen_budgets, [1, sys.maxsize])
+                self.assertIsNotNone(dialog.dataset, dialog.status.text())
+                self.assertEqual(dialog.snapshot()[2], original_mapping)
+                self.assertAlmostEqual(dialog.dataset.rcs_power.item(), 4.)
+                self.assertAlmostEqual(dialog.dataset.rcs_phase.item(), math.pi / 2)
+                self.assertIsNone(current_import_memory_budget())
+            finally:
+                dialog.deleteLater()
+                self.app.processEvents()
 
     def test_named_ascii_with_hz_and_radians_imports_using_constants(self):
         with tempfile.TemporaryDirectory() as directory:

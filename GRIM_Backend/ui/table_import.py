@@ -3,9 +3,11 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import importlib
+import sys
 
-from PySide6.QtWidgets import QComboBox, QLabel
+from PySide6.QtWidgets import QComboBox, QDialog, QLabel
 
+from GRIM_Backend.datasets.load_policy import checked_import_budget, import_memory_budget
 from GRIM_Backend.integrations.freddy import FREDDY_PACKAGE_NAMESPACE, load_freddy_package
 from GRIM_Backend.io.mapped_table import MAGNITUDE_FORMATS, grid_from_mapped_rows
 
@@ -20,6 +22,8 @@ def create_table_import_dialog(parent, path):
         def __init__(self):
             super().__init__(parent, importing=True)
             self.dataset = None
+            self._load_options = {}
+            self._load_budget = None
             self.intro.setText(
                 "GRIM could not recognize this table. Label its columns below. "
                 "Angles are azimuth/elevation in GRIM's conic convention. "
@@ -32,6 +36,10 @@ def create_table_import_dialog(parent, path):
             self.extra_layout.addWidget(self.magnitude_format)
             self.path_edit.setText(str(path))
             self.refresh_preview()
+
+        def configure_load_options(self, options=None, max_output_bytes=None):
+            self._load_options = dict(options or {})
+            self._load_budget = checked_import_budget(max_output_bytes)
 
         def configure_mapping(self):
             aliases = {
@@ -79,13 +87,44 @@ def create_table_import_dialog(parent, path):
                     raise ValueError("Choose what the magnitude column represents.")
                 provenance = {"options": asdict(options), "columns": [asdict(c) for c in columns],
                               "source_headers": list(names), "magnitude_format": representation}
-                self.start_job(lambda: grid_from_mapped_rows(
-                    core.converted_rows(source, options, columns, names), source, representation,
-                    mapping=provenance))
+                from GRIM_Backend.execution.dataset_jobs import _load_memory_budget
+                budget = self._load_budget
+                if budget is None:
+                    _, budget = _load_memory_budget(self._load_options.get('max_output_bytes'))
+                if self._load_options.get('allow_exceed'):
+                    budget = sys.maxsize
+                self._load_budget = budget
+
+                def convert():
+                    try:
+                        # Context variables do not propagate into a new Qt thread.
+                        with import_memory_budget(budget):
+                            return grid_from_mapped_rows(
+                                core.converted_rows(source, options, columns, names), source,
+                                representation, mapping=provenance)
+                    except MemoryError as exc:
+                        return {'memory_review': str(exc)}
+
+                self.start_job(convert)
             except Exception as exc:
                 self.status.setText(str(exc))
 
         def conversion_finished(self, result):
+            if isinstance(result, dict) and 'memory_review' in result:
+                from GRIM_Backend.execution.dataset_jobs import _available_memory_bytes
+                from GRIM_Backend.ui.load_options import LoadOptionsDialog
+                review = LoadOptionsDialog(self._load_options,
+                    review={'error': result['memory_review']},
+                    available_bytes=_available_memory_bytes(), parent=self)
+                try:
+                    if review.exec() == QDialog.Accepted:
+                        self.configure_load_options(review.options())
+                        self.submit()
+                    else:
+                        self.status.setText('Import paused. Column labels are preserved; you can retry or cancel.')
+                finally:
+                    review.deleteLater()
+                return
             self.dataset = result
             self.accept()
 

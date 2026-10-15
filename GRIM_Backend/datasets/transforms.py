@@ -7,6 +7,10 @@ import math
 
 import numpy as np
 
+from GRIM_Backend.datasets.result_storage import allocate_result, copy_result
+
+from GRIM_Backend.datasets.operations import dataset_operation, operation_effective_parameters
+
 from GRIM_Backend.datasets.grid import RcsGrid
 from GRIM_Backend.datasets.constants import C0, _ADOPT_CLEAN_ARRAYS_TOKEN
 from GRIM_Backend.datasets.memory import _bounded_grid_selections
@@ -18,35 +22,7 @@ _MAX_EXPLICIT_AXIS_POINTS = 1_000_000
 def _derived_response_extra(dataset: RcsGrid) -> dict:
     """Keep response-independent ancillary models, dropping stale grid claims."""
 
-    stale = {
-        "amplitude_convention",
-        "power_domain",
-        "rcs_domain",
-        "solver_metadata_json",
-        "solver_certification",
-        "production_mesh_certification_json",
-        "source_body_mesh_certification_json",
-        "requested_radar_grid_json",
-        "rcs_amp_real",
-        "rcs_amp_imag",
-    }
-    original_shape = tuple(dataset.power.shape)
-    extra = {}
-    for key, value in (dataset.extra or {}).items():
-        if key in stale:
-            continue
-        array = np.asarray(value)
-        if array.ndim >= 4 and tuple(array.shape[:4]) == original_shape:
-            continue
-        if isinstance(value, np.ndarray):
-
-
-            shared = value.view()
-            shared.setflags(write=False)
-            extra[key] = shared
-        else:
-            extra[key] = copy.deepcopy(value)
-    return extra
+    return dataset._response_independent_extra()
 
 
 def _copy_grid(
@@ -88,19 +64,20 @@ def _authoritative_response_phase(dataset: RcsGrid) -> np.ndarray:
     if raw_pair is None:
         return dataset.phase
     real, imag = raw_pair
-    phase = np.empty(dataset.power.shape, dtype=np.float64)
-    np.arctan2(
-        np.asarray(imag, dtype=np.float64),
-        np.asarray(real, dtype=np.float64),
-        out=phase,
-    )
+    phase = allocate_result(dataset.power.shape, np.float64)
+    for selection in _bounded_grid_selections(dataset.shape, 262_144):
+        np.arctan2(
+            np.asarray(imag[selection], dtype=np.float64),
+            np.asarray(real[selection], dtype=np.float64),
+            out=phase[selection],
+        )
     return phase
 
 
 def _phase_shifted_response(dataset: RcsGrid, phase_degrees: float) -> np.ndarray:
     """Return authoritative phase shifted into the canonical signed interval."""
 
-    phase = np.array(_authoritative_response_phase(dataset), copy=True)
+    phase = copy_result(_authoritative_response_phase(dataset))
     delta = np.deg2rad(float(phase_degrees))
     with np.errstate(invalid="ignore"):
         np.add(phase, delta + np.pi, out=phase)
@@ -109,6 +86,7 @@ def _phase_shifted_response(dataset: RcsGrid, phase_degrees: float) -> np.ndarra
     return phase
 
 
+@dataset_operation('duplicate_dataset')
 def duplicate_dataset(dataset: RcsGrid) -> RcsGrid:
     """Return a detached copy with the same numerical samples and metadata."""
 
@@ -117,7 +95,8 @@ def duplicate_dataset(dataset: RcsGrid) -> RcsGrid:
     # views are re-derived by the constructor rather than deep-copied twice.
     raw_in_samples = samples.get("rcs_storage_domain") == "raw_field"
     extra = {
-        key: copy.deepcopy(value)
+        key: (copy_result(value) if isinstance(value, np.ndarray)
+              and value.dtype.kind in "biufc" else copy.deepcopy(value))
         for key, value in (dataset.extra or {}).items()
         if not (raw_in_samples and key in ("rcs_amp_real", "rcs_amp_imag"))
     }
@@ -149,6 +128,7 @@ def _positive_stride(value, name: str) -> int:
     return stride
 
 
+@dataset_operation('crop_dataset')
 def crop_dataset(
     dataset: RcsGrid,
     *,
@@ -193,6 +173,7 @@ def crop_dataset(
     )
 
 
+@dataset_operation('regrid_axis')
 def regrid_axis(
     dataset: RcsGrid,
     axis: str,
@@ -309,6 +290,7 @@ def stitch_datasets(
     )
 
 
+@dataset_operation('shift_dataset')
 def shift_dataset(
     dataset: RcsGrid,
     *,
@@ -329,7 +311,7 @@ def shift_dataset(
             return result
         if result.storage_kind == "complex":
             rotation = np.exp(1j * np.deg2rad(delta))
-            field = np.empty(result.shape, dtype=(
+            field = allocate_result(result.shape, (
                 np.complex128 if result.real_dtype.itemsize > 4 else np.complex64
             ))
             read_field, _dtype = result._bounded_complex_slice_reader()
@@ -344,13 +326,17 @@ def shift_dataset(
             # Retain authoritative precision without materializing a complex
             # whole-grid response from the rounded display power.
             real, imag = raw_pair
-            power = np.square(np.asarray(real, dtype=np.float64))
-            power += np.square(np.asarray(imag, dtype=np.float64))
+            power = allocate_result(result.shape, np.float64)
             if result.linear_quantity() == "sigma_2d":
                 k = 2.0 * np.pi * result._frequency_value_to_hz(result.frequencies) / C0
-                power /= (4.0 * k)[None, None, :, None]
-            else:
-                power *= 4.0 * np.pi
+            for selection in _bounded_grid_selections(result.shape, 262_144):
+                block = np.square(np.asarray(real[selection], dtype=np.float64))
+                block += np.square(np.asarray(imag[selection], dtype=np.float64))
+                if result.linear_quantity() == "sigma_2d":
+                    block /= (4.0 * k[selection[2]])[None, None, :, None]
+                else:
+                    block *= 4.0 * np.pi
+                power[selection] = block
             return _copy_grid(
                 result, rcs_power=power,
                 rcs_phase=_phase_shifted_response(result, delta),
@@ -365,6 +351,7 @@ def shift_dataset(
     return result
 
 
+@dataset_operation('wrap_phase')
 def wrap_phase(dataset: RcsGrid, mode: str = "-180_180") -> RcsGrid:
     """Wrap stored phase using the user-facing degree interval names."""
 
@@ -374,12 +361,13 @@ def wrap_phase(dataset: RcsGrid, mode: str = "-180_180") -> RcsGrid:
     return dataset.wrap_phase(mode=mode_name)
 
 
+@dataset_operation('offset_db')
 def offset_db(dataset: RcsGrid, value_db: float) -> RcsGrid:
     """Shift all displayed RCS values by a constant number of decibels."""
 
     scale = 10.0 ** (float(value_db) / 10.0)
     if dataset.storage_kind == "complex":
-        field = np.empty(dataset.shape, dtype=(
+        field = allocate_result(dataset.shape, (
             np.complex128 if dataset.real_dtype.itemsize > 4 else np.complex64
         ))
         read_field, _dtype = dataset._bounded_complex_slice_reader()
@@ -402,8 +390,8 @@ def offset_db(dataset: RcsGrid, value_db: float) -> RcsGrid:
         # float64. Normalize those authoritative fields before scaling, keeping
         # the derived response in float64 for later coherent residuals.
         shape = dataset.power.shape
-        power = np.empty(shape, dtype=np.float64)
-        phase = np.empty(shape, dtype=np.float64)
+        power = allocate_result(shape, np.float64)
+        phase = allocate_result(shape, np.float64)
         for selection in _bounded_grid_selections(shape, (16 * 1024**2) // 48):
             field = dataset._authoritative_raw_amplitude_from_pair(
                 raw_pair, selection
@@ -417,14 +405,18 @@ def offset_db(dataset: RcsGrid, value_db: float) -> RcsGrid:
             dataset, rcs_power=power, rcs_phase=phase,
             rcs_domain=dataset.rcs_domain,
         )
+    power = allocate_result(dataset.shape, np.result_type(dataset.power.dtype, scale))
+    for selection in _bounded_grid_selections(dataset.shape, 262_144):
+        power[selection] = dataset.power[selection] * scale
     return _copy_grid(
         dataset,
-        rcs_power=dataset.power * scale,
+        rcs_power=power,
         rcs_phase=_authoritative_response_phase(dataset),
         rcs_domain=dataset.rcs_domain,
     )
 
 
+@dataset_operation('coherent_divide')
 def coherent_divide(
     numerator: RcsGrid,
     denominator: RcsGrid,
@@ -461,20 +453,16 @@ def coherent_divide(
         if real_dtype.itemsize > np.dtype(np.float32).itemsize
         else np.dtype(np.complex64)
     )
-    result_field = np.full(shape, np.nan + 1j * np.nan, dtype=complex_dtype)
+    result_field = allocate_result(shape, complex_dtype, fill=np.nan + 1j * np.nan)
 
 
-    cells_per_azimuth = max(1, int(np.prod(shape[1:], dtype=np.int64)))
     working_bytes_per_cell = (
         3 * complex_dtype.itemsize + real_dtype.itemsize + 3
     )
-    rows_per_block = max(
-        1,
-        (16 * 1024**2) // (cells_per_azimuth * working_bytes_per_cell),
-    )
-    for start in range(0, shape[0], rows_per_block):
-        stop = min(shape[0], start + rows_per_block)
-        selection = (slice(start, stop), slice(None), slice(None), slice(None))
+    usable_count = 0
+    for selection in _bounded_grid_selections(
+        shape, (16 * 1024**2) // working_bytes_per_cell
+    ):
         left = np.asarray(numerator.rcs_slice(selection), dtype=complex_dtype)
         right = np.asarray(denominator.rcs_slice(selection), dtype=complex_dtype)
         quotient = np.full(left.shape, np.nan + 1j * np.nan, dtype=complex_dtype)
@@ -486,7 +474,7 @@ def coherent_divide(
         finite_result = np.isfinite(power_block) & np.isfinite(quotient)
         quotient[~finite_result] = np.nan + 1j * np.nan
         result_field[selection] = quotient
-    usable_count = int(np.count_nonzero(np.isfinite(result_field)))
+        usable_count += int(np.count_nonzero(finite_result))
     if usable_count == 0:
         raise ValueError(
             "coherent division has no common usable complex samples with a "
@@ -541,6 +529,7 @@ def coherent_divide(
     )
 
 
+@dataset_operation('convert_extrusion')
 def convert_extrusion(dataset: RcsGrid, *, to: str, length_m: float) -> RcsGrid:
     """Convert between sigma_3d/dBsm and sigma_2d/dBke for an extrusion."""
 
@@ -572,12 +561,17 @@ def convert_extrusion(dataset: RcsGrid, *, to: str, length_m: float) -> RcsGrid:
         scale = 2.0 * length * length * frequency_hz / c0
         quantity = "sigma_3d"
     scale = np.where(np.isfinite(frequency_hz) & (frequency_hz > 0.0), scale, np.nan)
-    scale_4d = scale.reshape(1, 1, -1, 1)
     units = dict(dataset.units or {})
     units["rcs_log_unit"] = "dBke" if destination == "dbke" else "dBsm"
     units["rcs_linear_quantity"] = quantity
     if dataset.storage_kind == "complex":
-        rcs = dataset.rcs * np.sqrt(np.maximum(scale_4d, 0.0))
+        rcs = allocate_result(dataset.shape, np.complex128)
+        read_field, _dtype = dataset._bounded_complex_slice_reader()
+        for selection in _bounded_grid_selections(dataset.shape, 65_536):
+            block = rcs[selection]
+            np.multiply(read_field(selection), np.sqrt(
+                np.maximum(scale[selection[2]], 0.0))[None, None, :, None], out=block)
+            block[~np.isfinite(block.real) | ~np.isfinite(block.imag)] = np.nan + 1j * np.nan
         return RcsGrid(
             dataset.azimuths,
             dataset.elevations,
@@ -590,8 +584,11 @@ def convert_extrusion(dataset: RcsGrid, *, to: str, length_m: float) -> RcsGrid:
             history=dataset.history,
             units=units,
             extra=_derived_response_extra(dataset),
+            _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
         )
-    power = dataset.power * scale_4d
+    power = allocate_result(dataset.shape, np.result_type(dataset.power.dtype, scale.dtype))
+    for selection in _bounded_grid_selections(dataset.shape, 262_144):
+        power[selection] = dataset.power[selection] * scale[selection[2]][None, None, :, None]
     return RcsGrid(
         dataset.azimuths,
         dataset.elevations,
@@ -651,6 +648,7 @@ def decimation_axis_plan(source_axis, factor: int, partial: str = "keep"):
     }
 
 
+@dataset_operation('decimate_axis')
 def decimate_axis(
     dataset: RcsGrid,
     *,
@@ -695,9 +693,9 @@ def decimate_axis(
     output_shape[axis_index] = int(output_axis.size)
     output_shape = tuple(output_shape)
     coherent = mode_key == "coherent"
-    output = np.full(
-        output_shape, np.nan + 1j * np.nan if coherent else np.nan,
-        dtype=np.complex128 if coherent else np.float64,
+    output = allocate_result(
+        output_shape, np.complex128 if coherent else np.float64,
+        fill=np.nan + 1j * np.nan if coherent else np.nan,
     )
     output_by_bin = np.moveaxis(output, axis_index, 0)
     other_cell_count = max(
@@ -711,9 +709,10 @@ def decimate_axis(
         // max(1, factor * other_cell_count * transient_bytes_per_cell),
     )
 
-    def aggregate_bins(start: int, bin_count: int, samples_per_bin: int):
+    def aggregate_bins(start: int, bin_count: int, samples_per_bin: int, other_selection):
         stop = start + bin_count * samples_per_bin
-        source_selection = [slice(None)] * 4
+        source_selection = list(other_selection)
+        source_selection.insert(axis_index, slice(None))
         source_selection[axis_index] = slice(start, stop)
         source_selection = tuple(source_selection)
         if mode_key == "coherent":
@@ -762,17 +761,19 @@ def decimate_axis(
 
     for output_start in range(0, full_bin_count, bins_per_block):
         output_stop = min(full_bin_count, output_start + bins_per_block)
-        output_by_bin[output_start:output_stop] = aggregate_bins(
-            output_start * factor,
-            output_stop - output_start,
-            factor,
-        )
+        bin_count = output_stop - output_start
+        other_shape = output_by_bin.shape[1:]
+        block_cells = max(1, (32 * 1024**2) // (factor * bin_count * transient_bytes_per_cell))
+        for other_selection in _bounded_grid_selections(other_shape, block_cells):
+            output_by_bin[(slice(output_start, output_stop),) + other_selection] = aggregate_bins(
+                output_start * factor, bin_count, factor, other_selection,
+            )
     if remainder and partial == "keep":
-        output_by_bin[full_bin_count:] = aggregate_bins(
-            full_bin_count * factor,
-            1,
-            remainder,
-        )
+        block_cells = max(1, (32 * 1024**2) // (remainder * transient_bytes_per_cell))
+        for other_selection in _bounded_grid_selections(output_by_bin.shape[1:], block_cells):
+            output_by_bin[(slice(full_bin_count, None),) + other_selection] = aggregate_bins(
+                full_bin_count * factor, 1, remainder, other_selection,
+            )
 
     axes = [
         np.array(dataset.azimuths, copy=True),
@@ -830,12 +831,19 @@ def decimate_axis(
         f"{prior_history}\n{history_entry}" if prior_history else history_entry
     )
     samples = {"rcs": output} if coherent else {"rcs_power": output}
-    if coherent and np.any(output == 0.0):
+    if coherent and any(np.any(output[selection] == 0.0)
+                        for selection in _bounded_grid_selections(output.shape, 262_144)):
         # Exact cancellation has undefined phase. Preserve that distinction
         # instead of exposing atan2(0, 0) as an observed phase.
-        output_power = output.real * output.real + output.imag * output.imag
-        output_phase = np.angle(output)
-        output_phase[output_power == 0.0] = np.nan
+        output_power = allocate_result(output.shape, np.float64)
+        output_phase = allocate_result(output.shape, np.float64)
+        for selection in _bounded_grid_selections(output.shape, 262_144):
+            block = output[selection]
+            power_block = block.real * block.real + block.imag * block.imag
+            phase_block = np.angle(block)
+            phase_block[power_block == 0.0] = np.nan
+            output_power[selection] = power_block
+            output_phase[selection] = phase_block
         samples = {"rcs_power": output_power, "rcs_phase": output_phase}
     return RcsGrid(
         axes[0],
@@ -879,6 +887,7 @@ def _median_window_bounds(coordinates, coordinate_roundoff, center, half, origin
     return left, right
 
 
+@dataset_operation('medianize_azimuth')
 def medianize_azimuth(
     dataset: RcsGrid,
     *,
@@ -927,6 +936,10 @@ def medianize_azimuth(
     if periodic is None:
         periodic = span >= 360.0 - max(1.5 * typical_step, 1.0e-6)
     periodic = bool(periodic)
+    operation_effective_parameters(
+        "medianize_azimuth", periodic=periodic, seam_conflict=policy,
+        window_degrees=window, slide_degrees=slide,
+    )
     if periodic and window > 360.0 + 1.0e-9:
         raise ValueError("a periodic median window cannot exceed 360 degrees")
 
@@ -938,19 +951,20 @@ def medianize_azimuth(
     if periodic and np.isclose(span, 360.0, rtol=0.0, atol=1.0e-7):
 
 
-        merged_seam_power = np.array(dataset.power[0], copy=True)
-        merged_seam_phase = np.array(dataset.phase[0], copy=True)
+        merged_seam_power = allocate_result(dataset.shape[1:], dataset.power.dtype)
         # The closing endpoint re-measures the opening direction; it only
         # fills cells the opening sample left missing.
-        seam_conflict_mask = RcsGrid._merge_equivalent_sample_blocks(
-            merged_seam_power,
-            merged_seam_phase,
-            dataset.power[-1],
-            dataset.phase[-1],
-            context="medianize periodic endpoint",
-            keep_existing_on_conflict=policy == "first",
-        )
-        discarded_seam_cells = int(np.count_nonzero(seam_conflict_mask))
+        for selection in _bounded_grid_selections(dataset.shape[1:], 262_144):
+            first, last = (0,) + selection, (-1,) + selection
+            power_block = np.array(dataset.power[first], copy=True)
+            phase_block = np.array(dataset.phase[first], copy=True)
+            seam_conflict_mask = RcsGrid._merge_equivalent_sample_blocks(
+                power_block, phase_block, dataset.power[last], dataset.phase[last],
+                context="medianize periodic endpoint",
+                keep_existing_on_conflict=policy == "first",
+            )
+            discarded_seam_cells += int(np.count_nonzero(seam_conflict_mask))
+            merged_seam_power[selection] = power_block
         sample_azimuth = azimuth[:-1]
         sample_roundoff = sample_roundoff[:-1]
     if periodic:
@@ -999,7 +1013,7 @@ def medianize_azimuth(
                 )
             centers = first + np.arange(int(count_float), dtype=float) * slide
     shape = (centers.size,) + dataset.power.shape[1:]
-    power = np.full(shape, np.nan, dtype=dataset.power.dtype)
+    power = allocate_result(shape, dataset.power.dtype, fill=np.nan)
     for index, center in enumerate(centers):
         if periodic:
             left, right = _median_window_bounds(
@@ -1013,11 +1027,14 @@ def medianize_azimuth(
             samples = np.arange(left, right, dtype=np.int64)
         if samples.size == 0:
             continue
-        sample_power = dataset.power[samples]
-        if merged_seam_power is not None and np.any(samples == 0):
-            sample_power = np.array(sample_power, copy=True)
-            sample_power[np.flatnonzero(samples == 0)] = merged_seam_power
-        power[index] = np.nanmedian(sample_power, axis=0)
+        for selection in _bounded_grid_selections(
+            dataset.shape[1:], max(1, 262_144 // samples.size)
+        ):
+            sample_power = dataset.power[(samples,) + selection]
+            if merged_seam_power is not None and np.any(samples == 0):
+                sample_power = np.array(sample_power, copy=True)
+                sample_power[np.flatnonzero(samples == 0)] = merged_seam_power[selection]
+            power[(index,) + selection] = np.nanmedian(sample_power, axis=0)
     output_centers = np.deg2rad(centers) if angle_unit == "rad" else centers
     extra = {}
     for key in ("time_convention", "polarization_basis"):
@@ -1046,7 +1063,7 @@ def medianize_azimuth(
         dataset.polarizations,
         rcs=None,
         rcs_power=power,
-        rcs_phase=np.full_like(power, np.nan),
+        rcs_phase=None,
         rcs_domain=dataset.rcs_domain,
         source_path=dataset.source_path,
         history=history,
@@ -1065,6 +1082,7 @@ def medianize_azimuth(
     return result, report
 
 
+@dataset_operation('wedge_to_conic')
 def wedge_to_conic(
     dataset: RcsGrid,
     *,
@@ -1212,6 +1230,7 @@ def _validate_gate(dataset, start_m, stop_m, taper, mode):
     return start_m, stop_m, taper
 
 
+@dataset_operation('time_gate')
 def time_gate(
     dataset: RcsGrid,
     *,
@@ -1240,14 +1259,13 @@ def time_gate(
     frequencies = _uniform_frequencies_hz(dataset)
     conjugate = _declared_time_sign(dataset) == "-jwt"
     shape = tuple(int(value) for value in dataset.power.shape)
-    result_field = np.full(shape, np.nan + 1j * np.nan, dtype=np.complex128)
-    sweeps_per_azimuth = max(1, shape[1] * shape[3])
-    bytes_per_azimuth = sweeps_per_azimuth * _gate_fft_size(shape[2]) * 16 * 3
-    rows = max(1, _GATE_WORK_BYTES // bytes_per_azimuth)
+    result_field = allocate_result(shape, np.complex128, fill=np.nan + 1j * np.nan)
+    bytes_per_sweep = _gate_fft_size(shape[2]) * 16 * 3
+    sweep_block = max(1, _GATE_WORK_BYTES // bytes_per_sweep)
     usable = 0
-    for first in range(0, shape[0], rows):
-        block = (slice(first, min(shape[0], first + rows)),)
-        field = np.asarray(dataset.rcs_slice(block + (slice(None),) * 3), dtype=np.complex128)
+    for sweep_selection in _bounded_grid_selections((shape[0], shape[1], shape[3]), sweep_block):
+        block = sweep_selection[:2] + (slice(None), sweep_selection[2])
+        field = np.asarray(dataset.rcs_slice(block), dtype=np.complex128)
         sweeps = np.moveaxis(field, 2, -1)
         if conjugate:
             sweeps = np.conj(sweeps)
@@ -1353,6 +1371,7 @@ def _angle_axis_radians(dataset: RcsGrid, axis: str) -> np.ndarray:
     raise ValueError(f"unsupported {axis} unit {unit!r}; use deg or rad")
 
 
+@dataset_operation('translate_phase_center')
 def translate_phase_center(
     dataset: RcsGrid,
     *,
@@ -1383,8 +1402,9 @@ def translate_phase_center(
     # below straight from its field, so only power/phase storage needs the
     # authoritative phase array, and only a grid without any phase scans it.
     phase_in = None if complex_storage else _authoritative_response_phase(dataset)
-    if dataset.phase_coverage() == "none" and not np.any(
-        np.isfinite(power) & np.isfinite(phase_in)
+    if dataset.phase_coverage() == "none" and not any(np.any(
+        np.isfinite(power[selection]) & np.isfinite(phase_in[selection]))
+        for selection in _bounded_grid_selections(dataset.shape, 262_144)
     ):
         raise ValueError("moving the phase center needs complex (phase) data")
     azimuth = _angle_axis_radians(dataset, "azimuth")
@@ -1406,19 +1426,18 @@ def translate_phase_center(
         dataset._frequency_value_to_hz(np.asarray(dataset.frequencies, dtype=float)),
         dtype=float,
     ) / C0
-    projection = (
-        np.cos(elevation)[None, :] * np.cos(azimuth)[:, None] * offset[0]
-        + np.cos(elevation)[None, :] * np.sin(azimuth)[:, None] * offset[1]
-        + np.sin(elevation)[None, :] * offset[2]
-    )
     sign = 1.0 if _declared_time_sign(dataset) == "-jwt" else -1.0
-    shifted_response = np.empty(
-        power.shape, dtype=np.complex128 if complex_storage else np.float64
+    shifted_response = allocate_result(
+        power.shape, np.complex128 if complex_storage else np.float64
     )
-    rows = max(1, _GATE_WORK_BYTES // max(1, 8 * int(np.prod(power.shape[1:]))))
-    for first in range(0, power.shape[0], rows):
-        block = slice(first, min(power.shape[0], first + rows))
-        ramp = sign * 2.0 * projection[block, :, None] * wavenumber[None, None, :]
+    for block in _bounded_grid_selections(dataset.shape, _GATE_WORK_BYTES // 64):
+        azimuth_block, elevation_block = azimuth[block[0]], elevation[block[1]]
+        projection = (
+            np.cos(elevation_block)[None, :] * np.cos(azimuth_block)[:, None] * offset[0]
+            + np.cos(elevation_block)[None, :] * np.sin(azimuth_block)[:, None] * offset[1]
+            + np.sin(elevation_block)[None, :] * offset[2]
+        )
+        ramp = sign * 2.0 * projection[:, :, None] * wavenumber[block[2]][None, None, :]
         if complex_storage:
             shifted_response[block] = dataset.rcs_slice(block) * np.exp(1j * ramp[..., None])
         else:

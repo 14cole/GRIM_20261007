@@ -132,7 +132,8 @@ class NumericalButtonRegressions(unittest.TestCase):
             self.assertFalse(np.shares_memory(getattr(rounded, name), getattr(source, name)))
         self.assertEqual(rounded.rcs_power.dtype, np.float32)
         self.assertEqual(rounded.extra['phase_reference'], 'origin')
-        self.assertEqual(rounded.history, 'Original')
+        self.assertTrue(rounded.history.startswith('Original\nGRIM operation: round_axes'))
+        self.assertEqual(source.history, 'Original')
         source.elevations[:] = [.001, .002]
         with self.assertRaisesRegex(ValueError, 'duplicate'):
             source.round_axes(0)
@@ -264,7 +265,7 @@ class DatasetButtonGuiRegressions(_WindowCase):
             self.assertTrue(record['advisories'])
             self.assertFalse(record['user_attested'])
 
-    def test_align_memory_preflight_blocks_before_starting_worker(self):
+    def test_align_ram_review_cancel_prevents_starting_worker(self):
         w = self.window
         w.table.setRowCount(0)
         reference = RcsGrid(np.linspace(0, 1, 100), [50], [50], ['HH'],
@@ -276,12 +277,15 @@ class DatasetButtonGuiRegressions(_WindowCase):
         self.select_rows(0, 1)
         with (mock.patch('GRIM_Backend.ui.dataset_actions.AlignDialog') as dialog,
               mock.patch('GRIM_Backend.ui.dataset_actions._derived_grid_memory_limit', return_value=100000),
+              mock.patch.object(w, '_current_result_storage_options', return_value={'mode': 'memory', 'ram_budget_bytes': 256*1024**2}),
+              mock.patch('GRIM_Backend.ui.result_storage_options.ResultStorageDialog') as review,
               mock.patch.object(w, '_start_background_callable') as start):
+            review.return_value.exec.return_value = QDialog.Rejected
             dialog.return_value.exec.return_value = QDialog.Accepted
             dialog.return_value.get_mode.return_value = 'interp'
             w.btn_align.click()
         start.assert_not_called()
-        self.assertIn('blocked before allocation', w.status.currentMessage())
+        self.assertIn('canceled before allocation', w.status.currentMessage())
 
 
 if __name__ == '__main__':

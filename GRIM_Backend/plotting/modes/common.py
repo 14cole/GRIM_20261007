@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import warnings
 import tempfile
+import errno
+import math
+import shutil
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -37,6 +40,12 @@ class NativeSamples:
     """
 
     def __init__(self, shape):
+        required = math.prod(shape) * np.dtype(np.float64).itemsize
+        available = shutil.disk_usage(tempfile.gettempdir()).free
+        if required > available:
+            raise OSError(errno.ENOSPC,
+                f"Exact plot samples need {required / 1024**2:.0f} MiB of temporary disk space; "
+                f"{available / 1024**2:.0f} MiB is available")
         self._file = tempfile.TemporaryFile(prefix="grim-plot-probe-")
         self.values = None
         try:
@@ -655,7 +664,7 @@ class StreamingEnvelope:
             self.upper[existing] = np.maximum(self.upper[existing], incoming)
         self.count[finite] += 1
 
-    def result(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def result(self, *, cancel=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.lower is None or self.upper is None or self.count is None:
             raise ValueError("cannot read an empty envelope")
         if self.percentiles is not None and self._phase_dirty and self.lower.size:
@@ -665,6 +674,9 @@ class StreamingEnvelope:
             block_columns = max(1, REDUCTION_BLOCK_CELLS // self._phase_rows)
             try:
                 for start in range(0, self.lower.size, block_columns):
+                    if cancel is not None and cancel():
+                        from ..requests import PlotCancelled
+                        raise PlotCancelled()
                     stop = min(self.lower.size, start + block_columns)
                     block = np.array(samples[:, start:stop])
                     with warnings.catch_warnings():
@@ -701,6 +713,9 @@ class StreamingEnvelope:
             block_columns = max(1, REDUCTION_BLOCK_CELLS // self._phase_rows)
             try:
                 for start in range(0, self.lower.size, block_columns):
+                    if cancel is not None and cancel():
+                        from ..requests import PlotCancelled
+                        raise PlotCancelled()
                     stop = min(self.lower.size, start + block_columns)
                     block = np.array(samples[:, start:stop])
                     finite = np.isfinite(block)
@@ -1030,7 +1045,38 @@ def finite_data_limits(arrays) -> tuple[float, float] | None:
     return lower, upper
 
 
-def decimate_image(x_values, y_values, image, *, max_side=MAX_IMAGE_SIDE, max_cells=MAX_IMAGE_CELLS):
+def block_max_image(values, row_starts, column_starts, *, cancel=None):
+    """Exact block maxima with scratch space independent of native image size.
+
+    A reduction over one complete axis can itself allocate a nearly native-size
+    intermediate for a long, narrow image. Reduce bounded tiles into the final
+    blocks instead. NaNs are ignored only when the block has a valid sample.
+    """
+    values = np.asarray(values)
+    rows, columns = values.shape
+    row_starts, column_starts = np.asarray(row_starts), np.asarray(column_starts)
+    output = np.full((len(row_starts), len(column_starts)), np.nan)
+    width = min(columns, max(1, int(np.sqrt(REDUCTION_BLOCK_CELLS))))
+    height = max(1, REDUCTION_BLOCK_CELLS // max(1, width))
+    for first_row in range(0, rows, height):
+        stop_row = min(rows, first_row + height)
+        ri = max(0, int(np.searchsorted(row_starts, first_row, side="right")) - 1)
+        rj = int(np.searchsorted(row_starts, stop_row, side="left"))
+        local_rows = np.r_[0, row_starts[ri+1:rj] - first_row]
+        for first_column in range(0, columns, width):
+            if cancel is not None:
+                cancel()
+            stop_column = min(columns, first_column + width)
+            ci = max(0, int(np.searchsorted(column_starts, first_column, side="right")) - 1)
+            cj = int(np.searchsorted(column_starts, stop_column, side="left"))
+            local_columns = np.r_[0, column_starts[ci+1:cj] - first_column]
+            tile = values[first_row:stop_row, first_column:stop_column]
+            reduced = np.fmax.reduceat(np.fmax.reduceat(tile, local_rows, axis=0), local_columns, axis=1)
+            np.fmax(output[ri:rj, ci:cj], reduced, out=output[ri:rj, ci:cj])
+    return output
+
+
+def decimate_image(x_values, y_values, image, *, max_side=None, max_cells=None, cancel=None):
     """Bound a display image using peak-preserving block aggregation.
 
     Uniform striding can completely erase a narrow scattering peak when its
@@ -1048,21 +1094,19 @@ def decimate_image(x_values, y_values, image, *, max_side=MAX_IMAGE_SIDE, max_ce
         raise ValueError("image shape must be (len(x_values), len(y_values))")
     nx, ny = image.shape
     target_x, target_y = _bounded_image_shape(
-        nx, ny, max_side=max_side, max_cells=max_cells
+        nx, ny, max_side=MAX_IMAGE_SIDE if max_side is None else max_side,
+        max_cells=MAX_IMAGE_CELLS if max_cells is None else max_cells
     )
     if target_x >= nx and target_y >= ny:
         return x_values, y_values, image, False
     if np.iscomplexobj(image):
         raise ValueError("display image decimation requires real-valued intensity")
 
-    # ``fmax.reduceat`` performs variable-width block reduction without a
-    # Python loop over up to two million display cells.  It ignores a NaN when
-    # the same block contains a finite value and retains NaN for an all-NaN
-    # block, matching Matplotlib's missing-data behavior.
+    # Each tile uses vectorized variable-width reduction. Accumulating tiles
+    # avoids the large intermediate from reducing one entire native axis.
     x_starts = (np.arange(target_x, dtype=np.int64) * nx) // target_x
     y_starts = (np.arange(target_y, dtype=np.int64) * ny) // target_y
-    image_display = np.fmax.reduceat(image, x_starts, axis=0)
-    image_display = np.fmax.reduceat(image_display, y_starts, axis=1)
+    image_display = block_max_image(image, x_starts, y_starts, cancel=cancel)
 
     x_stops = np.concatenate((x_starts[1:], np.asarray([nx], dtype=np.int64)))
     y_stops = np.concatenate((y_starts[1:], np.asarray([ny], dtype=np.int64)))

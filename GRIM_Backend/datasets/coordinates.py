@@ -6,6 +6,13 @@ import json
 
 import numpy as np
 
+from GRIM_Backend.datasets.result_storage import (
+    allocate_result, take_result,
+)
+
+from GRIM_Backend.datasets.operations import dataset_operation
+from GRIM_Backend.datasets.memory import _bounded_grid_selections
+
 from GRIM_Backend.datasets.constants import (
     CONIC_VH_BASIS_CONVENTION,
     WEDGE_TURNTABLE_CONVENTION,
@@ -228,6 +235,7 @@ def strip_angular_coordinate_declarations(units, extra):
 class GridCoordinatesMixin:
     """Wedge, SENTRi, and elevation-pair coordinate transforms."""
 
+    @dataset_operation('convert_wedge_to_conic')
     def convert_wedge_to_conic(
         self,
         *,
@@ -323,53 +331,62 @@ class GridCoordinatesMixin:
                 "finite polarization sample; power-only data cannot be rotated"
             )
 
-        source_field = np.asarray(self.rcs)[phi_order, ...][:, tau_order, ...]
-        source_jones, labels, cross_note = _jones_from_polarization_channels(
-            source_field,
-            self.polarizations,
-            assume_missing_cross_pol_zero=assume_missing_cross_pol_zero,
-        )
-
-
         from scipy.interpolate import RegularGridInterpolator
 
+        # Keep the interpolation source and result in the selected storage.
+        # Jones reconstruction, interpolation and rotation only hold small tiles.
         phi_interp = np.concatenate((wrapped_phi, [wrapped_phi[0] + 360.0]))
-        jones_interp = np.concatenate(
-            (source_jones, source_jones[:1, ...]), axis=0
+        source_shape = (len(wrapped_phi), len(tau_sorted), len(self.frequencies))
+        jones_interp = allocate_result(
+            (len(phi_interp), len(tau_sorted), len(self.frequencies), 2, 2), np.complex128
         )
-        interpolator = RegularGridInterpolator(
-            (phi_interp, tau_sorted),
-            jones_interp,
-            method="linear",
-            bounds_error=False,
-            fill_value=np.nan,
-        )
+        labels, cross_note = None, None
+        for tile in _bounded_grid_selections(source_shape, 8_192):
+            selection = np.ix_(phi_order[tile[0]], tau_order[tile[1]],
+                               np.arange(tile[2].start, tile[2].stop),
+                               np.arange(len(self.polarizations)))
+            source_jones, labels, cross_note = _jones_from_polarization_channels(
+                self.rcs_slice(selection), self.polarizations,
+                assume_missing_cross_pol_zero=assume_missing_cross_pol_zero,
+            )
+            jones_interp[tile] = source_jones
+        for tile in _bounded_grid_selections(jones_interp.shape[1:], 65_536):
+            jones_interp[(len(wrapped_phi),) + tile] = jones_interp[(0,) + tile]
 
         target_lon = np.mod(-wrapped_phi + 180.0, 360.0) - 180.0
         target_lon[np.abs(target_lon) <= 1.0e-12] = 0.0
         target_lon = np.sort(target_lon, kind="stable")
         target_lat = np.array(tau_sorted, copy=True)
-        lon_mesh, lat_mesh = np.meshgrid(target_lon, target_lat, indexing="ij")
-        query_phi, query_tau = conic_to_wedge_geometry_deg(lon_mesh, lat_mesh)
-        query_phi = (
-            np.mod(query_phi - wrapped_phi[0], 360.0) + wrapped_phi[0]
-        )
-        query = np.column_stack((query_phi.ravel(), query_tau.ravel()))
-        wedge_jones = interpolator(query)
-        change = wedge_to_conic_basis_change(query[:, 0], query[:, 1])
-        conic_jones = np.einsum(
-            "qia,qfij,qjb->qfab", change, wedge_jones, change
-        )
-        conic_channels = _polarization_channels_from_jones(
-            conic_jones, labels
-        )
-        output_shape = (
-            target_lon.size,
-            target_lat.size,
-            self.frequencies.size,
-            self.polarizations.size,
-        )
-        conic_channels = conic_channels.reshape(output_shape)
+        output_shape = (target_lon.size, target_lat.size,
+                        self.frequencies.size, self.polarizations.size)
+        conic_channels = allocate_result(output_shape, np.complex128)
+        supported_count = 0
+        frequency_width = min(32, len(self.frequencies))
+        for frequency_start in range(0, len(self.frequencies), frequency_width):
+            frequency = slice(frequency_start, min(frequency_start + frequency_width, len(self.frequencies)))
+            interpolator = RegularGridInterpolator(
+                (phi_interp, tau_sorted), jones_interp[:, :, frequency],
+                method="linear", bounds_error=False, fill_value=np.nan,
+            )
+            angular_limit = max(1, 8_192 // (frequency.stop - frequency.start))
+            for angular in _bounded_grid_selections(output_shape[:2], angular_limit):
+                lon_mesh, lat_mesh = np.meshgrid(target_lon[angular[0]], target_lat[angular[1]], indexing="ij")
+                query_phi, query_tau = conic_to_wedge_geometry_deg(lon_mesh, lat_mesh)
+                query_phi = np.mod(query_phi - wrapped_phi[0], 360.0) + wrapped_phi[0]
+                query = np.column_stack((query_phi.ravel(), query_tau.ravel()))
+                wedge_jones = interpolator(query)
+                change = wedge_to_conic_basis_change(query[:, 0], query[:, 1])
+                conic_jones = np.einsum("qia,qfij,qjb->qfab", change, wedge_jones, change)
+                channels = _polarization_channels_from_jones(conic_jones, labels)
+                tile_shape = (angular[0].stop - angular[0].start,
+                              angular[1].stop - angular[1].start,
+                              frequency.stop - frequency.start, len(labels))
+                conic_channels[angular + (frequency,)] = channels.reshape(tile_shape)
+                if frequency_start == 0:
+                    supported_count += int(np.count_nonzero(
+                        (query_tau >= tau_sorted[0] - 1.0e-9)
+                        & (query_tau <= tau_sorted[-1] + 1.0e-9)
+                    ))
 
         converted_units = copy.deepcopy(self.units or {})
         converted_units["angular_coordinate_system"] = "conic"
@@ -415,13 +432,7 @@ class GridCoordinatesMixin:
             sort_keys=True,
             separators=(",", ":"),
         )
-        geometric_supported = (
-            (query_tau >= tau_sorted[0] - 1.0e-9)
-            & (query_tau <= tau_sorted[-1] + 1.0e-9)
-        )
-        coverage = 100.0 * float(np.count_nonzero(geometric_supported)) / float(
-            geometric_supported.size
-        )
+        coverage = 100.0 * supported_count / float(target_lon.size * target_lat.size)
         history_entry = (
             "Wedge->Conic physical regrid: inverse direction map; complex "
             f"Jones C^T*S*C rotation ({cross_note}); no extrapolation; "
@@ -442,6 +453,7 @@ class GridCoordinatesMixin:
             history=history,
             units=converted_units,
             extra=converted_extra,
+            _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
         )
 
     def _convert_wedge_waterline_to_conic(self, phi_deg, *, az_unit, attest_wedge_axes):
@@ -457,7 +469,7 @@ class GridCoordinatesMixin:
 
         # At tau=0 the range and conic polarization bases coincide. Going
         # through complex amplitudes would discard valid power-only samples.
-        samples = self._sample_kwargs(transform=lambda values: np.take(values, order, axis=0))
+        samples = self._sample_kwargs(transform=lambda values: take_result(values, order, axis=0))
         original_shape = tuple(self.power.shape)
         stale_grid_metadata = {
             "solver_metadata_json",
@@ -477,7 +489,7 @@ class GridCoordinatesMixin:
                 continue
             array = np.asarray(value)
             if array.ndim >= 4 and tuple(array.shape[:4]) == original_shape:
-                extra[key] = np.take(array, order, axis=0)
+                extra[key] = take_result(array, order, axis=0)
             else:
                 extra[key] = copy.deepcopy(value)
         self._drop_malformed_raw_metadata(extra)
@@ -527,6 +539,7 @@ class GridCoordinatesMixin:
             _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
         )
 
+    @dataset_operation('convert_sentri_elevation_to_grim')
     def convert_sentri_elevation_to_grim(self):
         """Convert native SENTRi polar theta to GRIM signed elevation.
 
@@ -631,7 +644,7 @@ class GridCoordinatesMixin:
             )
 
         samples = self._sample_kwargs(transform=lambda values:
-            np.take(np.take(values, azimuth_order, axis=0), order, axis=1))
+            take_result(take_result(values, azimuth_order, axis=0), order, axis=1))
         original_shape = tuple(self.power.shape)
         stale_grid_metadata = {
             "solver_metadata_json",
@@ -653,8 +666,8 @@ class GridCoordinatesMixin:
                 value_array.ndim >= 4
                 and tuple(value_array.shape[:4]) == original_shape
             ):
-                converted_value = np.take(value_array, azimuth_order, axis=0)
-                converted_extra[key] = np.take(converted_value, order, axis=1)
+                converted_value = take_result(value_array, azimuth_order, axis=0)
+                converted_extra[key] = take_result(converted_value, order, axis=1)
             else:
                 converted_extra[key] = value
 
@@ -711,6 +724,7 @@ class GridCoordinatesMixin:
             _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN,
         )
 
+    @dataset_operation('combine_elevation_pair_to_azimuth_360')
     def combine_elevation_pair_to_azimuth_360(
         self,
         elevation_lo: float | None = None,
@@ -859,87 +873,54 @@ class GridCoordinatesMixin:
             # raw arrays, and no power/phase -> complex conversion afterwards.
             field_domain = self.storage_domain
             stored = self._complex
-            out_field = np.full(out_shape, np.nan + 1j * np.nan, dtype=stored.dtype)
-            for label, target_indices, source_field in (
-                ("lower elevation", lo_target_idx, stored[:, lo_idx, :, :]),
-                ("shifted higher elevation", hi_target_idx, stored[:, hi_idx, :, :]),
+            out_field = allocate_result(out_shape, stored.dtype, fill=np.nan + 1j * np.nan)
+            for label, target_indices, elevation_index in (
+                ("lower elevation", lo_target_idx, lo_idx),
+                ("shifted higher elevation", hi_target_idx, hi_idx),
             ):
                 for src_idx, dst_idx in enumerate(target_indices):
-                    context = (
-                        f"El->Az360 {label} at azimuth "
-                        f"{az_merged[dst_idx]:.12g} {azimuth_unit}"
-                    )
-                    self._merge_equivalent_field_blocks(
-                        out_field[dst_idx, 0, :, :],
-                        source_field[src_idx, :, :],
-                        context=context,
-                        raw=(field_domain == "raw_field"),
-                    )
+                    context = f"El->Az360 {label} at azimuth {az_merged[dst_idx]:.12g} {azimuth_unit}"
+                    for tile in _bounded_grid_selections(out_shape[2:], 65_536):
+                        self._merge_equivalent_field_blocks(
+                            out_field[(dst_idx, 0) + tile],
+                            stored[(src_idx, elevation_index) + tile],
+                            context=context, raw=(field_domain == "raw_field"),
+                        )
             samples = {"rcs": out_field, "rcs_storage_domain": field_domain}
         else:
-            out_power = np.full(out_shape, np.nan, dtype=self.power.dtype)
-            out_phase = np.full(out_shape, np.nan, dtype=self.phase.dtype)
+            out_power = allocate_result(out_shape, self.power.dtype, fill=np.nan)
+            out_phase = allocate_result(out_shape, self.phase.dtype, fill=np.nan)
             raw_pair = self._complete_authoritative_raw_arrays()
             preserve_raw = raw_pair is not None
             if preserve_raw:
                 raw_real = np.asarray(raw_pair[0], dtype=np.float64)
                 raw_imag = np.asarray(raw_pair[1], dtype=np.float64)
-                out_raw_real = np.full(out_shape, np.nan, dtype=np.float64)
-                out_raw_imag = np.full(out_shape, np.nan, dtype=np.float64)
+                out_raw_real = allocate_result(out_shape, np.float64, fill=np.nan)
+                out_raw_imag = allocate_result(out_shape, np.float64, fill=np.nan)
 
-            lo_power = self.power[:, lo_idx, :, :]
-            lo_phase = self.phase[:, lo_idx, :, :]
-            hi_power = self.power[:, hi_idx, :, :]
-            hi_phase = self.phase[:, hi_idx, :, :]
-            if preserve_raw:
-                lo_raw_real = raw_real[:, lo_idx, :, :]
-                lo_raw_imag = raw_imag[:, lo_idx, :, :]
-                hi_raw_real = raw_real[:, hi_idx, :, :]
-                hi_raw_imag = raw_imag[:, hi_idx, :, :]
-
-            for label, target_indices, source_power, source_phase, source_real, source_imag in (
-                (
-                    "lower elevation",
-                    lo_target_idx,
-                    lo_power,
-                    lo_phase,
-                    lo_raw_real if preserve_raw else None,
-                    lo_raw_imag if preserve_raw else None,
-                ),
-                (
-                    "shifted higher elevation",
-                    hi_target_idx,
-                    hi_power,
-                    hi_phase,
-                    hi_raw_real if preserve_raw else None,
-                    hi_raw_imag if preserve_raw else None,
-                ),
+            for label, target_indices, elevation_index in (
+                ("lower elevation", lo_target_idx, lo_idx),
+                ("shifted higher elevation", hi_target_idx, hi_idx),
             ):
                 for src_idx, dst_idx in enumerate(target_indices):
-                    context = (
-                        f"El->Az360 {label} at azimuth "
-                        f"{az_merged[dst_idx]:.12g} {azimuth_unit}"
-                    )
-                    self._merge_equivalent_sample_blocks(
-                        out_power[dst_idx, 0, :, :],
-                        out_phase[dst_idx, 0, :, :],
-                        source_power[src_idx, :, :],
-                        source_phase[src_idx, :, :],
-                        context=context,
-                    )
-                    if preserve_raw:
-                        self._merge_equivalent_raw_blocks(
-                            out_raw_real[dst_idx, 0, :, :],
-                            out_raw_imag[dst_idx, 0, :, :],
-                            source_real[src_idx, :, :],
-                            source_imag[src_idx, :, :],
-                            context=context,
+                    context = f"El->Az360 {label} at azimuth {az_merged[dst_idx]:.12g} {azimuth_unit}"
+                    for tile in _bounded_grid_selections(out_shape[2:], 65_536):
+                        source = (src_idx, elevation_index) + tile
+                        target = (dst_idx, 0) + tile
+                        self._merge_equivalent_sample_blocks(
+                            out_power[target], out_phase[target],
+                            self.power[source], self.phase[source], context=context,
                         )
-
+                        if preserve_raw:
+                            self._merge_equivalent_raw_blocks(
+                                out_raw_real[target], out_raw_imag[target],
+                                raw_real[source], raw_imag[source], context=context,
+                            )
             if preserve_raw:
-                unmodeled = ~np.isfinite(out_power)
-                out_raw_real[unmodeled] = np.nan
-                out_raw_imag[unmodeled] = np.nan
+                for selection in _bounded_grid_selections(out_shape, 65_536):
+                    unmodeled = ~np.isfinite(out_power[selection])
+                    out_raw_real[selection][unmodeled] = np.nan
+                    out_raw_imag[selection][unmodeled] = np.nan
             samples = {"rcs_power": out_power, "rcs_phase": out_phase}
 
         combined_extra = self._exact_transform_extra(

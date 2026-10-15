@@ -77,7 +77,7 @@ class PythonWorkflowHelperTests(unittest.TestCase):
         np.testing.assert_array_equal(result.polarizations, ["HH"])
         self.assertEqual(result.rcs_power.shape, (2, 2, 2, 1))
         self.assertEqual(result.source_path, source.source_path)
-        self.assertEqual(result.history, source.history)
+        self.assertTrue(result.history.startswith(source.history + '\nGRIM operation: crop_dataset'))
         self.assertEqual(result.units, source.units)
         self.assertEqual(result.extra["phase_reference"], "vehicle origin")
 
@@ -104,7 +104,7 @@ class PythonWorkflowHelperTests(unittest.TestCase):
         )
         for result in (explicit, resolved):
             self.assertEqual(result.source_path, source.source_path)
-            self.assertEqual(result.history, source.history)
+            self.assertTrue(result.history.startswith(source.history + '\nGRIM operation: regrid_axis'))
             self.assertEqual(result.extra["phase_reference"], "vehicle origin")
 
     def test_regrid_axis_rejects_ambiguous_or_unsafe_grid_specs(self):

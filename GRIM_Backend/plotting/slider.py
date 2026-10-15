@@ -99,10 +99,18 @@ class PlotSliderMixin:
                       for artist in (*ax.lines, *ax.collections)}
         self._render_plot_mode(mode)
         if hold:
-            # Keep pre-existing held bands, but replace this slider's own
-            # previous curves and bands. Markers re-snap after every render.
-            for ax in self.plot_figure.axes:
-                for artist in (*ax.lines, *ax.collections):
-                    key = getattr(artist, "_grim_dataset_key", None)
-                    if id(artist) not in before and key is not None:
-                        artist._grim_slider_trace = True
+            if getattr(self, "_ordinary_plot_pending", False):
+                # Numerical work may finish later. Tag only the artists from
+                # that publication so the next scrub replaces its own traces.
+                self._ordinary_plot_slider_before = before
+            else:
+                self._tag_plot_slider_artists(before)
+
+    def _tag_plot_slider_artists(self, before) -> None:
+        # Keep pre-existing held bands, but replace this slider's own
+        # previous curves and bands. Markers re-snap after every render.
+        for ax in self.plot_figure.axes:
+            for artist in (*ax.lines, *ax.collections):
+                key = getattr(artist, "_grim_dataset_key", None)
+                if id(artist) not in before and key is not None:
+                    artist._grim_slider_trace = True

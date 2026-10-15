@@ -33,6 +33,14 @@ The [setup instructions](../offline%20packages/README.txt) include
 the optional manual wheel download command. Keep the sibling `tools` directory in the
 distribution for FREDDY and GHOST.
 
+Before distributing an offline release, use the optional root
+**Validate_GRIM.bat** to exercise file round trips, operations, plotting, and
+the application window with the supplied runtime. The
+[release validation guide](RELEASE_VALIDATION.md) explains the acceptance
+manifest and export of a folder containing the exact validated wheels.
+The [architecture guide](ARCHITECTURE.md) describes the shared dataset,
+plot-preparation, workspace, and operation-history services.
+
 ## Running from a development checkout
 
 GRIM is not a pip package: there is no `pyproject.toml`, no editable install,

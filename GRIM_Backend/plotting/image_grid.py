@@ -95,7 +95,7 @@ def _display_axis(support, target):
     return np.asarray(edges), starts, np.asarray(mapping), np.asarray(centers)
 
 
-def image_grid(x, y, values, *, x_width=1., y_width=1., target_shape=None, return_samples=False):
+def image_grid(x, y, values, *, x_width=1., y_width=1., target_shape=None, return_samples=False, cancel=None):
     """Return explicit X/Y edges and a row-by-column, gap-masked image.
 
     ``target_shape`` is (rows, columns). Band boundaries may add a few blocks
@@ -108,7 +108,8 @@ def image_grid(x, y, values, *, x_width=1., y_width=1., target_shape=None, retur
     rows, columns = values.shape if target_shape is None else target_shape
     xe, xi, xm, xc = _display_axis(xs, columns)
     ye, yi, ym, yc = _display_axis(ys, rows)
-    reduced = np.fmax.reduceat(np.fmax.reduceat(values, yi, axis=0), xi, axis=1)
+    from .modes.common import block_max_image
+    reduced = block_max_image(values, yi, xi, cancel=cancel)
     output = reduced[np.ix_(np.maximum(ym, 0), np.maximum(xm, 0))]
     output[(ym < 0), :] = np.nan
     output[:, (xm < 0)] = np.nan

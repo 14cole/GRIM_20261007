@@ -1,6 +1,7 @@
 """The CEM Tools ``.out`` writer keeps its text while reading each cut once."""
 
 from itertools import product
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -14,12 +15,13 @@ sys.path.insert(0, str(ROOT / "data_tools"))
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent))
 
-from cem_tools.grim_bridge import _rcs_grid_class, export_dataset, load_dataset  # noqa: E402
+from cem_tools.grim_bridge import _rcs_grid_class, _safe_token, export_dataset, load_dataset  # noqa: E402
 
 
 def _former_out_text(grid, elevation_index, polarization_index):
     """The per-cell loop the writer replaced: legacy attribute reads per sample."""
-    lines = ["# frequency_GHz azimuth_deg rcs_dBke phase_deg\n"]
+    lines = ["# frequency_GHz azimuth_deg rcs_dBke phase_deg\n",
+             "# polarization: " + json.dumps(str(grid.polarizations[polarization_index])) + "\n"]
     for iff, frequency in enumerate(grid.frequencies):
         wavelength = 299_792_458.0 / (float(frequency) * 1e9)
         for ia, azimuth in enumerate(grid.azimuths):
@@ -95,6 +97,36 @@ class GrimBridgeOutTest(unittest.TestCase):
             np.asarray(loaded.power)[:, 0, :, 0], np.asarray(grid.power)[:, 0, :, 0], rtol=1e-12,
         )
         self.assertEqual(list(loaded.polarizations), ["HH"])
+
+    def test_axis_units_are_converted_before_dbke_and_text_export(self):
+        grid_class = _rcs_grid_class()
+        for angle_unit, azimuth in (("deg", 90.), ("rad", np.pi / 2.)):
+            for frequency_unit, frequency in (("GHz", 10.), ("MHz", 10000.), ("kHz", 1.e7), ("Hz", 1.e10)):
+                with self.subTest(angle_unit=angle_unit, frequency_unit=frequency_unit):
+                    grid = grid_class([azimuth], [0.], [frequency], ["VV"],
+                        rcs=np.full((1, 1, 1, 1), 3.+4.j), units={
+                            "azimuth": angle_unit, "elevation": "deg", "frequency": frequency_unit,
+                            "rcs_linear_quantity": "sigma_2d", "rcs_log_unit": "dBke"})
+                    path, = export_dataset(grid, self.root / f"{angle_unit}_{frequency_unit}", ".out")
+                    row = np.loadtxt(path)
+                    expected = 10. * np.log10(25. * 2. * np.pi / (299_792_458. / 1.e10))
+                    np.testing.assert_allclose(row, [10., 90., expected, np.degrees(np.arctan2(4., 3.))])
+                    restored = load_dataset(path)
+                    np.testing.assert_allclose(restored.frequencies, [10.])
+                    np.testing.assert_allclose(restored.azimuths, [90.])
+                    np.testing.assert_allclose(restored.power, 25.)
+
+    def test_single_channel_identity_survives_arbitrary_output_names(self):
+        grid_class = _rcs_grid_class()
+        for channel in ("HH", "VV", "HV", "VH", "TE", "custom receive channel", r"L\R:/test"):
+            with self.subTest(channel=channel):
+                grid = grid_class([0.], [0.], [10.], [channel], rcs=np.ones((1, 1, 1, 1), complex),
+                    units={"rcs_linear_quantity": "sigma_2d", "rcs_log_unit": "dBke"})
+                path, = export_dataset(grid, self.root / f"requested_HH_VV_{len(list(self.root.iterdir()))}", ".out")
+                expected = str(grid.polarizations[0])
+                self.assertEqual(path.parent, self.root)
+                self.assertIn("_" + _safe_token(expected) + ".out", path.name)
+                self.assertEqual(list(load_dataset(path).polarizations), [expected])
 
 
 if __name__ == "__main__":

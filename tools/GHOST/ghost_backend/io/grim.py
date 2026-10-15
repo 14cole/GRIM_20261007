@@ -8,6 +8,10 @@ from io import StringIO
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+from ghost_backend.data_tools.cem_tools.native_samples import (
+    SampleComponent, decode_native_samples, encode_native_samples, grid_blocks,
+    legacy_components, raw_amplitude,
+)
 
 C0 = 299_792_458.0
 EPS = 1e-12
@@ -420,16 +424,17 @@ def _build_grid_for_samples(
                 f'Duplicate amplitude conflict at az={az}, el=0, f={freq}, pol={polarization}.'
             )
 
-    rcs_phase = np.full(shape, np.nan, dtype=np.float32)
     rcs_power = np.full(shape, np.nan, dtype=np.float32)
     rcs_power.flat[unique_cells] = linear[first]
-    rcs_phase.flat[unique_cells] = phase[first]
-    rcs_amp_real = rcs_amp_imag = None
+    raw_field = None
     if preserve_raw_complex_amplitude:
-        rcs_amp_real = np.full(shape, np.nan, dtype=np.float64)
-        rcs_amp_imag = np.full(shape, np.nan, dtype=np.float64)
-        rcs_amp_real.flat[unique_cells] = amp_real[first]
-        rcs_amp_imag.flat[unique_cells] = amp_imag[first]
+        raw_field = np.full(shape, complex(np.nan, np.nan), dtype=np.complex128)
+        raw_field.real.flat[unique_cells] = amp_real[first]
+        raw_field.imag.flat[unique_cells] = amp_imag[first]
+        rcs_phase = SampleComponent(raw_field, "phase", dtype=np.float32)
+    else:
+        rcs_phase = np.full(shape, np.nan, dtype=np.float32)
+        rcs_phase.flat[unique_cells] = phase[first]
 
     missing = np.argwhere(~np.isfinite(rcs_power))
     if missing.size:
@@ -439,11 +444,11 @@ def _build_grid_for_samples(
             f"(angle x frequency x polarization) grid: {len(missing)} cell(s) "
             f"are missing; first missing index is {first_missing}."
         )
-    if not np.all(np.isfinite(rcs_phase)):
+    if not np.all(np.isfinite(phase[first])):
         raise ValueError("Solver sample phases are not finite after grid construction.")
     if preserve_raw_complex_amplitude and (
-        not np.all(np.isfinite(rcs_amp_real))
-        or not np.all(np.isfinite(rcs_amp_imag))
+        not np.all(np.isfinite(amp_real[first]))
+        or not np.all(np.isfinite(amp_imag[first]))
     ):
         raise ValueError(
             "Solver complex amplitudes are not finite after grid construction."
@@ -496,9 +501,15 @@ def _build_grid_for_samples(
     if solver_metadata_json:
         payload['solver_metadata_json'] = str(solver_metadata_json)
     if preserve_raw_complex_amplitude:
-        payload['rcs_amp_real'] = rcs_amp_real
-        payload['rcs_amp_imag'] = rcs_amp_imag
         payload['complex_field_domain'] = complex_field_domain
+        compact = legacy_components(payload, raw_field, component_dtype=np.float32)
+        # Solver rows supply independent power values. Keep any discrepancy,
+        # including tiny edits, for the existing consistency validation;
+        # ordinary canonical rows retain only the complex field in memory.
+        if any(not np.array_equal(compact['rcs_power'][selection], rcs_power[selection])
+               for selection in grid_blocks(shape)):
+            compact['rcs_power'] = rcs_power
+        payload = compact
     return payload
 
 
@@ -569,12 +580,13 @@ def _build_grid_for_co_solved_samples(
 
     combined['polarization_alias_primary'] = ','.join(internal_labels)
     combined['polarization_aliases_json'] = json.dumps(internal_labels)
-    for grid_name in ('rcs_power', 'rcs_phase'):
-        combined[grid_name] = np.concatenate(
-            [payload[grid_name] for payload in channel_payloads], axis=-1
-        )
     if preserve_raw_complex_amplitude:
-        for grid_name in ('rcs_amp_real', 'rcs_amp_imag'):
+        field = np.concatenate([raw_amplitude(payload) for payload in channel_payloads], axis=-1)
+        combined = legacy_components(combined, field, component_dtype=np.float32)
+        if any(not isinstance(payload['rcs_power'], SampleComponent) for payload in channel_payloads):
+            combined['rcs_power'] = np.concatenate([payload['rcs_power'] for payload in channel_payloads], axis=-1)
+    else:
+        for grid_name in ('rcs_power', 'rcs_phase'):
             combined[grid_name] = np.concatenate(
                 [payload[grid_name] for payload in channel_payloads], axis=-1
             )
@@ -582,6 +594,7 @@ def _build_grid_for_co_solved_samples(
 
 def _validate_grim_payload(payload: 'Dict[str, Any]') -> 'None':
     """Reject malformed/non-finite grids before opening the destination file."""
+    payload = decode_native_samples(payload)
 
     axes = {}
     for key in ('azimuths', 'elevations', 'frequencies'):
@@ -656,6 +669,20 @@ def _validate_grim_payload(payload: 'Dict[str, Any]') -> 'None':
             raise ValueError(f"GRIM grid '{key}' contains negative linear power.")
         return grid
 
+    sample_keys = ('rcs_power', 'rcs_phase', 'rcs_amp_real', 'rcs_amp_imag', 'combination_estimate_power')
+    if (int(np.prod(expected_shape)) > 262144
+            or any(isinstance(payload.get(key), SampleComponent) for key in sample_keys)):
+        for selection in grid_blocks(expected_shape):
+            part = dict(payload)
+            for key, index in zip(('azimuths', 'elevations', 'frequencies', 'polarizations'), selection):
+                part[key] = np.asarray(payload[key])[index]
+            for key in sample_keys:
+                if key in payload:
+                    if np.shape(payload[key]) != expected_shape:
+                        raise ValueError(f"GRIM grid '{key}' shape does not match axes {expected_shape}")
+                    part[key] = np.asarray(payload[key][selection])
+            _validate_grim_payload(part)
+        return
     stored_power = finite_grid('rcs_power', nonnegative=True)
     stored_phase = finite_grid('rcs_phase')
 
@@ -733,17 +760,23 @@ def _save_grim_npz(
 ) -> 'str':
     """Validate ``payload`` and write it atomically as a ``.grim`` archive.
 
-    Version 2, the default, stores a payload's raw complex amplitude once as
+    Version 2, the default, stores a consistent payload's raw complex amplitude once as
     ``rcs_complex`` (complex128) with GRIM's ``grim_format_version``,
     ``storage_kind`` and ``storage_domain`` framing; ``rcs_power``,
     ``rcs_phase``, ``rcs_amp_real`` and ``rcs_amp_imag`` are omitted and every
     reader derives power and phase from the field under
     ``units.rcs_linear_quantity``.  Version 1 keeps those four arrays.  A
-    payload without a raw pair is written in the version-1 layout whichever
+    Explicitly edited compatibility components are retained as power/phase
+    storage when the field cannot reproduce them. A payload without a raw pair is written in the version-1 layout whichever
     version is requested; every other metadata key is identical in both.
     ``format_version=None`` consults ``GHOST_GRIM_FORMAT_VERSION``.
     """
     version = _resolve_grim_format_version(format_version)
+    preserve_components = str(payload.get('storage_kind', '')) == 'power_phase'
+    payload = decode_native_samples(payload)
+    preserve_components |= any(isinstance(payload.get(key), SampleComponent)
+                               and payload[key]._detached is not None
+                               for key in ('rcs_power', 'rcs_phase'))
     _validate_grim_payload(payload)
     out = _ensure_grim_ext(path)
     destination_dir = os.path.dirname(os.path.abspath(out))
@@ -784,19 +817,22 @@ def _save_grim_npz(
             if has_raw_pair:
 
 
-                real = np.asarray(payload['rcs_amp_real'], dtype=np.float64)
-                imag = np.asarray(payload['rcs_amp_imag'], dtype=np.float64)
                 if compact:
-                    field = np.empty(real.shape, dtype=np.complex128)
-                    field.real = real
-                    field.imag = imag
-                    save_payload['grim_format_version'] = np.asarray(2, dtype=np.int16)
-                    save_payload['storage_kind'] = 'complex'
-                    save_payload['storage_domain'] = 'raw_field'
-                    save_payload['rcs_complex'] = field
+                    # Ordinary solver payloads retain the established raw
+                    # authority (including arbitrary phase at exact zero).
+                    # Only explicit compatibility edits need the lossless
+                    # component-preservation decision.
+                    encoded = encode_native_samples(payload) if preserve_components else dict(
+                        grim_format_version=np.int16(2), storage_kind='complex',
+                        storage_domain='raw_field', rcs_complex=raw_amplitude(payload))
+                    for key in ('grim_format_version', 'storage_kind', 'storage_domain',
+                                'rcs_complex', 'rcs_power', 'rcs_phase', 'rcs_amp_real', 'rcs_amp_imag',
+                                'raw_complex_amplitude_preserved'):
+                        if key in encoded:
+                            save_payload[key] = encoded[key]
                 else:
-                    save_payload['rcs_amp_real'] = real
-                    save_payload['rcs_amp_imag'] = imag
+                    save_payload['rcs_amp_real'] = payload['rcs_amp_real']
+                    save_payload['rcs_amp_imag'] = payload['rcs_amp_imag']
                 save_payload['complex_field_domain'] = payload.get(
                     'complex_field_domain',
                     'solver_raw_far_field_amplitude',
@@ -1126,7 +1162,7 @@ def export_result_to_grim(
 
 
 class DecodedGrimArrays(dict):
-    """Archive arrays expanded to the version-1 keys.
+    """Archive components exposed through the version-1 keys.
 
     ``files`` and the context-manager protocol mirror ``np.load`` so code that
     reopened GHOST output with ``np.load`` can call :func:`load_grim_npz` in
@@ -1147,9 +1183,10 @@ class DecodedGrimArrays(dict):
 def load_grim_npz(path: 'str') -> 'DecodedGrimArrays':
     """Read a ``.grim`` archive as the version-1 key set GHOST consumers expect.
 
-    A version-2 archive (``rcs_complex``) is expanded through
-    ``decode_native_samples`` to ``rcs_power``, ``rcs_phase``, ``rcs_amp_real``
-    and ``rcs_amp_imag``; a version-1 archive is returned unchanged.
+    A version-2 archive (``rcs_complex``) exposes lazy ``rcs_power``,
+    ``rcs_phase``, ``rcs_amp_real`` and ``rcs_amp_imag`` components. Indexing
+    derives only the selected cells; explicit NumPy conversion provides a
+    writable legacy array. A version-1 archive is returned unchanged.
     """
     from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples
     with np.load(path, allow_pickle=False) as data:

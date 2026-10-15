@@ -245,91 +245,54 @@ def _validate_grim_axes(d, path):
 
 
 def _decode_grim_fields(d, path):
-    """Validate and normalize stored fields, including power/phase exports."""
-    from ghost_backend.data_tools.cem_tools.native_samples import decode_native_samples
+    """Validate bounded component slices and retain the authoritative field."""
+    from ghost_backend.data_tools.cem_tools.native_samples import (
+        decode_native_samples, grid_blocks, raw_amplitude,
+    )
     d = decode_native_samples(d, label=str(path))
     axes, pols = _validate_grim_axes(d, path)
-
-    shape = (
-        len(axes["azimuths"]),
-        len(axes["elevations"]),
-        len(axes["frequencies"]),
-        len(pols),
-    )
-
-    def _field(key: 'str', *, nonnegative: 'bool' = False) -> 'np.ndarray':
+    shape = tuple(len(values) for values in axes.values()) + (len(pols),)
+    has_real, has_imag = "rcs_amp_real" in d, "rcs_amp_imag" in d
+    if has_real != has_imag:
+        raise ValueError(f"{path}: complex amplitude must provide both rcs_amp_real and rcs_amp_imag.")
+    keys = ("rcs_power", "rcs_phase") + (("rcs_amp_real", "rcs_amp_imag") if has_real else ())
+    for key in keys:
         if key not in d:
             raise ValueError(f"{path}: missing GRIM field {key!r}.")
-        values = np.asarray(d[key], dtype=float)
-        if values.shape != shape:
-            raise ValueError(
-                f"{path}: {key} shape {values.shape} does not match axes "
-                f"{shape}.")
-        if not np.all(np.isfinite(values)):
-            raise ValueError(f"{path}: {key} contains NaN or infinity.")
-        if nonnegative and np.any(values < 0.0):
-            raise ValueError(f"{path}: {key} contains negative values.")
-        return values
-
-    power = _field("rcs_power", nonnegative=True)
-    phase = _field("rcs_phase")
-    has_real = "rcs_amp_real" in d
-    has_imag = "rcs_amp_imag" in d
-    if has_real != has_imag:
-        raise ValueError(
-            f"{path}: complex amplitude must provide both rcs_amp_real and "
-            "rcs_amp_imag.")
+        if np.shape(d[key]) != shape:
+            raise ValueError(f"{path}: {key} shape {np.shape(d[key])} does not match axes {shape}.")
     if "raw_complex_amplitude_preserved" in d and not has_real:
         _record_metadata_advisory(d, f"{path}: no raw amplitude arrays; complex fields reconstructed from the supplied power and phase.")
-
-    scale = np.asarray(
-        convention_scale(d, axes["frequencies"]), dtype=float)
-    scale_grid = (
-        scale[None, None, :, None] if scale.size > 1 else float(scale.ravel()[0])
-    )
-    if has_real:
-        real = _field("rcs_amp_real")
-        imag = _field("rcs_amp_imag")
-        amp = real + 1j * imag
-        with np.errstate(over="ignore", invalid="ignore"):
-            scaled_real = real * scale_grid
-            scaled_imag = imag * scale_grid
-            expected_power = (
-                scaled_real * scaled_real + scaled_imag * scaled_imag
-            )
-        if not np.all(np.isfinite(expected_power)):
-            raise ValueError(
-                f"{path}: complex amplitude is too large to form finite "
-                "physical power under the declared normalization."
-            )
-        tolerance = (
-            16.0 * np.finfo(np.float32).eps
-            * np.maximum(expected_power, power)
-            + np.finfo(np.float32).tiny
-        )
-        if np.any(np.abs(power - expected_power) > tolerance):
-            raise ValueError(
-                f"{path}: rcs_power is inconsistent with its complex "
-                "amplitude and declared 2-D/3-D normalization.")
-        live = (
-            np.abs(real) > np.finfo(np.float32).tiny
-        ) | (
-            np.abs(imag) > np.finfo(np.float32).tiny
-        )
-        if np.any(live):
-            phase_error = np.abs(np.angle(np.exp(
-                1j * (phase[live] - np.angle(amp[live]))
-            )))
-            if float(np.max(phase_error)) > 2.0e-5:
-                raise ValueError(
-                    f"{path}: rcs_phase is inconsistent with its complex "
-                    "amplitude.")
-        d["_amp"] = amp
-    else:
-
-
-        amp = np.sqrt(power) * np.exp(1j * phase)
-        d["_amp"] = amp / scale_grid
+    scale = np.asarray(convention_scale(d, axes["frequencies"]), dtype=float)
+    scale_grid = scale[None, None, :, None] if scale.size > 1 else float(scale.ravel()[0])
+    amp = raw_amplitude(d) if has_real else np.empty(shape, dtype=np.complex128)
+    for selection in grid_blocks(shape):
+        values = {key: np.asarray(d[key][selection], dtype=float) for key in keys}
+        for key, value in values.items():
+            if not np.all(np.isfinite(value)):
+                raise ValueError(f"{path}: {key} contains NaN or infinity.")
+        power, phase = values["rcs_power"], values["rcs_phase"]
+        if np.any(power < 0):
+            raise ValueError(f"{path}: rcs_power contains negative values.")
+        factor = np.broadcast_to(scale_grid, shape)[selection] if np.ndim(scale_grid) else scale_grid
+        if has_real:
+            real, imag = values["rcs_amp_real"], values["rcs_amp_imag"]
+            with np.errstate(over="ignore", invalid="ignore"):
+                expected_power = (real * factor) ** 2 + (imag * factor) ** 2
+            if not np.all(np.isfinite(expected_power)):
+                raise ValueError(f"{path}: complex amplitude is too large to form finite physical power under the declared normalization.")
+            tolerance = 16. * np.finfo(np.float32).eps * np.maximum(expected_power, power) + np.finfo(np.float32).tiny
+            if np.any(np.abs(power - expected_power) > tolerance):
+                raise ValueError(f"{path}: rcs_power is inconsistent with its complex amplitude and declared 2-D/3-D normalization.")
+            live = (np.abs(real) > np.finfo(np.float32).tiny) | (np.abs(imag) > np.finfo(np.float32).tiny)
+            if np.any(live):
+                error = np.abs(np.angle(np.exp(1j * (phase[live] - np.angle(amp[selection][live])))))
+                if float(np.max(error)) > 2.e-5:
+                    raise ValueError(f"{path}: rcs_phase is inconsistent with its complex amplitude.")
+        else:
+            amp[selection] = np.sqrt(power) * np.exp(1j * phase) / factor
+    d["_amp"] = amp
+    if not has_real:
         d["_amp_from_power_phase"] = True
     d["_pol_primary"] = str(d.get("polarization_alias_primary", ""))
     return d
@@ -2535,7 +2498,7 @@ def _load_pattern(pattern, *, declared_coherent_delta=False,
         fr = np.asarray(g["frequencies"], float)
         pols = [str(p) for p in np.asarray(g["polarizations"]).ravel()]
         if "rcs_amp_real" in g and "rcs_amp_imag" in g:
-            amp = g["rcs_amp_real"] + 1j * g["rcs_amp_imag"]
+            amp = g["_amp"]
         elif declared_coherent_delta and g.get("_amp_from_power_phase", False):
 
 
@@ -2554,26 +2517,24 @@ def _load_pattern(pattern, *, declared_coherent_delta=False,
                 "units for sigma_3d.")
         if "rcs_power" not in g:
             raise ValueError(f"{pattern}: compact-feature pattern has no rcs_power.")
-        stored_power = np.asarray(g["rcs_power"], dtype=float)
-        with np.errstate(over="ignore", invalid="ignore"):
-            amplitude_squared = np.abs(np.asarray(amp, dtype=complex)) ** 2
-            predicted_power = 4.0 * math.pi * amplitude_squared
-        if stored_power.shape != amp.shape:
+        if np.shape(g["rcs_power"]) != amp.shape:
             raise ValueError(
-                f"{pattern}: rcs_power shape {stored_power.shape} does not "
+                f"{pattern}: rcs_power shape {np.shape(g['rcs_power'])} does not "
                 f"match complex-field shape {amp.shape}.")
-        tolerance = (
-            8.0 * np.finfo(np.float32).eps
-            * np.maximum(predicted_power, stored_power)
-            + np.finfo(np.float32).tiny
-        )
-        if (not np.all(np.isfinite(stored_power))
-                or not np.all(np.isfinite(predicted_power))
-                or np.any(stored_power < 0.0)
-                or np.any(np.abs(stored_power - predicted_power) > tolerance)):
-            raise ValueError(
-                f"{pattern}: rcs_power is inconsistent with the 3-D complex "
-                "field; require rcs_power=4*pi*|F|^2.")
+        from ghost_backend.data_tools.cem_tools.native_samples import grid_blocks
+        for selection in grid_blocks(amp.shape):
+            stored_power = np.asarray(g["rcs_power"][selection], dtype=float)
+            with np.errstate(over="ignore", invalid="ignore"):
+                predicted_power = 4.0 * math.pi * np.abs(amp[selection])**2
+            tolerance = (8.0 * np.finfo(np.float32).eps
+                         * np.maximum(predicted_power, stored_power) + np.finfo(np.float32).tiny)
+            if (not np.all(np.isfinite(stored_power))
+                    or not np.all(np.isfinite(predicted_power))
+                    or np.any(stored_power < 0.0)
+                    or np.any(np.abs(stored_power - predicted_power) > tolerance)):
+                raise ValueError(
+                    f"{pattern}: rcs_power is inconsistent with the 3-D complex "
+                    "field; require rcs_power=4*pi*|F|^2.")
     else:
         pattern = dict(pattern)
         _validate_point_pattern_metadata(
@@ -4677,10 +4638,8 @@ def assembly_response_physics_sha256(
             raise ValueError(
                 f"{label}: authoritative complex amplitude is unavailable."
             )
-        amplitude = (
-            np.asarray(payload["rcs_amp_real"], dtype=np.float64)
-            + 1j * np.asarray(payload["rcs_amp_imag"], dtype=np.float64)
-        )
+        from ghost_backend.data_tools.cem_tools.native_samples import raw_amplitude
+        amplitude = raw_amplitude(payload)
     amplitude = np.asarray(amplitude, dtype=np.complex128)
     digest = hashlib.sha256()
     digest.update(b"ghost.assembly-base-response-physics-v1\0")

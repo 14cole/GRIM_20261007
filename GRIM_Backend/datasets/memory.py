@@ -59,6 +59,10 @@ def _available_import_memory_bytes():
 
 
 def _default_dense_import_limit_bytes():
+    from GRIM_Backend.datasets.load_policy import current_import_memory_budget
+    override = current_import_memory_budget()
+    if override is not None:
+        return override
     available = _available_import_memory_bytes()
     if available is None:
         return _DENSE_IMPORT_FALLBACK_LIMIT_BYTES
@@ -205,37 +209,11 @@ def _checked_dense_import_allocation(
     }
 
 
-def _preflight_native_archive_allocation(
-    path,
-    *,
-    allow_legacy_pickle=False,
-    max_output_bytes=None,
-):
-    """Validate NPZ member framing and peak eager-load bytes before extraction.
-
-    ``np.load`` defers each compressed member until subscription.  Without a
-    central-directory/header preflight, a tiny archive can declare a huge NPY
-    shape and trigger a multi-gigabyte allocation before GRIM sees the axes.
-    This reads only bounded NPY headers, verifies their declared data lengths,
-    and applies the same configurable memory policy as direct dense imports.
-    """
-
-    if max_output_bytes is None:
-        limit = _default_dense_import_limit_bytes()
-    else:
-        if isinstance(max_output_bytes, (bool, np.bool_)):
-            raise ValueError("native .grim max_output_bytes must be a positive integer")
-        try:
-            limit = operator.index(max_output_bytes)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                "native .grim max_output_bytes must be a positive integer"
-            ) from exc
-        if limit <= 0:
-            raise ValueError("native .grim max_output_bytes must be a positive integer")
-
+def _native_archive_header_report(path, *, allow_legacy_pickle=False):
+    """Check every member's declared framing without decoding sample arrays."""
     member_payload_bytes: dict[str, int] = {}
     member_element_counts: dict[str, int] = {}
+    member_layouts = {}
     try:
         with zipfile.ZipFile(path, "r") as archive:
             infos = [info for info in archive.infolist() if not info.is_dir()]
@@ -265,15 +243,6 @@ def _preflight_native_archive_allocation(
                 )
 
             declared_uncompressed = sum(max(0, int(info.file_size)) for info in infos)
-            if declared_uncompressed > limit:
-                raise MemoryError(
-                    f"{path} declares {declared_uncompressed / 1024**3:.2f} GiB "
-                    "of uncompressed native members, above the current "
-                    f"{limit / 1024**3:.2f} GiB load limit. Use a machine with "
-                    "more available memory or pass a larger reviewed "
-                    "max_output_bytes value."
-                )
-
             for info in infos:
                 with archive.open(info, "r") as member:
                     version = np.lib.format.read_magic(member)
@@ -330,6 +299,7 @@ def _preflight_native_archive_allocation(
                 member_payload_bytes[info.filename[:-4]] = payload_bytes
                 if not dtype.hasobject:
                     member_element_counts[info.filename[:-4]] = element_count
+                    member_layouts[info.filename[:-4]] = (shape, _fortran, dtype)
     except (zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
         raise ValueError(f"{path} is not a valid native .grim/NPZ archive") from exc
 
@@ -353,7 +323,7 @@ def _preflight_native_archive_allocation(
     if not ((has_version and (has_complex or has_power)) or (has_power and has_phase)):
         raise ValueError(f"{path} is not a supported .grim file (missing sample arrays)")
     retained_bytes = sum(member_payload_bytes.values())
-    # A complex64/complex128 member without a retained raw pair is adopted by
+    # A native, C-contiguous complex64/complex128 member without a raw pair is adopted by
     # load() as the stored field after its bounded block validation, so only
     # that scan's scratch is transient.  Any other complex archive still pays
     # one canonical copy plus full-grid masks during construction.
@@ -362,8 +332,14 @@ def _preflight_native_archive_allocation(
     if has_complex:
         cells = member_element_counts.get("rcs_complex", 0)
         scratch = min(cells, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS) * 128
+        shape, fortran, dtype = member_layouts.get("rcs_complex", ((), True, None))
+        # Match io.native._owned_decoded_member: a Fortran-order reshape of
+        # NumPy's decoded buffer cannot be adopted. Degenerate F arrays with
+        # at most one non-singleton dimension are also C-contiguous.
+        c_contiguous = not fortran or sum(dimension > 1 for dimension in shape) <= 1
         adopted = (
-            member_payload_bytes.get("rcs_complex", 0) in (8 * cells, 16 * cells)
+            dtype in (np.dtype(np.complex64), np.dtype(np.complex128))
+            and c_contiguous
             and not any(key in member_payload_bytes for key in ("rcs_amp_real", "rcs_amp_imag"))
         )
         validation_bytes = scratch if adopted else sample_bytes + max(3 * cells, scratch)
@@ -373,21 +349,125 @@ def _preflight_native_archive_allocation(
         declared_uncompressed,
         retained_bytes + validation_bytes,
     )
-    if peak_bytes > limit:
-        raise MemoryError(
-            f"{path} needs about {peak_bytes / 1024**3:.2f} GiB peak memory "
-            "for eager native load and validation, above the current "
-            f"{limit / 1024**3:.2f} GiB limit. Close other datasets, use a "
-            "machine with more available memory, or pass a larger reviewed "
-            "max_output_bytes value."
-        )
     return {
         "member_payload_bytes": member_payload_bytes,
+        "member_layouts": member_layouts,
         "declared_uncompressed_bytes": declared_uncompressed,
         "retained_bytes": retained_bytes,
         "estimated_peak_bytes": peak_bytes,
-        "limit_bytes": limit,
+        "allow_legacy_pickle": bool(allow_legacy_pickle),
     }
+
+
+def estimate_native_archive_allocation(path, *, storage="memory", selection=None,
+                                       allow_legacy_pickle=False):
+    """Return the loader's estimate without applying a policy memory cap.
+
+    Disk storage budgets bounded extraction/validation buffers and mapped
+    working pages, not the full file-backed address range. The OS may cache
+    additional pages and can reclaim those pages. This is an estimate, not
+    a guarantee that unrelated operations will fit in memory.
+    """
+    if storage not in {"memory", "disk"}:
+        raise ValueError("storage must be 'memory' or 'disk'")
+    path = os.fspath(path)
+    if not path.casefold().endswith(".grim"):
+        path += ".grim"
+    report = _native_archive_header_report(path, allow_legacy_pickle=allow_legacy_pickle)
+    return _native_allocation_from_headers(path, report, storage=storage, selection=selection)
+
+
+def _native_allocation_from_headers(path, report, *, storage, selection):
+    from GRIM_Backend.io.native_cache import native_component_dtype, selection_indices
+    axes, indices, units = selection_indices(path, report, selection)
+    source_shape = tuple(axis.size for axis in axes)
+    selected_shape = tuple(index.size for index in indices)
+    report.update(source_shape=source_shape, selected_shape=selected_shape,
+                  axis_units={"azimuth": units.get("azimuth", "deg"),
+                              "elevation": units.get("elevation", "deg"),
+                              "frequency": units.get("frequency", "GHz")},
+                  axis_ranges={name: (float(np.min(axis)), float(np.max(axis)))
+                               for name, axis in zip(("azimuth", "elevation", "frequency"), axes[:3])},
+                  polarizations=[v.decode("utf-8") if isinstance(v, bytes) else str(v) for v in axes[3]],
+                  storage=storage, disk_bytes=0, mapped_bytes=0,
+                  logical_dataset_bytes=report["retained_bytes"])
+    if storage == "disk" or selection is not None:
+        retained = 0
+        largest_block = 0
+        resident_metadata = 0
+        component_dtype = native_component_dtype(report["member_layouts"])
+        selected_cells = int(np.prod(selected_shape, dtype=object))
+        for key, payload in report["member_payload_bytes"].items():
+            layout = report["member_layouts"].get(key)
+            if layout is None:
+                resident_metadata += payload
+                retained += payload
+                continue
+            shape, _, dtype = layout
+            axis_names = ("azimuths", "elevations", "frequencies", "polarizations")
+            if key in axis_names:
+                shape = (selected_shape[axis_names.index(key)],)
+            grid_shaped = len(shape) >= 4 and tuple(shape[:4]) == source_shape
+            if grid_shaped:
+                shape = selected_shape + tuple(shape[4:])
+            count = int(np.prod(shape, dtype=object))
+            itemsize = dtype.itemsize
+            if key in {"rcs_power", "rcs_phase"} and dtype.kind in "iuf":
+                itemsize = component_dtype.itemsize
+            elif key == "rcs_complex" and dtype.kind == "c":
+                itemsize = 16 if dtype.itemsize > 8 else 8
+            retained += count * itemsize
+            largest_block = max(largest_block, min(count, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS) * itemsize)
+        axis_bytes = sum(axis.nbytes + index.nbytes for axis, index in zip(axes, indices))
+        retained_axis_bytes = sum(index.size * axis.dtype.itemsize for axis, index in zip(axes, indices))
+        scratch = min(selected_cells, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS) * 128
+        # ZIP inflation/copy can hold several 1 MiB buffers concurrently.
+        # It is sequential with validation, so budget the larger working
+        # set. Axis decoding and opted-in pickle metadata remain resident.
+        resident = retained_axis_bytes + resident_metadata + largest_block
+        working = resident + axis_bytes + max(2 * largest_block, scratch, 4 * 1024**2)
+        report["logical_dataset_bytes"] = retained
+        report["retained_bytes"] = resident if storage == "disk" else retained
+        report["mapped_bytes"] = max(0, retained - retained_axis_bytes - resident_metadata) if storage == "disk" else 0
+        report["estimated_peak_bytes"] = working + (retained if storage == "memory" else 0)
+        # Extraction currently preserves complete numeric members on disk;
+        # selected/converted members may coexist until the cache is released.
+        report["disk_bytes"] = report["declared_uncompressed_bytes"] + retained
+    return report
+
+
+def _preflight_native_archive_allocation(path, *, allow_legacy_pickle=False,
+                                         max_output_bytes=None, storage="memory", selection=None):
+    """Apply the shared policy to exactly the estimate shown by the GUI."""
+    if max_output_bytes is None:
+        limit = _default_dense_import_limit_bytes()
+    else:
+        if isinstance(max_output_bytes, (bool, np.bool_)):
+            raise ValueError("native .grim max_output_bytes must be a positive integer")
+        try:
+            limit = operator.index(max_output_bytes)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("native .grim max_output_bytes must be a positive integer") from exc
+        if limit <= 0:
+            raise ValueError("native .grim max_output_bytes must be a positive integer")
+    if storage not in {"memory", "disk"}:
+        raise ValueError("storage must be 'memory' or 'disk'")
+    report = _native_archive_header_report(path, allow_legacy_pickle=allow_legacy_pickle)
+    # The ordinary eager estimate depends only on safe NPY headers. Preserve
+    # its early rejection before even the small axis members are decoded.
+    if storage == "memory" and selection is None and report["estimated_peak_bytes"] > limit:
+        raise MemoryError(f"{path} needs about {report['estimated_peak_bytes'] / 1024**3:.2f} GiB peak memory, "
+                          f"above the current {limit / 1024**3:.2f} GiB limit. Choose disk-backed loading, "
+                          "a smaller selection, or increase the load budget (max_output_bytes).")
+    report = _native_allocation_from_headers(path, report, storage=storage, selection=selection)
+    report["limit_bytes"] = int(limit)
+    if report["estimated_peak_bytes"] > limit:
+        raise MemoryError(
+            f"{path} needs about {report['estimated_peak_bytes'] / 1024**3:.2f} GiB peak memory "
+            f"for {storage} native load and validation, above the current {limit / 1024**3:.2f} GiB limit. "
+            "Choose disk-backed loading or a smaller selection, close other datasets, "
+            "or increase the load budget (max_output_bytes).")
+    return report
 
 
 def _real_storage_dtype(*values):

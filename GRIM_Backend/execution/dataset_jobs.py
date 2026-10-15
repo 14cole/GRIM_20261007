@@ -5,10 +5,13 @@ remains with DatasetOpsMixin."""
 from __future__ import annotations
 
 import ctypes
+import csv
 import math
 import os
+import sys
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps
 from PySide6.QtCore import QObject, QThread, Signal
 from GRIM_Backend.datasets.grid import RcsGrid
 from GRIM_Backend.io.loaders import (
@@ -88,13 +91,38 @@ def _grim_archive_uncompressed_bytes(path: str) -> int | None:
         # non-destructive and does not mask that parse error.
         return None
 
-def _dataset_load_memory_estimate(path: str) -> tuple[int, int]:
+def _dataset_load_memory_estimate(path: str, *, storage="memory", selection=None) -> tuple[int, int]:
     """Return conservative ``(retained, per-load peak)`` byte estimates."""
 
     try:
         stored_bytes = max(0, int(os.path.getsize(path)))
     except OSError:
         stored_bytes = 0
+    if str(path).casefold().endswith(".grim"):
+        from GRIM_Backend.datasets.memory import estimate_native_archive_allocation
+        try:
+            report = estimate_native_archive_allocation(path, storage=storage, selection=selection)
+            return int(report['retained_bytes']), int(report['estimated_peak_bytes'])
+        except (OSError, ValueError, zipfile.BadZipFile):
+            # Preserve the authoritative reader's format error. The fallback
+            # below is only for malformed/unreadable archives, not valid v2 data.
+            pass
+    if str(path).casefold().endswith(_TEXT_LOADER_EXTENSIONS):
+        from GRIM_Backend.io.csv import has_flat_csv_signature, load_flat_csv
+        if has_flat_csv_signature(path):
+            try:
+                report = load_flat_csv(path, None, None, _estimate_only=True)
+            except (OSError, ValueError, csv.Error):
+                pass  # The per-file loader reports malformed input independently.
+            else:
+                return int(report['retained_bytes']), int(report['estimated_peak_bytes'])
+        from GRIM_Backend.io.cst import estimate_vendor_text_import
+        try:
+            report = estimate_vendor_text_import(path)
+        except (OSError, ValueError, KeyError, IndexError, csv.Error):
+            report = None
+        if report is not None:
+            return int(report['retained_bytes']), int(report['estimated_peak_bytes'])
     expanded_bytes = _grim_archive_uncompressed_bytes(path)
     if expanded_bytes is not None:
         retained = max(stored_bytes, int(expanded_bytes))
@@ -127,68 +155,65 @@ def _dataset_load_memory_estimate(path: str) -> tuple[int, int]:
     peak = max(_LOADER_MIN_WORKING_BYTES, 6 * stored_bytes)
     return retained, peak
 
-def _recommended_loader_workers(tasks) -> int:
-    if isinstance(tasks, int):
-        task_count = int(tasks)
-        paths = []
-    else:
-        paths = [str(task[1]) for task in tasks]
-        task_count = len(paths)
-    cpu_total = os.cpu_count() or 1
-    if cpu_total <= 2:
-        target = cpu_total
-    else:
-        target = cpu_total - 1
-    target = max(1, min(int(task_count), int(target)))
-    if not paths:
-        return target
-    estimates = [_dataset_load_memory_estimate(path) for path in paths]
-    retained_total = sum(retained for retained, _peak in estimates)
-    transient_extras = sorted(
-        (max(0, peak - retained) for retained, peak in estimates),
-        reverse=True,
-    )
-    available = _available_memory_bytes()
-    budget = (
-        int(available * 0.5)
-        if available is not None
-        else _LOADER_UNKNOWN_MEMORY_BUDGET_BYTES
-    )
+class LoadMemoryLimitError(MemoryError):
+    """A planning estimate exceeded policy, rather than an allocation failing."""
+    def __init__(self, plan):
+        self.plan = plan
+        super().__init__(
+            f"This dataset batch needs an estimated {plan['serial_peak_bytes'] / 1024**2:.0f} MiB "
+            f"but the load budget is {plan['budget_bytes'] / 1024**2:.0f} MiB. "
+            "Adjust Load options, continue once, or use disk storage for .grim files. "
+            "Load fewer or smaller dataset files to reduce the estimate.")
 
-    # Every successfully loaded grid remains in the result batch.  Reserve
-    # that final retained footprint, then admit only as many simultaneous
-    # parse/clean workspaces as fit in the remaining budget.  This prevents a
-    # tiny, highly compressed .grim file from spawning CPU-count workers that
-    # each expand into a large in-memory grid.
-    safe_workers = 0
-    for worker_count in range(1, target + 1):
-        planned_peak = retained_total + sum(transient_extras[:worker_count])
-        if planned_peak <= budget:
-            safe_workers = worker_count
-        else:
-            break
-    if safe_workers < 1:
-        budget_mib = budget / 1024**2
-        required_mib = (
-            retained_total + (transient_extras[0] if transient_extras else 0)
-        ) / 1024**2
-        source = (
-            "available memory"
-            if available is not None
-            else "the conservative fallback budget"
-        )
-        raise MemoryError(
-            f"This dataset batch needs an estimated {required_mib:.0f} MiB "
-            f"but only {budget_mib:.0f} MiB of {source} is reserved for "
-            "loading. Load fewer or smaller dataset files at a time."
-        )
-    # Python's delimited parsers are memory-heavy and mostly GIL-bound. Running
-    # several simultaneously increases peak memory without a reliable speedup.
-    if any(path.casefold().endswith(_TEXT_LOADER_EXTENSIONS) for path in paths):
+
+def _load_memory_budget(max_output_bytes=None):
+    from GRIM_Backend.datasets.load_policy import checked_import_budget
+    explicit = checked_import_budget(max_output_bytes)
+    available = _available_memory_bytes()
+    budget = (explicit if explicit is not None else
+              max(1, int(available * 0.5)) if available is not None else
+              _LOADER_UNKNOWN_MEMORY_BUDGET_BYTES)
+    return available, budget
+
+
+def _dataset_load_plan(tasks, *, max_output_bytes=None, load_options=None):
+    paths = [str(task[1]) for task in tasks]
+    options = load_options or {}
+    estimates = [_dataset_load_memory_estimate(path, storage=options.get('storage', 'memory'),
+                 selection=options.get('selection')) for path in paths]
+    retained = sum(value for value, _ in estimates)
+    extras = sorted((max(0, peak - value) for value, peak in estimates), reverse=True)
+    available, budget = _load_memory_budget(max_output_bytes)
+    return dict(retained_bytes=retained, transient_bytes=extras,
+                serial_peak_bytes=retained + (extras[0] if extras else 0),
+                available_bytes=available, budget_bytes=budget,
+                files=[dict(path=path, retained_bytes=value, peak_bytes=peak)
+                       for path, (value, peak) in zip(paths, estimates)])
+
+
+def _recommended_loader_workers(tasks, *, max_output_bytes=None, load_options=None,
+                                allow_exceed=False) -> int:
+    task_count = tasks if isinstance(tasks, int) else len(tasks)
+    cpus = os.cpu_count() or 1
+    target = max(1, min(int(task_count), cpus if cpus <= 2 else cpus - 1))
+    if isinstance(tasks, int) or not tasks:
+        return target
+    plan = _dataset_load_plan(tasks, max_output_bytes=max_output_bytes, load_options=load_options)
+    if allow_exceed:
+        return 1  # A one-time override never multiplies concurrent workspaces.
+    if plan['serial_peak_bytes'] > plan['budget_bytes']:
+        raise LoadMemoryLimitError(plan)
+    if any(str(task[1]).casefold().endswith(_TEXT_LOADER_EXTENSIONS) for task in tasks):
         return 1
+    safe_workers = 1
+    for count in range(2, target + 1):
+        if plan['retained_bytes'] + sum(plan['transient_bytes'][:count]) > plan['budget_bytes']:
+            break
+        safe_workers = count
     return safe_workers
 
-def _load_dataset_path_task(task: tuple[int, str]) -> dict[str, object]:
+
+def _load_dataset_path_task(task: tuple[int, str], *, load_options=None, max_output_bytes=None) -> dict[str, object]:
     index, path = task
     file_name = os.path.basename(path)
     dataset_name = os.path.splitext(file_name)[0]
@@ -202,15 +227,26 @@ def _load_dataset_path_task(task: tuple[int, str]) -> dict[str, object]:
                 "file_name": file_name,
                 "error": "Unsupported file extension",
             }
-        dataset = load_dataset_headless(path)
+        options = dict(load_options or {})
+        options.pop('allow_exceed', None)
+        options.pop('max_output_bytes', None)
+        if not lower.endswith('.grim'):
+            options.pop('storage', None)
+            options.pop('selection', None)
+        if max_output_bytes is not None:
+            options['max_output_bytes'] = max_output_bytes
+        dataset = load_dataset_headless(path, **options)
         history = str(getattr(dataset, "history", "") or path)
     except Exception as exc:
         return {
-            "status": "mapping_required" if isinstance(exc, UnrecognizedTableError) else "error",
+            "status": ("memory_limit" if isinstance(exc, MemoryError) else
+                       "mapping_required" if isinstance(exc, UnrecognizedTableError) else "error"),
             "index": index,
             "path": path,
             "file_name": file_name,
             "error": str(exc),
+            "load_options": dict(load_options or {}),
+            "max_output_bytes": max_output_bytes,
         }
 
     return {
@@ -221,6 +257,7 @@ def _load_dataset_path_task(task: tuple[int, str]) -> dict[str, object]:
         "name": dataset_name,
         "history": history,
         "dataset": dataset,
+        "load_options": dict(load_options or {}),
     }
 
 def _join_many_with_progress(
@@ -232,7 +269,9 @@ def _join_many_with_progress(
     checked = RcsGrid._ensure_grids(grids)
     total = len(checked)
     available = _available_memory_bytes()
-    limit = int(available * 0.5) if available is not None else None
+    from GRIM_Backend.datasets.load_policy import current_import_memory_budget
+    captured_limit = current_import_memory_budget()
+    limit = captured_limit if captured_limit is not None else int(available * 0.5) if available is not None else None
     result = RcsGrid.join_many(
         *checked,
         tol=tol,
@@ -247,10 +286,11 @@ class _DatasetLoadWorker(QObject):
     progress = Signal(int, int, str)
     finished = Signal(object)
 
-    def __init__(self, tasks: list[tuple[int, str]], ignored_count: int = 0, parent=None) -> None:
+    def __init__(self, tasks: list[tuple[int, str]], ignored_count: int = 0, parent=None, *, load_options=None) -> None:
         super().__init__(parent)
         self._tasks = list(tasks)
         self._ignored_count = int(ignored_count)
+        self._load_options = dict(load_options or {})
 
     def run(self) -> None:
         total = len(self._tasks)
@@ -258,10 +298,16 @@ class _DatasetLoadWorker(QObject):
         mapping_required: list[dict[str, object]] = []
         failed: list[str] = []
         used_parallel = False
+        memory_entries = []
+        memory_review = None
 
         def _consume(result: dict[str, object], done_count: int) -> None:
             status = str(result.get("status", "error"))
             file_name = str(result.get("file_name", "dataset"))
+            if status == "memory_limit":
+                memory_entries.append(result)
+                self.progress.emit(done_count, total, f"Load options needed: {file_name}")
+                return
             if status == "mapping_required":
                 mapping_required.append(result)
                 self.progress.emit(done_count, total, f"Column labels needed: {file_name}")
@@ -275,13 +321,18 @@ class _DatasetLoadWorker(QObject):
             self.progress.emit(done_count, total, f"Failed {file_name}")
 
         try:
-            worker_count = _recommended_loader_workers(self._tasks) if total else 1
+            options = self._load_options
+            _available, budget = _load_memory_budget(options.get('max_output_bytes'))
+            worker_count = _recommended_loader_workers(
+                self._tasks, max_output_bytes=budget, load_options=options,
+                allow_exceed=bool(options.get('allow_exceed'))) if total else 1
+            cap = sys.maxsize if options.get('allow_exceed') else budget
             if total == 1:
-                _consume(_load_dataset_path_task(self._tasks[0]), 1)
+                _consume(_load_dataset_path_task(self._tasks[0], load_options=options, max_output_bytes=cap), 1)
             elif total > 1:
                 with ThreadPoolExecutor(max_workers=worker_count) as pool:
                     futures = {
-                        pool.submit(_load_dataset_path_task, task): task
+                        pool.submit(_load_dataset_path_task, task, load_options=options, max_output_bytes=cap): task
                         for task in self._tasks
                     }
                     done_count = 0
@@ -290,12 +341,19 @@ class _DatasetLoadWorker(QObject):
                         done_count += 1
                         _consume(result, done_count)
                 used_parallel = worker_count > 1
+        except LoadMemoryLimitError as exc:
+            memory_review = {'paths': [str(task[1]) for task in self._tasks],
+                             'plan': exc.plan, 'options': self._load_options, 'error': str(exc)}
         except Exception as exc:
             # Individual parse failures normally arrive as result mappings.
             # This catches pool setup/submission/future faults so the owning
             # QThread still receives exactly one terminal signal and can quit.
             failed.append(f"Dataset loader ({type(exc).__name__}: {exc})")
         finally:
+            if memory_entries:
+                memory_review = {'paths': [entry['path'] for entry in memory_entries],
+                                 'options': self._load_options,
+                                 'error': '; '.join(str(entry['error']) for entry in memory_entries)}
             self.finished.emit(
                 {
                     "loaded": loaded,
@@ -304,6 +362,7 @@ class _DatasetLoadWorker(QObject):
                     "ignored": self._ignored_count,
                     "used_parallel": used_parallel,
                     "total_supported": total,
+                    "memory_review": memory_review,
                 }
             )
 
@@ -342,6 +401,26 @@ class _CsvExportWorker(QObject):
 class _BackgroundJobCancelled(RuntimeError):
     """Internal cooperative-cancellation sentinel."""
 
+
+def _operation_storage_run(function):
+    """Create a separate allocation context inside the actual Qt worker."""
+    @wraps(function)
+    def run(self):
+        from GRIM_Backend.datasets.result_storage import operation_result_storage
+        options = dict(getattr(self, '_result_storage_options', {}) or {})
+        try:
+            with operation_result_storage(**options):
+                return function(self)
+        except Exception as exc:
+            # Context setup can fail before the worker's ordinary terminal
+            # handler (for example invalid replayed options). Always quit.
+            if isinstance(self, _RangeCalibrationWorker):
+                self.finished.emit({'results': [], 'failed': [str(exc)], 'total': len(self._targets)})
+            else:
+                self.finished.emit({'ok': False, 'error': str(exc), 'error_type': type(exc).__name__})
+    return run
+
+
 class _BackgroundCallableWorker(QObject):
     """Run one pure-Python/NumPy callable away from Qt's GUI thread."""
 
@@ -354,6 +433,7 @@ class _BackgroundCallableWorker(QObject):
         self._reports_progress = bool(reports_progress)
         self.supports_cancellation = self._reports_progress
 
+    @_operation_storage_run
     def run(self) -> None:
         try:
             if QThread.currentThread().isInterruptionRequested():
@@ -389,6 +469,7 @@ class _JoinDatasetsWorker(QObject):
         self._grids = list(grids)
         self._tol = float(tol)
 
+    @_operation_storage_run
     def run(self) -> None:
         total = max(1, len(self._grids))
         try:
@@ -431,6 +512,7 @@ class _RangeCalibrationWorker(QObject):
         self._exact_name, self._exact = exact_entry
         self._params = dict(params)
 
+    @_operation_storage_run
     def run(self) -> None:
         total = len(self._targets)
         results: list[dict[str, object]] = []
@@ -486,7 +568,7 @@ class _RangeCalibrationWorker(QObject):
                     ),
                     "history": (
                         f"Range Cal: {target_name}; measured={self._measured_name}; "
-                        f"exact={self._exact_name}; ΔR={offset_m:+.12g} m "
+                        f"exact={self._exact_name}; Î”R={offset_m:+.12g} m "
                         "(positive away)"
                     ),
                 }

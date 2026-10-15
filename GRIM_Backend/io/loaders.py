@@ -62,7 +62,28 @@ def read_SENTRi(path: str) -> RcsGrid:
     return RcsGrid.read_SENTRi(path)
 
 
-def load_dataset(path: str, *, allow_legacy_pickle=False) -> RcsGrid:
+def load_dataset(path: str, *, allow_legacy_pickle=False, max_output_bytes=None,
+                 storage="memory", selection=None, cache_dir=None) -> RcsGrid:
+    """Load a supported file with an optional memory budget and native selection.
+
+    Native selections use inclusive axis ranges in the file's declared units.
+    Disk storage and pre-load selection apply to .grim files. Other formats
+    accept the same memory-budget override through their existing readers.
+    """
+    from GRIM_Backend.datasets.load_policy import import_memory_budget
+    with import_memory_budget(max_output_bytes):
+        if str(path).lower().endswith(".grim"):
+            return RcsGrid.load(path, allow_legacy_pickle=allow_legacy_pickle,
+                               max_output_bytes=max_output_bytes, storage=storage,
+                               selection=selection, cache_dir=cache_dir)
+        if selection:
+            raise ValueError("Selection before loading is supported for .grim files")
+        if storage not in {"memory", "disk"}:
+            raise ValueError("storage must be memory or disk")
+        return _load_dataset_dispatch(path, allow_legacy_pickle=allow_legacy_pickle)
+
+
+def _load_dataset_dispatch(path: str, *, allow_legacy_pickle=False) -> RcsGrid:
     """Load any GRIM-supported dataset without importing Qt."""
     path = str(path)
     lower = path.lower()
@@ -99,6 +120,8 @@ def load_dataset(path: str, *, allow_legacy_pickle=False) -> RcsGrid:
     for loader in loaders:
         try:
             return loader(path)
+        except MemoryError:
+            raise
         except Exception as exc:
             errors.append(f"{loader.__name__}: {exc}")
     error_type = (UnrecognizedTableError if lower.endswith(

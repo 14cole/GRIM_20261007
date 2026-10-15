@@ -116,7 +116,8 @@ class CompactSampleTests(unittest.TestCase):
                     expected = _build_grid_for_co_solved_samples(ordinary['co_solved_samples'], ordinary['polarization_mapping'])
                     actual = _build_grid_for_co_solved_samples(packed['co_solved_samples'], packed['polarization_mapping'])
                     for key in expected:
-                        if isinstance(expected[key], np.ndarray):
+                        # Native sample components expose lazy array values.
+                        if isinstance(expected[key], np.ndarray) or hasattr(expected[key], '__array__'):
                             np.testing.assert_array_equal(actual[key], expected[key])
                         else:
                             self.assertEqual(actual[key], expected[key])

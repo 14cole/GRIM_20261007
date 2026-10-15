@@ -1,4 +1,5 @@
 """Public GRIM python API."""
+from GRIM_Backend.datasets.result_storage import operation_result_storage
 from GRIM_Backend.datasets.transforms import (
     _MAX_EXPLICIT_AXIS_POINTS,
     _authoritative_response_phase,
@@ -56,6 +57,7 @@ __all__ = [
     'join_datasets',
     'medianize_azimuth',
     'offset_db',
+    'operation_result_storage',
     'plot_datasets',
     'regrid_axis',
     'save_dataset_batch',

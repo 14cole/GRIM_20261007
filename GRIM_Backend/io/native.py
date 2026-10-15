@@ -478,6 +478,7 @@ class NativeFormatMixin:
         rcs_phase,
         units,
         extra=None,
+        _validated_complex=False,
     ):
         """Validate the native archive before constructor sanitation.
 
@@ -562,6 +563,11 @@ class NativeFormatMixin:
                 )
             if values.dtype.kind not in "iuf":
                 raise ValueError(f"{path} contains non-real-numeric {name}")
+            if name == "rcs_phase" and _validated_complex:
+                # A finite complex field (or paired NaNs) has already been
+                # checked. Its derived phase cannot add infinities. Power is
+                # still scanned because normalization/squaring can overflow.
+                continue
             for selection in _bounded_grid_selections(expected, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS):
                 block = values[selection]
                 if np.any(np.isinf(block)):
@@ -584,7 +590,7 @@ class NativeFormatMixin:
             if raw_unit is not None and str(raw_unit).strip():
                 normalized_units[key] = canonical
 
-        raw_report = cls._raw_complex_consistency_report(
+        raw_report = {"issues": []} if _validated_complex else cls._raw_complex_consistency_report(
             expected_shape=expected,
             frequencies=numeric_axes["frequency"],
             rcs_power=power,
@@ -610,9 +616,56 @@ class NativeFormatMixin:
         )
 
     @classmethod
+    def _native_grid_instance(cls, axes, *, units, extra, power=None, phase=None,
+                              field=None, domain="physical"):
+        """Install private validated storage without full-grid sanitation copies.
+
+        Power/phase archives keep that exact representation in the bounded
+        loader. Their usual eager canonicalization is optional compression,
+        not a prerequisite for any dataset operation.
+        """
+        from GRIM_Backend.datasets.coordinates import strip_angular_coordinate_declarations
+        grid = cls.__new__(cls)
+        grid.azimuths, grid.elevations, grid.frequencies = (cls._clean_axis(axis) for axis in axes[:3])
+        grid.polarizations = cls._canonical_polarization_axis(axes[3])
+        grid.units, grid.extra = dict(units or {}), dict(extra or {})
+        grid._complex = None
+        grid._power, grid._phase = power, phase
+        grid._legacy_samples = False
+        grid._legacy_fingerprint = None
+        grid._raw_coverage_cache = None
+        grid._storage_domain = "physical"
+        grid._storage_kind = "power_phase" if phase is not None else "power"
+        grid.rcs_domain = "complex_amplitude" if field is not None else "power_phase"
+        grid.power_domain = "linear_rcs"
+        grid.source_path = grid.history = None
+        wrap = str(grid.units.get("phase_wrap", "")).strip()
+        if wrap and wrap not in {"0_360", "-180_180"}:
+            raise ValueError("phase_wrap must be '0_360' or '-180_180' when declared")
+        if field is not None:
+            grid._install_complex(field, domain=domain, copy=False)
+            if domain == "raw_field" and grid._authoritative_raw_amplitude_from_pair(
+                    (grid._complex.real, grid._complex.imag), (0, 0, 0, 0)) is None:
+                raise ValueError("raw complex normalization is not defined for this dataset")
+        else:
+            if phase is not None:
+                for tile in _bounded_grid_selections(power.shape, _RAW_COMPLEX_VALIDATION_BLOCK_CELLS):
+                    block = phase[tile]
+                    if wrap:
+                        block[...] = grid._wrapped_phase_values(block)
+                    block[~np.isfinite(power[tile])] = np.nan
+                phase.flags.writeable = False
+            power.flags.writeable = False
+        grid._apply_solver_amplitude_annotation()
+        strip_angular_coordinate_declarations(grid.units, grid.extra)
+        return grid
+
+    @classmethod
     def _from_native_arrays(cls, data, *, path="native dataset", source_path_override=None):
         """Decode old or current native samples, also used by embedded assemblies."""
         keys = set(getattr(data, "files", data.keys() if hasattr(data, "keys") else ()))
+        from GRIM_Backend.io.native_cache import NativeArrays
+        private_arrays = isinstance(data, NativeArrays)
 
         def scalar(name, default=None):
             if name not in keys:
@@ -653,6 +706,7 @@ class NativeFormatMixin:
         extra = {key: data[key] for key in keys if key not in cls._RESERVED_KEYS}
         constructor_samples = {}
         candidate = None
+        deferred_raw_pair = {}
         if version == 1:
             power, phase = data["rcs_power"], data["rcs_phase"]
         else:
@@ -698,11 +752,26 @@ class NativeFormatMixin:
                     adopt = bool(field.flags.owndata)
                 # Validate through bounded derived views rather than allocating
                 # complete normalized-field, power, and phase copies on load.
-                candidate = cls(data["azimuths"], data["elevations"], data["frequencies"],
-                                data["polarizations"], rcs=field, rcs_storage_domain=domain,
-                                units=units, extra=extra,
-                                _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN if adopt else None)
+                if private_arrays:
+                    if domain == "physical":
+                        # Validate a declared physical field against a retained
+                        # solver pair before enabling that pair as authority.
+                        # Otherwise the component views would normalize the
+                        # pair and compare it against itself, hiding a conflict.
+                        deferred_raw_pair = {key: value for key, value in extra.items()
+                                             if key in {"rcs_amp_real", "rcs_amp_imag"}}
+                    candidate = cls._native_grid_instance(
+                        [data[name] for name in ("azimuths", "elevations", "frequencies", "polarizations")],
+                        units=units, extra={key: value for key, value in extra.items()
+                                            if key not in deferred_raw_pair}, field=field, domain=domain)
+                else:
+                    candidate = cls(data["azimuths"], data["elevations"], data["frequencies"],
+                                    data["polarizations"], rcs=field, rcs_storage_domain=domain,
+                                    units=units, extra=extra,
+                                    _adopt_clean_arrays=_ADOPT_CLEAN_ARRAYS_TOKEN if adopt else None)
                 power, phase, extra = candidate.power, candidate.phase, candidate.extra
+                if deferred_raw_pair:
+                    extra = dict(extra, **deferred_raw_pair)
             else:
                 power = np.asarray(data["rcs_power"])
                 phase = (np.asarray(data["rcs_phase"]) if kind == "power_phase" else
@@ -712,12 +781,22 @@ class NativeFormatMixin:
             path=path, azimuths=data["azimuths"], elevations=data["elevations"],
             frequencies=data["frequencies"], polarizations=data["polarizations"],
             rcs_power=power, rcs_phase=phase, units=units, extra=extra,
+            _validated_complex=(candidate is not None and
+                                (domain == "raw_field" or not any(key in extra for key in ("rcs_amp_real", "rcs_amp_imag")))),
         )
         source_path = scalar("source_path") or None
         if source_path_override is not None:
             source_path = source_path_override
         if candidate is not None:
+            candidate.extra.update(deferred_raw_pair)
             candidate.units = units
+            candidate.source_path = source_path
+            candidate.history = scalar("history") or None
+            return candidate
+        if private_arrays:
+            candidate = cls._native_grid_instance(
+                [azimuths, elevations, frequencies, polarizations], units=units, extra=extra,
+                power=power, phase=None if version == 2 and kind == "power" else phase)
             candidate.source_path = source_path
             candidate.history = scalar("history") or None
             return candidate
@@ -737,6 +816,9 @@ class NativeFormatMixin:
         *,
         allow_legacy_pickle: bool = False,
         max_output_bytes=None,
+        storage="memory",
+        selection=None,
+        cache_dir=None,
     ):
         """Load a grid from a .grim (npz) file.
 
@@ -750,6 +832,14 @@ class NativeFormatMixin:
                 plus temporary sample validation and constructor arrays. By default one
                 load may use at most half of currently available memory (or
                 the conservative 2 GiB fallback when memory is unknown).
+            storage: ``memory`` (default) or ``disk`` to retain numeric arrays
+                in a private, memory-mapped cache. The source is never changed.
+            selection: Optional inclusive ranges in the file's declared units,
+                e.g. ``{'frequency': (8, 12), 'polarization': ['HH', 'VV']}``.
+                Numeric keys are azimuth, elevation, and frequency. A selection
+                is copied in blocks, without decoding the entire grid in RAM.
+            cache_dir: Optional parent directory for temporary mapped files.
+                Surviving sample views retain their cache after the grid closes.
 
         Returns:
             RcsGrid instance loaded from disk.
@@ -758,20 +848,34 @@ class NativeFormatMixin:
         path = os.fspath(path)
         if not path.casefold().endswith(".grim"):
             path = f"{path}.grim"
-        _preflight_native_archive_allocation(
+        report = _preflight_native_archive_allocation(
             path,
             allow_legacy_pickle=bool(allow_legacy_pickle),
             max_output_bytes=max_output_bytes,
+            storage=storage,
+            selection=selection,
         )
         if mmap_mode is not None:
             warnings.warn(
-                "mmap_mode has no effect for .grim/.npz archives; arrays are loaded eagerly",
+                "mmap_mode has no effect for .grim/.npz archives; use storage='disk' for a private mapped cache",
                 RuntimeWarning,
                 stacklevel=2,
             )
 
 
+        if storage == "disk" or selection is not None:
+            from GRIM_Backend.io.native_cache import load_native_arrays
+            arrays = load_native_arrays(path, report, storage=storage, selection=selection, cache_dir=cache_dir)
+            grid = cls._from_native_arrays(arrays, path=path)
+            grid.load_storage = storage
+            if selection is not None:
+                grid.history = (str(grid.history or "") + "\nNative load selection: " +
+                                json.dumps(selection, default=lambda value: np.asarray(value).tolist())).strip()
+                grid._invalidate_assembly_sampling_hash(grid.extra, "native load selection")
+            return grid
         with open(path, "rb") as f, np.load(
             f, allow_pickle=bool(allow_legacy_pickle)
         ) as data:
-            return cls._from_native_arrays(data, path=path)
+            grid = cls._from_native_arrays(data, path=path)
+            grid.load_storage = "memory"
+            return grid

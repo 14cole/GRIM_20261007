@@ -35,6 +35,7 @@ from GRIM_Backend.ui.dataset_actions import (
     WrapDialog,
 )
 from GRIM_Backend.datasets.grid import RcsGrid
+from GRIM_Backend.datasets.operations import operation_events
 from GRIM_Backend.scripting.recorder import DatasetReference, PythonScriptRecorder
 from test_gui_shell import (
     _FakeFeatureWorkflow,
@@ -1280,7 +1281,7 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
         self.assertIn("statistics_dataset", self.window.python_recorder.script)
         self.assertIn("statistics_source.grim", self.window.python_recorder.script)
 
-    def test_statistics_broadcast_is_memory_guarded_before_worker_start(self) -> None:
+    def test_statistics_ram_review_cancel_prevents_worker_start(self) -> None:
         self.window._add_dataset_row(
             _axis_grid([0.0, 1.0, 2.0], 1.0), "Large broadcast", "Loaded"
         )
@@ -1294,7 +1295,11 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
                 "_derived_grid_memory_limit",
                 return_value=1,
             ),
+            mock.patch.object(self.window, '_current_result_storage_options',
+                return_value={'mode': 'memory', 'ram_budget_bytes': 256*1024**2}),
+            mock.patch('GRIM_Backend.ui.result_storage_options.ResultStorageDialog') as review,
         ):
+            review.return_value.exec.return_value = QDialog.Rejected
             dialog = dialog_type.return_value
             dialog.exec.return_value = QDialog.Accepted
             dialog.get_params.return_value = (
@@ -1308,7 +1313,7 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
         self.assertFalse(self.window._background_job_active())
         self.assertEqual(self.window.table.rowCount(), 1)
         self.assertIn(
-            "Statistics blocked before allocation",
+            "Statistics canceled before allocation",
             self.window.status.currentMessage(),
         )
 
@@ -1795,6 +1800,9 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
             )
 
         self._select_rows_in_order(2, 0, 1)
+        expected_outputs = RcsGrid.overlap_many(*(
+            self.window.table.item(row, 0).data(Qt.UserRole) for row in (2, 0, 1)
+        ), tol=1.e-6)
         with mock.patch.object(
             self.window.python_recorder, "record_multi_function"
         ) as record:
@@ -1806,13 +1814,24 @@ class GuiDatasetWorkflowTest(unittest.TestCase):
             [self.window.table.item(row, 0).text() for row in range(3, 6)],
             ["C [Overlap]", "A [Overlap]", "B [Overlap]"],
         )
-        for row, source_name in zip(range(3, 6), ("C", "A", "B")):
+        for row, source_name, expected in zip(range(3, 6), ("C", "A", "B"), expected_outputs):
             result = self.window.table.item(row, 0).data(Qt.UserRole)
             np.testing.assert_array_equal(result.azimuths, [2.0, 3.0])
-            self.assertIn(
-                f"Overlap with [C, A, B]: {source_name}",
-                self.window.table.item(row, 2).text(),
-            )
+            # Core history is shared with scripts; GUI row aliases live in
+            # output names rather than adding a second operation entry.
+            self.assertEqual(self.window.table.item(row, 2).text(), result.history)
+            self.assertTrue(result.history.startswith(f"Loaded {source_name}\n"))
+            self.assertEqual(result.history.count("GRIM operation: overlap_many"), 1)
+            events = operation_events(result)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["operation"], "overlap_many")
+            self.assertEqual(events[0]["parameters"], {"tol": 1.e-6})
+            self.assertEqual(events[0]["inputs"], operation_events(expected)[0]["inputs"])
+            self.assertEqual(result.history, expected.history)
+            self.assertEqual([item["shape"][0] for item in events[0]["inputs"]], [3, 4, 3])
+            self.assertEqual(len({item["source_id"] for item in events[0]["inputs"]}), 3)
+            expected_field = {"A": 1., "B": 2., "C": 3.}[source_name]
+            np.testing.assert_array_equal(result.rcs, np.full(result.shape, expected_field))
 
         record.assert_called_once()
         output_refs, function, input_refs = record.call_args.args

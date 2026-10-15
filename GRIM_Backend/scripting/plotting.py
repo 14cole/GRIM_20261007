@@ -8,6 +8,10 @@ import warnings
 import numpy as np
 
 from GRIM_Backend.datasets.grid import RcsGrid
+from GRIM_Backend.plotting.requests import (
+    PlotPlan, PlotRequest, prepare_sweep, prepare_cdf, prepare_waterfall_image,
+)
+from GRIM_Backend.plotting.registry import HEADLESS_PLOT_MODES, canonical_plot_mode
 
 
 def _indices(axis, selected, *, text=False, tolerance=1.0e-6) -> list[int]:
@@ -166,6 +170,8 @@ def plot_datasets(
     starts at the center sample of the first panel. Horizontal cuts appear
     below their image and share its X axis; vertical cuts appear to the right
     with response on X and the image's physical Y coordinate on Y.
+    ``waterfall_style`` is retained for compatibility with existing scripts;
+    Waterfall uses the physical two-axis image for every style value.
     """
 
     from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -175,24 +181,11 @@ def plot_datasets(
     if not selected:
         raise ValueError("plot_datasets needs at least one dataset")
     scale = str(scale).strip().lower()
-    mode_key = str(mode).strip().lower()
-    if mode_key == "heatmap":
-        mode_key = "waterfall"
-    supported_modes = {
-        "azimuth_rect",
-        "azimuth_polar",
-        "frequency",
-        "elevation_sweep",
-        "isar_image",
-        "delta_map",
-        "cdf",
-        "waterfall",
-    }
-    if mode_key not in supported_modes:
+    mode_key = canonical_plot_mode(mode)
+    if mode_key not in HEADLESS_PLOT_MODES:
         raise ValueError(
             f"Unsupported headless plot mode {mode!r}; supported modes are "
-            "azimuth_rect, azimuth_polar, frequency, elevation_sweep, "
-            "isar_image, delta_map, cdf, and waterfall"
+            + ", ".join(sorted(HEADLESS_PLOT_MODES))
         )
     if mode_key == "isar_image" and len(selected) != 1:
         raise ValueError("ISAR headless plotting requires exactly one dataset")
@@ -253,8 +246,9 @@ def plot_datasets(
     if not az_values or not el_values or not freq_values:
         raise ValueError("azimuths, elevations, and frequencies cannot be empty")
     if mode_key == "waterfall":
-        from GRIM_Backend.plotting.image_analysis import AXES, AXIS_ATTRIBUTES, heatmap_display_plane
-        from GRIM_Backend.plotting.image_grid import image_grid, line_with_gaps, native_sample_width
+        from GRIM_Backend.plotting.image_analysis import AXES, AXIS_ATTRIBUTES
+        from GRIM_Backend.plotting.image_grid import line_with_gaps, native_sample_width
+        from GRIM_Backend.plotting.image_figure import WaterfallFigure
         from matplotlib.colors import Normalize
         options = dict(heatmap_options or {})
         heatmap_axes = options.get("axes", heatmap_axes)
@@ -277,6 +271,8 @@ def plot_datasets(
             raise ValueError("Waterfall aggregation must be panels or mean_power")
         remaining = next(a for a in AXES if a not in (x_axis, y_axis))
         panels = []
+        request = PlotRequest("waterfall", reference, (), phase=phase, scale=scale,
+                              options={"axes": (x_axis, y_axis), "aggregation": heatmap_aggregation})
         for name, dataset in selected:
             for pol in polarizations:
                 indices = _plot_selection_indices(reference, dataset, az_values, el_values, freq_values, pol)
@@ -287,18 +283,27 @@ def plot_datasets(
                 x = plot_common.values_for_display(reference, dataset, x_axis, np.asarray(getattr(dataset, AXIS_ATTRIBUTES[x_axis]))[indices[AXES.index(x_axis)]])
                 y = plot_common.values_for_display(reference, dataset, y_axis, np.asarray(getattr(dataset, AXIS_ATTRIBUTES[y_axis]))[indices[AXES.index(y_axis)]])
                 xo, yo = np.argsort(x), np.argsort(y)
+                indices[AXES.index(x_axis)] = np.asarray(indices[AXES.index(x_axis)])[xo]
+                indices[AXES.index(y_axis)] = np.asarray(indices[AXES.index(y_axis)])[yo]
+                plan = PlotPlan(name, dataset, tuple(indices))
+                widths = (native_sample_width(reference, dataset, x_axis), native_sample_width(reference, dataset, y_axis))
                 for cut in cuts:
-                    plane = heatmap_display_plane(dataset, indices, x_axis, y_axis, remaining_index=cut, phase=phase, linear=str(scale).lower() == "linear")
-                    plane = plane[np.ix_(xo, yo)]
+                    prepared = prepare_waterfall_image(request, plan, x[xo], y[yo], remaining_index=cut,
+                        x_width=widths[0], y_width=widths[1])
+                    if prepared is None:
+                        continue
+                    snapshot = prepared["snapshot"]
+                    plane = snapshot[2].values if isinstance(snapshot, tuple) else prepared["native_display"]
                     suffix = (f"{'Circular phase mean' if phase else 'Mean linear display quantity'} over {len(indices[AXES.index(remaining)])} {remaining} samples" if cut is None else
                               f"{remaining.capitalize()} {plot_common.values_for_display(reference, dataset, remaining, [getattr(dataset, AXIS_ATTRIBUTES[remaining])[cut]])[0]:g} {plot_common.axis_unit(reference, remaining)}")
                     response = _plot_response_label(dataset, phase=phase, scale=scale)
-                    widths = (native_sample_width(reference, dataset, x_axis), native_sample_width(reference, dataset, y_axis))
-                    panels.append((f"{name} | Pol {pol} | {suffix} | {response}", x[xo], y[yo], plane, response, widths))
+                    panels.append((f"{name} | Pol {pol} | {suffix} | {response}", x[xo], y[yo], plane, response, prepared))
         if not panels:
             raise ValueError("No compatible Waterfall coordinates")
-        figure = Figure(figsize=(10., max(4., 4.*len(panels))), dpi=100, facecolor="white")
+        figure = WaterfallFigure(figsize=(10., max(4., 4.*len(panels))), dpi=100, facecolor="white")
         FigureCanvasAgg(figure)
+        figure._grim_waterfall_panels = [panel[5] for panel in panels]
+        figure.canvas.mpl_connect("close_event", figure._release_waterfall)
         cut_count = int(horizontal_cuts) + int(vertical_cuts)
         shared_bar = bool(show_colorbar and shared_colorbar)
         spec = figure.add_gridspec(
@@ -309,14 +314,15 @@ def plot_datasets(
             first_x, first_y = panels[0][1:3]
             cut_position = (first_x[len(first_x) // 2], first_y[len(first_y) // 2])
         norms = {}
-        for _title, _x, _y, data, response, _widths in panels:
-            finite = data[np.isfinite(data)]
+        for _title, _x, _y, data, response, prepared in panels:
+            display_values = prepared["display"]
+            finite = display_values[np.isfinite(display_values)]
             if finite.size:
                 old = norms.get(response, (np.inf, -np.inf))
                 norms[response] = (min(old[0], float(np.min(finite))), max(old[1], float(np.max(finite))))
         callbacks, image_axes, meshes, cut_views = [], [], [], []
         global_limits = (min(v[0] for v in norms.values()), max(v[1] for v in norms.values())) if norms else None
-        for i, (title, x, y, data, response, widths) in enumerate(panels):
+        for i, (title, x, y, data, response, prepared) in enumerate(panels):
             individual_bar = bool(show_colorbar and not shared_colorbar)
             # Marginal cuts occupy the same grid column/row as their image.
             # Dedicated colorbar cells preserve that alignment after layout.
@@ -330,7 +336,7 @@ def plot_datasets(
             ax = figure.add_subplot(panel_spec[0, 0])
             limits = color_limits if color_limits is not None else global_limits if shared_colorbar else None
             norm = Normalize(*limits) if limits is not None else None
-            xe, ye, display = image_grid(x, y, data.T, x_width=widths[0], y_width=widths[1])
+            xe, ye, display = prepared["x_edges"], prepared["y_edges"], prepared["drawn"]
             mesh = ax.pcolormesh(xe, ye, display,
                                  shading="flat", cmap=colormap, norm=norm)
             ax.set(title=title, xlabel=plot_common.axis_label(reference, x_axis), ylabel=plot_common.axis_label(reference, y_axis))
@@ -394,6 +400,8 @@ def plot_datasets(
             color_axis = figure.add_subplot(spec[:, 1])
             figure.colorbar(meshes[-1], cax=color_axis, label=response)
         figure._grim_heatmap_cut_callbacks = callbacks
+        if any(panel[5]["snapshot"] is not None for panel in panels):
+            figure.text(.01, .005, "Image shows block maxima; cuts use original samples.", fontsize=8)
         figure.set_layout_engine("constrained")
         return figure
 
@@ -402,16 +410,16 @@ def plot_datasets(
         if phase:
             raise ValueError("CDF plots rank magnitude levels, not phase")
         config = distribution.options(cdf_options)
-        curves = []
+        plans = []
         for name, dataset in selected:
             for pol in polarizations:
                 indices = _plot_selection_indices(reference, dataset, az_values, el_values, freq_values, pol)
                 if indices is None:
                     continue
-                for selection, label in distribution.groups(dataset, reference, indices, config, azimuths=az_values, frequencies=freq_values):
-                    curve = distribution.prepare_curve(name, dataset, selection, label, config, scale=scale)
-                    if curve is not None:
-                        curves.append(curve)
+                plans.append(PlotPlan(name, dataset, (*indices[:3], [indices[3]])))
+        request = PlotRequest("cdf", reference, tuple(plans), scale=scale, options=config,
+                              selectors={"azimuth": az_values, "frequency": freq_values})
+        curves = prepare_cdf(request).items
         if not curves:
             raise ValueError("No valid magnitude population for the selected CDF")
         figure = Figure(figsize=(10., 6.), dpi=100, facecolor="white")
@@ -466,12 +474,6 @@ def plot_datasets(
         axes = figure.add_subplot(111, projection="polar")
         axes.set_theta_zero_location(str(polar_zero))
         axes.set_theta_direction(-1)
-    elif mode_key == "compare":
-        axes, residual_axes = figure.subplots(
-            2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 1]}
-        )
-    elif mode_key == "waterfall":
-        axes = figure.add_subplot(111, projection="3d")
     else:
         axes = figure.add_subplot(111)
 
@@ -526,8 +528,6 @@ def plot_datasets(
                         draw_y,
                         **plot_common.singleton_line_markers(draw_x, draw_y),
                         linestyle="-",
-                        # Same label as the interactive azimuth modes, so a
-                        # replayed script reproduces the GUI legend.
                         label=(
                             f"{name} | Pol {polarization}, Freq "
                             f"{float(plot_common.values_for_display(reference, dataset, 'frequency', [dataset.frequencies[fi]])[0]):.12g} "
@@ -547,6 +547,7 @@ def plot_datasets(
         from GRIM_Backend.plotting import sweep_analysis
         config = sweep_analysis.options(sweep_options)
         sweep_axis = "frequency" if mode_key == "frequency" else "elevation"
+        plans = []
         for name, dataset, polarization in overlay_series:
             indices = _plot_selection_indices(
                 reference, dataset, az_values, el_values, freq_values, polarization,
@@ -555,128 +556,27 @@ def plot_datasets(
             if indices is None:
                 continue
             compatible_count += 1
-            for x, y, label, key in sweep_analysis.iter_series(
-                name, dataset, reference, indices, sweep_axis=sweep_axis,
-                config=config, phase=phase, scale=scale,
-            ):
-                order = np.argsort(x)
-                sweep_indices = indices[2] if sweep_axis == "frequency" else indices[1]
-                requested = freq_values if sweep_axis == "frequency" else el_values
-                breaks = plot_common.selection_breaks(
-                    reference, dataset, sweep_axis, np.asarray(sweep_indices)[order], requested)
-                draw_x, draw_y = plot_common.insert_plot_breaks(
-                    breaks, np.asarray(x)[order], np.asarray(y)[order])
-                lines = axes.plot(draw_x, draw_y, linestyle="-", label=label,
-                                  **plot_common.singleton_line_markers(draw_x, draw_y))
-                for line in lines:
-                    line._grim_trace_key = key
-                plotted_series.extend((line, dataset) for line in lines)
+            plans.append(PlotPlan(name, dataset, (*indices[:3], [indices[3]])))
+        request = PlotRequest(mode_key, reference, tuple(plans), phase=phase, scale=scale,
+                              options=config)
+        for plan, (x, y, label, key) in prepare_sweep(request).items:
+            dataset, indices = plan.dataset, plan.selection
+            order = np.argsort(x)
+            sweep_indices = indices[2] if sweep_axis == "frequency" else indices[1]
+            requested = freq_values if sweep_axis == "frequency" else el_values
+            breaks = plot_common.selection_breaks(
+                reference, dataset, sweep_axis, np.asarray(sweep_indices)[order], requested)
+            draw_x, draw_y = plot_common.insert_plot_breaks(
+                breaks, np.asarray(x)[order], np.asarray(y)[order])
+            lines = axes.plot(draw_x, draw_y, linestyle="-", label=label,
+                              **plot_common.singleton_line_markers(draw_x, draw_y))
+            for line in lines:
+                line._grim_trace_key = key
+            plotted_series.extend((line, dataset) for line in lines)
         axes.set_xlabel(plot_common.axis_label(reference, sweep_axis))
         response = _plot_response_label(reference, phase=phase, scale=scale)
         tag = sweep_analysis.axis_tag(config, phase=phase) if mode_key == "frequency" or len(az_values) > 1 or config["mode"] != "median" else ""
         axes.set_ylabel(response.replace(" (", tag + " (", 1))
-
-    elif mode_key == "compare":
-        if len(selected) != 2:
-            raise ValueError("compare requires exactly two datasets")
-        varying = "azimuth" if len(az_values) > 1 else "elevation" if len(el_values) > 1 else "frequency"
-        series_values = []
-        for name, dataset in selected:
-            az_idx = _indices(dataset.azimuths, az_values)
-            el_idx = _indices(dataset.elevations, el_values)
-            fr_idx = _indices(dataset.frequencies, freq_values)
-            pol_idx = _indices(dataset.polarizations, [polarization], text=True)[0]
-            if varying == "azimuth":
-                x = np.asarray(dataset.azimuths)[az_idx]
-                selection = np.ix_(az_idx, [el_idx[0]], [fr_idx[0]], [pol_idx])
-                raw = (
-                    dataset.rcs_slice(selection)
-                    if phase
-                    else dataset.power[selection]
-                )[:, 0, 0, 0]
-                frequency = dataset.frequencies[fr_idx[0]]
-            elif varying == "elevation":
-                x = np.asarray(dataset.elevations)[el_idx]
-                selection = np.ix_([az_idx[0]], el_idx, [fr_idx[0]], [pol_idx])
-                raw = (
-                    dataset.rcs_slice(selection)
-                    if phase
-                    else dataset.power[selection]
-                )[0, :, 0, 0]
-                frequency = dataset.frequencies[fr_idx[0]]
-            else:
-                x = np.asarray(dataset.frequencies)[fr_idx]
-                selection = np.ix_([az_idx[0]], [el_idx[0]], fr_idx, [pol_idx])
-                raw = (
-                    dataset.rcs_slice(selection)
-                    if phase
-                    else dataset.power[selection]
-                )[0, 0, :, 0]
-                frequency = x
-            y = _display_values(dataset, raw, frequency=frequency, phase=phase, scale=scale)
-            order = np.argsort(x)
-            x, y = np.asarray(x)[order], np.asarray(y)[order]
-            axes.plot(x, y, label=name)
-            series_values.append((x, y))
-        common, left_idx, right_idx = np.intersect1d(
-            np.round(series_values[0][0], 8),
-            np.round(series_values[1][0], 8),
-            return_indices=True,
-        )
-        if common.size:
-            residual_axes.plot(common, series_values[0][1][left_idx] - series_values[1][1][right_idx])
-        residual_axes.axhline(0.0, color="gray", linestyle="--")
-        residual_axes.set_xlabel(varying.title())
-        residual_axes.set_ylabel("Residual")
-        axes.set_ylabel("Phase (deg)" if phase else ("RCS (Linear)" if scale == "linear" else "RCS (dB)"))
-
-    elif mode_key == "waterfall":
-        for name, dataset in selected:
-            az_idx = _indices(dataset.azimuths, az_values)
-            el_idx = _indices(dataset.elevations, el_values)
-            fr_idx = _indices(dataset.frequencies, freq_values)
-            pol_idx = _indices(dataset.polarizations, [polarization], text=True)[0]
-            az_axis = np.asarray(dataset.azimuths)[az_idx]
-            fr_axis = np.asarray(dataset.frequencies)[fr_idx]
-            x_mesh, y_mesh = np.meshgrid(az_axis, fr_axis, indexing="ij")
-            for ei in el_idx:
-                selection = np.ix_(az_idx, [ei], fr_idx, [pol_idx])
-                raw = (
-                    dataset.rcs_slice(selection)
-                    if phase
-                    else dataset.power[selection]
-                )[:, 0, :, 0]
-                z = _display_values(dataset, raw, frequency=fr_axis[None, :], phase=phase, scale=scale)
-                if str(waterfall_style).lower().startswith("wire"):
-                    axes.plot_wireframe(x_mesh, y_mesh, z, label=name)
-                else:
-                    axes.plot_surface(x_mesh, y_mesh, z, cmap=colormap, alpha=0.85)
-        axes.set_xlabel("Azimuth (deg)")
-        axes.set_ylabel(f"Frequency ({selected[0][1].units.get('frequency', 'GHz')})")
-        axes.set_zlabel("Phase (deg)" if phase else ("RCS (Linear)" if scale == "linear" else "RCS (dB)"))
-
-    elif mode_key == "az_vs_range":
-        dataset = selected[0][1]
-        name = selected[0][0]
-        az_idx = _indices(dataset.azimuths, az_values)
-        fr_idx = _indices(dataset.frequencies, freq_values)
-        el_idx = _indices(dataset.elevations, [el_values[0]])[0]
-        pol_idx = _indices(dataset.polarizations, [polarization], text=True)[0]
-        freq = np.asarray(dataset._frequency_value_to_hz(dataset.frequencies[fr_idx]), dtype=float)
-        order_f = np.argsort(freq)
-        freq = freq[order_f]
-        complex_data = dataset.rcs_slice(
-            np.ix_(az_idx, [el_idx], fr_idx, [pol_idx])
-        )[:, 0, :, 0][:, order_f]
-        window = np.hanning(freq.size)
-        image = np.fft.fftshift(np.fft.ifft(complex_data * window[None, :], axis=1), axes=1)
-        distance = np.fft.fftshift(np.fft.fftfreq(freq.size, d=float(np.mean(np.diff(freq))))) * 299_792_458.0 / 2.0
-        magnitude = np.abs(image)
-        display = magnitude if scale == "linear" else 20.0 * np.log10(np.maximum(magnitude, 1.0e-15))
-        axes.pcolormesh(np.asarray(dataset.azimuths)[az_idx], distance, display.T, shading="auto", cmap=colormap)
-        axes.set_title(name)
-        axes.set_xlabel("Azimuth (deg)")
-        axes.set_ylabel("Down-Range (m)")
 
     elif mode_key == "isar_image":
         from GRIM_Backend.plotting.modes.isar_mode import _length_unit, form_isar

@@ -5,6 +5,12 @@ import json
 
 import numpy as np
 
+from GRIM_Backend.datasets.result_storage import (
+    allocate_result, copy_result, resident_result_bytes,
+)
+
+from GRIM_Backend.datasets.operations import dataset_operation
+
 from GRIM_Backend.datasets.audit import _physical_grid_content_sha256, _support_reference_qa
 from GRIM_Backend.datasets.constants import _COHERENT_OPERATION_BLOCK_CELLS
 from GRIM_Backend.datasets.memory import (
@@ -14,9 +20,49 @@ from GRIM_Backend.datasets.memory import (
 )
 
 
+def _bounded_sum(grids, *, coherent=False):
+    """Accumulate in input order, deriving only the current sample block."""
+    if coherent:
+        readers_and_types = [grid._bounded_complex_slice_reader() for grid in grids]
+        readers = [reader for reader, _dtype in readers_and_types]
+        dtype = np.result_type(*(np.result_type(dtype, np.complex64)
+                                 for _reader, dtype in readers_and_types))
+    else:
+        readers = [grid.power_slice for grid in grids]
+        dtype = np.result_type(*(grid.power.dtype for grid in grids))
+        # Writable legacy setters can supply integer or float16 power arrays.
+        # Match the constructor's real storage dtype after (not before) the
+        # sequential sum, preserving historical intermediate arithmetic.
+        dtype = np.dtype(np.float64 if dtype.kind == "f" and dtype.itemsize > 4 else np.float32)
+    result = allocate_result(grids[0].shape, dtype)
+    for selection in _bounded_grid_selections(result.shape, _COHERENT_OPERATION_BLOCK_CELLS):
+        block = readers[0](selection)
+        for read in readers[1:]:
+            # Do not promote the first inputs to the final output precision:
+            # preserve the historical sequential mixed-dtype rounding.
+            block = block + read(selection)
+        # The output is newly owned. Apply the constructor's normalization
+        # here so it can adopt the completed array without a grid-sized copy.
+        if coherent:
+            block[~np.isfinite(block.real) | ~np.isfinite(block.imag)] = np.nan + 1j * np.nan
+        else:
+            block = np.asarray(block, dtype=dtype)
+            block[~np.isfinite(block)] = np.nan
+            np.maximum(block, 0.0, out=block)
+        result[selection] = block
+    return result
+
+
+def _finite_complex_count(values):
+    return sum(int(np.count_nonzero(np.isfinite(values[selection])))
+               for selection in _bounded_grid_selections(
+                   values.shape, _COHERENT_OPERATION_BLOCK_CELLS))
+
+
 class GridArithmeticMixin:
     """Coherent and incoherent arithmetic and statistical reductions."""
 
+    @dataset_operation("coherent_add")
     def coherent_add(self, other, *, metadata_attested=False):
         """Coherently add two grids (complex sum).
 
@@ -36,9 +82,8 @@ class GridArithmeticMixin:
             coherent_metadata_attested=metadata_attested,
             _scan_phase_samples=False,
         )
-        rcs_out = self.rcs + other.rcs
-        usable = np.isfinite(rcs_out.real) & np.isfinite(rcs_out.imag)
-        usable_count = int(np.count_nonzero(usable))
+        rcs_out = _bounded_sum((self, other), coherent=True)
+        usable_count = _finite_complex_count(rcs_out)
         if usable_count == 0:
             raise ValueError(
                 "coherent addition has no common usable complex samples"
@@ -74,8 +119,10 @@ class GridArithmeticMixin:
             rcs_domain="power_phase",
             history=history,
             extra=extra,
+            _adopt_clean_arrays=True,
         )
 
+    @dataset_operation("coherent_add_many")
     def coherent_add_many(self, *grids, metadata_attested=False):
         """Coherently add multiple grids (complex sum).
 
@@ -91,7 +138,6 @@ class GridArithmeticMixin:
         """
         if not grids:
             return self
-        total = np.array(self.rcs, copy=True)
         for grid in grids:
             self._assert_compatible(
                 grid,
@@ -99,9 +145,8 @@ class GridArithmeticMixin:
                 coherent_metadata_attested=metadata_attested,
                 _scan_phase_samples=False,
             )
-            total = total + grid.rcs
-        usable = np.isfinite(total.real) & np.isfinite(total.imag)
-        usable_count = int(np.count_nonzero(usable))
+        total = _bounded_sum((self, *grids), coherent=True)
+        usable_count = _finite_complex_count(total)
         if usable_count == 0:
             raise ValueError(
                 "coherent addition has no common usable complex samples"
@@ -137,8 +182,10 @@ class GridArithmeticMixin:
             rcs_domain="power_phase",
             history=history,
             extra=extra,
+            _adopt_clean_arrays=True,
         )
 
+    @dataset_operation("coherent_subtract")
     def coherent_subtract(
         self,
         other,
@@ -200,7 +247,8 @@ class GridArithmeticMixin:
         scratch_bytes = block_cells * (
             12 * complex_dtype.itemsize + 8 * real_dtype.itemsize
         )
-        estimated_peak_bytes = retained_bytes + scratch_bytes
+        result_ram_bytes = resident_result_bytes(retained_bytes)
+        estimated_peak_bytes = result_ram_bytes + scratch_bytes
         limit_bytes = _coherent_working_set_limit_bytes(maximum_working_bytes)
         if (
             retained_bytes > np.iinfo(np.intp).max
@@ -214,7 +262,7 @@ class GridArithmeticMixin:
             raise MemoryError(
                 "coherent subtraction needs an estimated "
                 f"{estimated_peak_bytes / 1024**2:.1f} MiB working set "
-                f"({retained_bytes / 1024**2:.1f} MiB retained result plus "
+                f"({result_ram_bytes / 1024**2:.1f} MiB result RAM plus "
                 f"{scratch_bytes / 1024**2:.1f} MiB bounded scratch), above "
                 f"the {limit_bytes / 1024**2:.1f} MiB limit. Crop the common "
                 "grid or deliberately raise maximum_working_bytes / "
@@ -225,7 +273,7 @@ class GridArithmeticMixin:
 
         read_left, _left_reader_dtype = self._bounded_complex_slice_reader()
         read_right, _right_reader_dtype = other._bounded_complex_slice_reader()
-        field_out = np.empty(self.power.shape, dtype=complex_dtype)
+        field_out = allocate_result(self.power.shape, complex_dtype)
         usable_count = 0
         for selection in _bounded_grid_selections(
             self.power.shape, _COHERENT_OPERATION_BLOCK_CELLS
@@ -285,6 +333,7 @@ class GridArithmeticMixin:
             _adopt_clean_arrays=True,
         )
 
+    @dataset_operation("support_referenced_difference")
     def support_referenced_difference(
         self,
         support_reference,
@@ -424,6 +473,7 @@ class GridArithmeticMixin:
         difference.source_path = None
         return difference
 
+    @dataset_operation("incoherent_add")
     def incoherent_add(self, other):
         """Incoherently add two grids (magnitude sum).
 
@@ -436,7 +486,7 @@ class GridArithmeticMixin:
             New RcsGrid with linear power = self.power + other.power.
         """
         self._assert_compatible(other)
-        power_sum = self.power + other.power
+        power_sum = _bounded_sum((self, other))
         return self._new_grid(
             self.azimuths,
             self.elevations,
@@ -447,8 +497,10 @@ class GridArithmeticMixin:
             extra=self._derived_response_extra(
                 (other,), operation="incoherent-add", coherent=False
             ),
+            _adopt_clean_arrays=True,
         )
 
+    @dataset_operation("incoherent_add_many")
     def incoherent_add_many(self, *grids):
         """Incoherently add multiple grids (magnitude sum).
 
@@ -462,10 +514,9 @@ class GridArithmeticMixin:
         """
         if not grids:
             return self
-        total = np.array(self.power, copy=True)
         for grid in grids:
             self._assert_compatible(grid)
-            total = total + grid.power
+        total = _bounded_sum((self, *grids))
         return self._new_grid(
             self.azimuths,
             self.elevations,
@@ -476,8 +527,10 @@ class GridArithmeticMixin:
             extra=self._derived_response_extra(
                 grids, operation="incoherent-add-many", coherent=False
             ),
+            _adopt_clean_arrays=True,
         )
 
+    @dataset_operation("incoherent_subtract")
     def incoherent_subtract(self, other):
         """Incoherently subtract two grids (magnitude difference).
 
@@ -495,33 +548,34 @@ class GridArithmeticMixin:
         subtraction from being silently clipped into a plausible dataset.
         """
         self._assert_compatible(other)
-        left = np.asarray(self.power)
-        right = np.asarray(other.power)
-        calculation_dtype = np.result_type(left.dtype, right.dtype, np.float64)
-        left_calc = left.astype(calculation_dtype, copy=False)
-        right_calc = right.astype(calculation_dtype, copy=False)
-        power_diff = left_calc - right_calc
-
-
+        left_dtype, right_dtype = self.power.dtype, other.power.dtype
+        calculation_dtype = np.result_type(left_dtype, right_dtype, np.float64)
+        power_diff = allocate_result(self.shape, calculation_dtype)
         input_epsilons = [
             np.finfo(dtype).eps
-            for dtype in (left.dtype, right.dtype)
+            for dtype in (left_dtype, right_dtype)
             if np.issubdtype(dtype, np.floating)
         ]
         input_epsilon = max(input_epsilons, default=np.finfo(np.float64).eps)
-        scale = np.maximum(np.abs(left_calc), np.abs(right_calc))
-        roundoff_limit = 8.0 * float(input_epsilon) * scale
-        finite_negative = np.isfinite(power_diff) & (power_diff < 0.0)
-        material_negative = finite_negative & (power_diff < -roundoff_limit)
-        if np.any(material_negative):
-            count = int(np.count_nonzero(material_negative))
-            minimum = float(np.min(power_diff[material_negative]))
+        count, minimum = 0, float("inf")
+        for selection in _bounded_grid_selections(self.shape, _COHERENT_OPERATION_BLOCK_CELLS):
+            left = np.asarray(self.power[selection], dtype=calculation_dtype)
+            right = np.asarray(other.power[selection], dtype=calculation_dtype)
+            block = left - right
+            roundoff_limit = 8.0 * float(input_epsilon) * np.maximum(np.abs(left), np.abs(right))
+            finite_negative = np.isfinite(block) & (block < 0.0)
+            material_negative = finite_negative & (block < -roundoff_limit)
+            if np.any(material_negative):
+                count += int(np.count_nonzero(material_negative))
+                minimum = min(minimum, float(np.min(block[material_negative])))
+            block[finite_negative] = 0.0
+            power_diff[selection] = block
+        if count:
             raise ValueError(
                 "incoherent subtraction would produce materially negative "
                 f"linear power in {count} cell(s); minimum difference is "
                 f"{minimum:.17g}"
             )
-        power_diff[finite_negative] = 0.0
         return self._new_grid(
             self.azimuths,
             self.elevations,
@@ -534,6 +588,7 @@ class GridArithmeticMixin:
             ),
         )
 
+    @dataset_operation("arithmetic_db_subtract")
     def arithmetic_db_subtract(self, other):
         """Return the dimensionless power ratio represented by a dB difference.
 
@@ -552,24 +607,18 @@ class GridArithmeticMixin:
             )
 
 
-        numerator = np.asarray(self.power)
-        denominator = np.asarray(other.power)
-
-
         output_dtype = np.result_type(
-            numerator.dtype, denominator.dtype, np.float64
+            self.power.dtype, other.power.dtype, np.float64
         )
-        numerator = numerator.astype(output_dtype, copy=False)
-        denominator = denominator.astype(output_dtype, copy=False)
-        output_power = np.full(numerator.shape, np.nan, dtype=output_dtype)
-        valid = (
-            np.isfinite(numerator)
-            & np.isfinite(denominator)
-            & (denominator > 0.0)
-        )
-        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-            np.divide(numerator, denominator, out=output_power, where=valid)
-        output_power[~np.isfinite(output_power)] = np.nan
+        output_power = allocate_result(self.shape, output_dtype, fill=np.nan)
+        for selection in _bounded_grid_selections(self.shape, _COHERENT_OPERATION_BLOCK_CELLS):
+            numerator = np.asarray(self.power[selection], dtype=output_dtype)
+            denominator = np.asarray(other.power[selection], dtype=output_dtype)
+            valid = np.isfinite(numerator) & np.isfinite(denominator) & (denominator > 0.0)
+            block = output_power[selection]
+            with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                np.divide(numerator, denominator, out=block, where=valid)
+            block[~np.isfinite(block)] = np.nan
         ratio_units = dict(self.units)
         ratio_units["rcs_log_unit"] = "dB"
         ratio_units["rcs_linear_quantity"] = "power_ratio"
@@ -587,6 +636,7 @@ class GridArithmeticMixin:
             ),
         )
 
+    @dataset_operation("statistics_dataset")
     def statistics_dataset(
         self,
         statistic="mean",
@@ -625,18 +675,7 @@ class GridArithmeticMixin:
             raise ValueError("axes must include at least one axis")
         reduce_axes = tuple(sorted(reduce_axes))
 
-        if domain == "complex":
-            values = self.rcs
-        elif domain == "magnitude":
-            values = self.power
-        elif domain in ("db", "dbsm"):
-            values = self.linear_to_dbsm(self.power)
-        elif domain == "dbke":
-
-
-            freq_grid = np.asarray(self.frequencies, dtype=float).reshape(1, 1, -1, 1)
-            values = self.linear_to_dbke(self.power, freq_grid)
-        else:
+        if domain not in {"complex", "magnitude", "db", "dbsm", "dbke"}:
             raise ValueError("domain must be 'complex', 'magnitude', 'dbsm', or 'dbke'")
 
         stat_key = str(statistic).strip().lower()
@@ -653,22 +692,38 @@ class GridArithmeticMixin:
                 "linear-power RCS standard deviation."
             )
 
-        if stat_key == "mean":
-            reduced = np.nanmean(values, axis=reduce_axes, keepdims=True)
-        elif stat_key == "median":
-            reduced = np.nanmedian(values, axis=reduce_axes, keepdims=True)
-        elif stat_key == "min":
-            reduced = np.nanmin(values, axis=reduce_axes, keepdims=True)
-        elif stat_key == "max":
-            reduced = np.nanmax(values, axis=reduce_axes, keepdims=True)
-        elif stat_key == "std":
-            reduced = np.nanstd(values, axis=reduce_axes, keepdims=True)
-        elif stat_key == "percentile":
-            reduced = np.nanpercentile(values, float(percentile), axis=reduce_axes, keepdims=True)
-        else:
+        reducers = {"mean": np.nanmean, "median": np.nanmedian,
+                    "min": np.nanmin, "max": np.nanmax, "std": np.nanstd,
+                    "percentile": np.nanpercentile}
+        if stat_key not in reducers:
             raise ValueError(
                 "statistic must be mean, median, min, max, std, percentile, or pXX (for percentile XX)"
             )
+        # Keep each population and NumPy's percentile definition/dtype intact.
+        # Tile independent outputs; at least one population must fit in the
+        # reduction workspace. Tile layout can change summation roundoff.
+        reduced_shape = tuple(1 if axis in reduce_axes else count
+                              for axis, count in enumerate(self.shape))
+        population_cells = int(np.prod([self.shape[axis] for axis in reduce_axes]))
+        output_block_cells = max(1, _COHERENT_OPERATION_BLOCK_CELLS // population_cells)
+        reduced = None
+        for selection in _bounded_grid_selections(reduced_shape, output_block_cells):
+            source_selection = tuple(slice(None) if axis in reduce_axes else part
+                                     for axis, part in enumerate(selection))
+            if domain == "complex":
+                values = self.rcs_slice(source_selection)
+            else:
+                values = self.power[source_selection]
+                if domain in {"db", "dbsm"}:
+                    values = self.linear_to_dbsm(values)
+                elif domain == "dbke":
+                    frequency = self.frequencies[source_selection[2]]
+                    values = self.linear_to_dbke(values, frequency.reshape(1, 1, -1, 1))
+            args = (float(percentile),) if stat_key == "percentile" else ()
+            block = reducers[stat_key](values, *args, axis=reduce_axes, keepdims=True)
+            if reduced is None:
+                reduced = allocate_result(reduced_shape, block.dtype)
+            reduced[selection] = block
 
         axis_values = [
             np.array(self.azimuths, copy=True),
@@ -679,7 +734,7 @@ class GridArithmeticMixin:
         if broadcast_reduced:
 
 
-            reduced = np.broadcast_to(reduced, values.shape).copy()
+            reduced = copy_result(np.broadcast_to(reduced, self.shape))
         else:
             for axis_idx in reduce_axes:
                 original = axis_values[axis_idx]
@@ -775,22 +830,19 @@ class GridArithmeticMixin:
                 axis_values[1],
                 axis_values[2],
                 axis_values[3],
-                rcs_power=np.asarray(reduced, dtype=self.power.dtype),
+                rcs_power=copy_result(reduced, dtype=self.power.dtype),
                 rcs_domain="power_phase",
                 extra=statistics_extra,
             )
 
-        if domain == "dbke":
-            freq_grid = np.asarray(axis_values[2], dtype=float).reshape(1, 1, -1, 1)
-            reduced_linear = np.asarray(
-                self.dbke_to_linear(np.asarray(reduced, dtype=float), freq_grid),
-                dtype=self.power.dtype,
-            )
-        else:
-            reduced_linear = np.asarray(
-                10.0 ** (np.asarray(reduced, dtype=float) / 10.0),
-                dtype=self.power.dtype,
-            )
+        reduced_linear = allocate_result(reduced.shape, self.power.dtype)
+        for selection in _bounded_grid_selections(reduced.shape, _COHERENT_OPERATION_BLOCK_CELLS):
+            block = np.asarray(reduced[selection], dtype=float)
+            if domain == "dbke":
+                freq_grid = np.asarray(axis_values[2][selection[2]], dtype=float).reshape(1, 1, -1, 1)
+                reduced_linear[selection] = self.dbke_to_linear(block, freq_grid)
+            else:
+                reduced_linear[selection] = 10.0 ** (block / 10.0)
         return self._new_grid(
             axis_values[0],
             axis_values[1],

@@ -208,7 +208,7 @@ class PythonDatasetHelperTest(unittest.TestCase):
         # Four physical directions remain: median([1, 2, 100, 100]) = 51.
         self.assertEqual(float(result.rcs_power.item()), 51.0)
         self.assertEqual(result.source_path, "closed.grim")
-        self.assertEqual(result.history, "loaded closed sweep")
+        self.assertTrue(result.history.startswith("loaded closed sweep\nGRIM operation: medianize_azimuth"))
 
     def test_periodic_median_keeps_opening_sample_of_conflicting_closed_seam(self):
         conflict = _grid(
@@ -274,7 +274,7 @@ class PythonDatasetHelperTest(unittest.TestCase):
         self.assertNotIn("rcs_domain", width.extra)
         self.assertNotIn("power_domain", width.extra)
         self.assertEqual(width.source_path, "vehicle.grim")
-        self.assertEqual(width.history, "loaded vehicle")
+        self.assertTrue(width.history.startswith("loaded vehicle\nGRIM operation: convert_extrusion"))
         np.testing.assert_array_equal(
             width.extra["body_profile_radius_m"], [1.0, 2.0]
         )
@@ -310,7 +310,7 @@ class PythonDatasetHelperTest(unittest.TestCase):
             self.assertNotIn("rcs_domain", result.extra)
             self.assertNotIn("power_domain", result.extra)
             self.assertEqual(result.source_path, "vehicle.grim")
-            self.assertEqual(result.history, "loaded vehicle")
+            self.assertTrue(result.history.startswith("loaded vehicle\nGRIM operation: "))
             np.testing.assert_array_equal(
                 result.extra["body_profile_radius_m"], [1.0, 2.0]
             )

@@ -1,6 +1,7 @@
 """Public GRIM headless API."""
 from GRIM_Backend.scripting.cli import _audit_json_default, _parser, audit_dataset, main
 from GRIM_Backend.datasets.combine import combine_datasets
+from GRIM_Backend.datasets.result_storage import operation_result_storage
 from GRIM_Backend.io.loaders import (
     SUPPORTED_EXTENSIONS,
     _matching_dataset_paths,

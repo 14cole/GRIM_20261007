@@ -9,6 +9,10 @@ import re
 
 import numpy as np
 
+from GRIM_Backend.datasets.result_storage import (
+    copy_result,
+)
+
 from GRIM_Backend.datasets.constants import (
     _ACQUISITION_METADATA_FAMILIES,
     _ANGLE_UNITS,
@@ -827,6 +831,7 @@ class GridMetadataMixin:
     })
 
     _DERIVED_PROVENANCE_EXTRA_KEYS = frozenset({
+        "operation_provenance_json",
 
 
         "support_reference_difference_json",
@@ -840,6 +845,40 @@ class GridMetadataMixin:
     })
 
     _RAW_AMPLITUDE_EXTRA_KEYS = ("rcs_amp_real", "rcs_amp_imag")
+
+    def _response_independent_extra(self):
+        """Preserve ancillary models for transforms; drop response-bound claims.
+
+        This is distinct from arithmetic's scalar-only policy. Both policies
+        live here so new metadata types have one owner.
+        """
+        stale = {
+            "amplitude_convention",
+            "power_domain",
+            "rcs_domain",
+            "solver_metadata_json",
+            "solver_certification",
+            "production_mesh_certification_json",
+            "source_body_mesh_certification_json",
+            "requested_radar_grid_json",
+            "rcs_amp_real",
+            "rcs_amp_imag",
+        }
+        original_shape = tuple(self.power.shape)
+        extra = {}
+        for key, value in (self.extra or {}).items():
+            if key in stale:
+                continue
+            array = np.asarray(value)
+            if array.ndim >= 4 and tuple(array.shape[:4]) == original_shape:
+                continue
+            if isinstance(value, np.ndarray):
+                shared = value.view()
+                shared.setflags(write=False)
+                extra[key] = shared
+            else:
+                extra[key] = copy.deepcopy(value)
+        return extra
 
     def _safe_derived_scalar_extra(self, *, include_field_conventions=True):
         """Copy only scalar metadata with durable derived-grid semantics.
@@ -958,7 +997,9 @@ class GridMetadataMixin:
         raw_in_samples = self._storage_domain == "raw_field"
         if preserve_all:
             extra = {
-                key: copy.deepcopy(value)
+                key: (copy_result(value) if isinstance(value, np.ndarray) and value.ndim
+                      and not value.dtype.hasobject
+                      else copy.deepcopy(value))
                 for key, value in self._extra_to_write().items()
                 if not (raw_in_samples and key in self._RAW_AMPLITUDE_EXTRA_KEYS)
             }
@@ -979,14 +1020,14 @@ class GridMetadataMixin:
             if preserve_raw and pair is not None:
                 real_array, imag_array = pair
                 transform = array_transform or (
-                    lambda value: np.array(value, copy=True)
+                    lambda value: copy_result(value)
                 )
                 transformed_real = np.asarray(transform(real_array))
                 transformed_imag = np.asarray(transform(imag_array))
                 if np.shares_memory(transformed_real, real_array):
-                    transformed_real = np.array(transformed_real, copy=True)
+                    transformed_real = copy_result(transformed_real)
                 if np.shares_memory(transformed_imag, imag_array):
-                    transformed_imag = np.array(transformed_imag, copy=True)
+                    transformed_imag = copy_result(transformed_imag)
                 extra["rcs_amp_real"] = transformed_real
                 extra["rcs_amp_imag"] = transformed_imag
                 extra["raw_complex_amplitude_preserved"] = True

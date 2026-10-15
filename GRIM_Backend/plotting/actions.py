@@ -78,6 +78,14 @@ class _PbpBands:
                 self._owner._native_db_quantity(dataset)
             )
 
+    def accept_prepared(self, plan, envelope):
+        """Adopt already reduced worker data without retaining every trace."""
+        dataset = plan.dataset
+        identity = (self._owner._dataset_plot_key(dataset), str(dataset.polarizations[plan.selection[3][0]]))
+        self._envelopes[identity] = envelope
+        if self._owner._native_db_overlay_enabled():
+            self._db_quantities.setdefault(identity, set()).add(self._owner._native_db_quantity(dataset))
+
     def _band_key(self):
         """A held render is a new plot item, even for the same dataset/cuts."""
         if not self._owner._plot_item_artists(PBP_BAND_KEY):
@@ -211,6 +219,81 @@ def _selected_polarization_axis_availability(
 
 
 class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
+    def _cancel_plot_preparations(self):
+        canceled = False
+        for context in getattr(self, "_plot_contexts", {}).values():
+            canceled = context.session.cancel() or canceled
+        if canceled:
+            self.status.showMessage("Pending plot canceled because its inputs changed.")
+
+    def _submit_plot_preparation(self, request, compute, publish, *, cells):
+        """Prepare substantial array work separately from GUI publication.
+
+        Small selections stay immediate; this keeps a click on an ordinary
+        short cut inexpensive. Tests and non-window callers use the same pure
+        service synchronously. Large jobs are coalesced per owning canvas.
+        """
+        contexts = getattr(self, "_plot_contexts", {})
+        context = contexts.get(getattr(self, "_active_plot_tab", None))
+        threshold = int(getattr(self, "_plot_async_threshold", 100_000))
+        if context is None or int(cells) < threshold:
+            try:
+                publish(compute(None))
+            except (MemoryError, ValueError) as exc:
+                self.status.showMessage(f"Plot preparation failed: {exc}")
+            return False
+        from GRIM_Backend.execution.plot_jobs import PlotJobRunner, dispose_result
+        session = context.session
+        if session.runner is None:
+            session.runner = PlotJobRunner(self)
+            session.runner.publication_failed.connect(
+                lambda error: self.status.showMessage(f"Plot publication failed: {error}"))
+        generation = int(getattr(self, "_plot_render_generation", 0))
+        tab_key = self._active_plot_tab
+        old_recipe = getattr(self, "last_python_plot_spec", None)
+        self._record_python_plot(request.mode, emit=False)
+        recipe = self.last_python_plot_spec
+        self.last_python_plot_spec = old_recipe
+        self._ordinary_plot_pending = True
+        self._ordinary_plot_emit = False
+        self._ordinary_plot_fit = None
+        self._ordinary_plot_slider_before = None
+        self.status.showMessage(f"Preparing {request.mode.replace('_', ' ')} plot…")
+
+        def completed(result, error):
+            if (session.disposed or getattr(self, "_active_plot_tab", None) != tab_key
+                    or context.plot_figure is not self.plot_figure
+                    or generation != int(getattr(self, "_plot_render_generation", 0))):
+                dispose_result(result)
+                return
+            self._ordinary_plot_pending = False
+            if error is not None:
+                self.status.showMessage(f"Plot preparation failed: {error}")
+                return
+            if result is None:
+                return
+            try:
+                publish(result)
+            except Exception as exc:
+                dispose_result(result)
+                self.status.showMessage(f"Plot display failed: {exc}")
+                return
+            if "updated" in str(self.status.currentMessage()).lower():
+                self.last_python_plot_spec = recipe
+                self._update_current_python_plot_style()
+                slider_before = self._ordinary_plot_slider_before
+                if slider_before is not None:
+                    self._tag_plot_slider_artists(slider_before)
+                self._restore_plot_markers()
+                fit = getattr(self, "_ordinary_plot_fit", None)
+                if fit:
+                    getattr(self, fit)()
+                self._maybe_autoscale()
+                if self._ordinary_plot_emit:
+                    self._emit_last_successful_python_plot()
+        session.runner.submit(compute, completed)
+        return True
+
     def _on_param_selection_changed(self) -> None:
         self._invalidate_isar_result()
         self._maybe_autoplot()
@@ -480,15 +563,24 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             self._fit_y()
         elif self.last_plot_mode == "frequency":
             self._plot_frequency()
-            self._fit_y()
+            if getattr(self, "_ordinary_plot_pending", False):
+                self._ordinary_plot_fit = "_fit_y"
+            else:
+                self._fit_y()
         elif self.last_plot_mode == "elevation_sweep":
             self._plot_elevation_sweep()
-            self._fit_y()
+            if getattr(self, "_ordinary_plot_pending", False):
+                self._ordinary_plot_fit = "_fit_y"
+            else:
+                self._fit_y()
         elif self.last_plot_mode == "compare":
             self._plot_compare()
         elif self.last_plot_mode == "cdf":
             self._plot_cdf()
-            self._fit_both()
+            if getattr(self, "_ordinary_plot_pending", False):
+                self._ordinary_plot_fit = "_fit_both"
+            else:
+                self._fit_both()
         elif self.last_plot_mode == "sector_stats":
             self._plot_sector_stats()
             self._fit_y()
@@ -885,6 +977,10 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         self._style_plot_axes()
 
     def _clear_plot(self) -> None:
+        context = getattr(self, "_plot_contexts", {}).get(getattr(self, "_active_plot_tab", None))
+        if context is not None:
+            context.session.disposed = False
+            context.session.cancel()
         panel = getattr(self, "inline_analysis", None)
         if panel is not None:
             panel.deactivate()
@@ -1099,6 +1195,10 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     # --- renderer preflight, unit conversion, and display bounding ----------
 
     def _start_plot_render(self) -> None:
+        context = getattr(self, "_plot_contexts", {}).get(getattr(self, "_active_plot_tab", None))
+        if context is not None:
+            context.session.disposed = False
+            context.session.cancel()
         panel = getattr(self, "inline_analysis", None)
         if panel is not None and not panel._rendering:
             panel.deactivate()
@@ -1170,6 +1270,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         artist._grim_native_rectilinear_data = None
 
     def _release_native_plot_samples(self):
+        context = getattr(self, "_plot_contexts", {}).get(getattr(self, "_active_plot_tab", None))
+        if context is not None:
+            context.session.release()
         linked_cuts = getattr(self.plot_figure, "_grim_linked_cuts", None)
         if linked_cuts is not None:
             linked_cuts.disconnect()
@@ -1180,7 +1283,17 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _dispose_native_plot_snapshots(self):
         """Release both tabs' temporary resources after an accepted close."""
+        for name in ("_autoplot_timer", "_hover_timer", "_plot_slider_refresh_timer"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.stop()
         for context in getattr(self, "_plot_contexts", {}).values():
+            context.session.close()
+            if context.plot_slider is not None:
+                context.plot_slider.stop_interaction()
+            for marker in context.session.state.pop("_plot_markers", []):
+                self._detach_marker(marker)
+            context.session.state.update(_active_marker=None, _marker_drag=None)
             panel = getattr(context, "inline_analysis", None)
             if panel is not None:
                 panel.deactivate()
@@ -2041,6 +2154,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         generation: the Plotting and ISAR tabs own different canvases.
         """
 
+        self._cancel_plot_preparations()
         cancel_event = getattr(self, "_isar_cancel_event", None)
         if cancel_event is not None:
             cancel_event.set()
@@ -2864,6 +2978,9 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _on_explicit_plot_clicked(self, mode: str) -> None:
         """Emit a synchronous plot after its renderer reports success."""
+        if getattr(self, "_ordinary_plot_pending", False):
+            self._ordinary_plot_emit = True
+            return
         if "updated" in str(self.status.currentMessage()).lower():
             self._emit_last_successful_python_plot()
 
@@ -2885,7 +3002,7 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
     def _capture_successful_python_plot(self, mode: str) -> None:
         """Freeze the semantic spec without recording automatic re-plots."""
 
-        if "updated" in str(self.status.currentMessage()).lower():
+        if not getattr(self, "_ordinary_plot_pending", False) and "updated" in str(self.status.currentMessage()).lower():
             self._record_python_plot(mode, emit=False)
 
     def _update_current_python_plot_style(
@@ -2908,6 +3025,16 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
             parameters.update(self._current_isar_python_display_style())
         if spec[3] == "delta_map":
             parameters["show_colorbar"] = bool(self.chk_colorbar.isChecked())
+        if spec[3] == "waterfall":
+            parameters["show_colorbar"] = bool(self.chk_colorbar.isChecked())
+            parameters["shared_colorbar"] = bool(self.chk_colorbar_shared.isChecked())
+            zmin, zmax = float(self.spin_plot_zmin.value()), float(self.spin_plot_zmax.value())
+            parameters["color_limits"] = (zmin, zmax) if zmin < zmax else None
+            controls = getattr(self, "image_analysis_controls", None)
+            if controls is not None:
+                options = dict(parameters.get("heatmap_options", {}))
+                options["cut_position"] = controls.options().get("cut_position")
+                parameters["heatmap_options"] = options
         self.last_python_plot_spec = (*spec[:4], parameters)
 
     def _current_isar_python_display_style(self) -> dict[str, object]:
@@ -2950,16 +3077,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
         if recorder is None or not callable(reference_getter):
             return
 
-        supported_modes = {
-            "azimuth_rect",
-            "azimuth_polar",
-            "frequency",
-            "elevation_sweep",
-            "isar_image",
-            "delta_map",
-            "cdf",
-            "waterfall",
-        }
+        from GRIM_Backend.plotting.registry import HEADLESS_PLOT_MODES
+        supported_modes = HEADLESS_PLOT_MODES
         if mode not in supported_modes:
             spec = (
                 "unsupported",
@@ -3200,14 +3319,16 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _plot_frequency(self) -> None:
         self._set_compare_sector_controls_visible(False)
-        frequency_mode.render(self)
+        if frequency_mode.render(self):
+            return
         self._capture_successful_python_plot("frequency")
         self._restore_plot_markers()
         self._maybe_autoscale()
 
     def _plot_elevation_sweep(self) -> None:
         self._set_compare_sector_controls_visible(False)
-        elevation_sweep_mode.render(self)
+        if elevation_sweep_mode.render(self):
+            return
         self._capture_successful_python_plot("elevation_sweep")
         self._restore_plot_markers()
         self._maybe_autoscale()
@@ -3225,7 +3346,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _plot_waterfall(self) -> None:
         self._set_compare_sector_controls_visible(False)
-        waterfall_mode.render(self)
+        if waterfall_mode.render(self):
+            return
         self._capture_successful_python_plot("waterfall")
         self._restore_plot_markers()
         self._maybe_autoscale()
@@ -3238,7 +3360,8 @@ class PlotOpsMixin(PlotMarkersMixin, PlotSliderMixin, DatasetPlotStyleMixin):
 
     def _plot_cdf(self) -> None:
         self._set_compare_sector_controls_visible(False)
-        cdf_mode.render(self)
+        if cdf_mode.render(self):
+            return
         self._capture_successful_python_plot("cdf")
         self._restore_plot_markers()
         self._maybe_autoscale()

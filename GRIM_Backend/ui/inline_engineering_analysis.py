@@ -18,6 +18,7 @@ from GRIM_Backend.ui.engineering_analysis import (
     EngineeringAnalysisDialog, ResultTable, _number, _trace_sort_order, _with_run_breaks,
 )
 from GRIM_Backend.ui.iq_analysis import IQControls, render_iq
+from GRIM_Backend.ui.analysis_presenter import EngineeringAnalysisPresenter
 
 
 _PHASE_HELP = {
@@ -97,7 +98,7 @@ class _SettingsScrollArea(QScrollArea):
             self.updateGeometry()
 
 
-class InlineEngineeringAnalysis(QWidget):
+class InlineEngineeringAnalysis(EngineeringAnalysisPresenter, QWidget):
     """Small contextual controls; computations and result formats remain shared."""
     TAB_NAMES = EngineeringAnalysisDialog.TAB_NAMES
     _spin = staticmethod(EngineeringAnalysisDialog._spin)
@@ -107,8 +108,6 @@ class InlineEngineeringAnalysis(QWidget):
     _maximum_gap = EngineeringAnalysisDialog._maximum_gap
     _sync_region_context = EngineeringAnalysisDialog._sync_region_context
     _export_results = EngineeringAnalysisDialog._export_results
-    _analyze_phase = EngineeringAnalysisDialog._analyze_phase
-    _analyze_polarization = EngineeringAnalysisDialog._analyze_polarization
 
     def __init__(self, owner):
         super().__init__()

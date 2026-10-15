@@ -795,7 +795,7 @@ class PlotRendererIntegrationTests(unittest.TestCase):
                 azimuth_rect_mode.render(harness)
                 self.assertEqual(harness.plot_ax.get_ylabel(), expected)
 
-    def test_large_synchronous_sweep_and_waterfall_work_are_blocked_pre_draw(self):
+    def test_prepared_plots_check_working_memory_before_drawing(self):
         dataset = _grid()
         selections = {
             "azimuth": dataset.azimuths,
@@ -811,19 +811,20 @@ class PlotRendererIntegrationTests(unittest.TestCase):
         elevation_harness = _RendererHarness(
             [("dataset", dataset)], selections=selections
         )
+        from GRIM_Backend.plotting import requests
         with mock.patch.object(
-            common,
-            "validate_synchronous_plot_workload",
-            side_effect=ValueError("selection too large"),
+            requests,
+            "check_working_memory",
+            side_effect=MemoryError("working memory budget exceeded"),
         ) as preflight:
             frequency_mode.render(frequency_harness)
-            self.assertIn("plot blocked", frequency_harness.status.message.lower())
+            self.assertIn("preparation failed", frequency_harness.status.message.lower())
             self.assertEqual(len(frequency_harness.plot_ax.lines), 0)
             elevation_sweep_mode.render(elevation_harness)
-            self.assertIn("plot blocked", elevation_harness.status.message.lower())
+            self.assertIn("preparation failed", elevation_harness.status.message.lower())
             self.assertEqual(len(elevation_harness.plot_ax.lines), 0)
             waterfall_mode.render(waterfall_harness)
-            self.assertIn("plot blocked", waterfall_harness.status.message.lower())
+            self.assertIn("preparation failed", waterfall_harness.status.message.lower())
             self.assertIsNone(waterfall_harness.plot_axes)
         self.assertEqual(preflight.call_count, 3)
 

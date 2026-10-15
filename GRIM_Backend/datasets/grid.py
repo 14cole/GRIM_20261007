@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import weakref
 
 import numpy as np
 
@@ -25,6 +24,9 @@ from GRIM_Backend.datasets.coordinates import (
 from GRIM_Backend.datasets.memory import _bounded_grid_selections, _real_storage_dtype
 from GRIM_Backend.datasets.metadata import GridMetadataMixin
 from GRIM_Backend.datasets.storage import GridStorageMixin
+from GRIM_Backend.datasets.result_storage import (
+    allocate_result, copy_result, result_blocks, result_storage_info, typed_samples,
+)
 from GRIM_Backend.io.cst import CstFormatMixin
 from GRIM_Backend.io.native import NativeFormatMixin
 from GRIM_Backend.io.out import OutFormatMixin
@@ -111,6 +113,12 @@ class RcsGrid(
         self._storage_kind = "power_phase"
         self._storage_domain = "physical"
         self._raw_coverage_cache = None
+        storage_options = result_storage_info()
+        if storage_options is not None:
+            self._operation_storage_options = {
+                key: storage_options[key] for key in ("mode", "ram_budget_bytes", "cache_dir", "allow_exceed")
+                if key in storage_options and storage_options[key] is not None
+            }
         if (_adopt_clean_arrays is not None and _adopt_clean_arrays is not False
                 and _adopt_clean_arrays is not _ADOPT_CLEAN_ARRAYS_TOKEN):
             raise ValueError("_adopt_clean_arrays is reserved for internal operations")
@@ -127,7 +135,7 @@ class RcsGrid(
         if (rcs is None and rcs_power is not None and rcs_phase is None
                 and rcs_storage_domain == "physical"
                 and not any(key in (extra or {}) for key in ("rcs_amp_real", "rcs_amp_imag"))):
-            power = np.asarray(rcs_power, dtype=_real_storage_dtype(rcs_power))
+            power = typed_samples(rcs_power, _real_storage_dtype(rcs_power))
             if power.shape != expected:
                 raise ValueError(f"rcs_power shape {power.shape} != {expected}")
             self._power = power if _adopt_clean_arrays is _ADOPT_CLEAN_ARRAYS_TOKEN else self._clean_power(power)
@@ -151,8 +159,9 @@ class RcsGrid(
             raw = direct
             if direct_physical and raw.shape == expected + (2,):
                 dtype = np.complex128 if _real_storage_dtype(raw) == np.float64 else np.complex64
-                field = np.empty(expected, dtype=dtype)
-                field.real, field.imag = raw[..., 0], raw[..., 1]
+                field = allocate_result(expected, dtype)
+                for block in result_blocks(expected):
+                    field[block].real, field[block].imag = raw[block + (0,)], raw[block + (1,)]
                 raw = field
             if raw is None or raw.shape != expected or not np.iscomplexobj(raw):
                 raise ValueError("raw complex samples must have the dataset shape")
@@ -168,16 +177,17 @@ class RcsGrid(
                 _adopt_clean_arrays is _ADOPT_CLEAN_ARRAYS_TOKEN
                 and raw is direct
                 and raw.dtype == dtype
-                and raw.flags.owndata
             ):
                 # An internal exact operation hands over a fresh array whose
                 # non-finite samples are already NaN pairs. Adopt it instead of
                 # copying and rescanning a grid-sized field.
                 field = raw
             else:
-                field = np.array(raw, dtype=dtype, copy=True)
-                invalid = ~np.isfinite(field.real) | ~np.isfinite(field.imag)
-                field[invalid] = np.nan + 1j * np.nan
+                field = copy_result(raw, dtype=dtype)
+                for block in result_blocks(field.shape):
+                    part = field[block]
+                    invalid = ~np.isfinite(part.real) | ~np.isfinite(part.imag)
+                    part[invalid] = np.nan + 1j * np.nan
             self._install_complex(field, domain=rcs_storage_domain, copy=False)
             if rcs_storage_domain == "raw_field" and self._authoritative_raw_amplitude_from_pair((self._complex.real, self._complex.imag), (0, 0, 0, 0)) is None:
                 raise ValueError("raw complex normalization is not defined for this dataset")
@@ -194,12 +204,13 @@ class RcsGrid(
         if rcs is not None:
             rcs_arr = np.asarray(rcs)
             if rcs_arr.shape == expected + (2,):
-                complex_arr = np.asarray(
-                    rcs_arr[..., 0] + 1j * rcs_arr[..., 1], dtype=complex_dtype
-                )
+                complex_arr = allocate_result(expected, complex_dtype)
+                for block in result_blocks(expected):
+                    complex_arr[block].real = rcs_arr[block + (0,)]
+                    complex_arr[block].imag = rcs_arr[block + (1,)]
             elif rcs_arr.shape == expected:
                 if np.iscomplexobj(rcs_arr):
-                    complex_arr = np.asarray(rcs_arr, dtype=complex_dtype)
+                    complex_arr = typed_samples(rcs_arr, complex_dtype)
                 elif rcs_power is None:
 
                     rcs_power = np.asarray(rcs_arr, dtype=real_dtype)
@@ -207,22 +218,26 @@ class RcsGrid(
                 raise ValueError(f"rcs shape {rcs_arr.shape} != {expected}")
 
         if rcs_power is not None:
-            power_arr = np.asarray(rcs_power, dtype=real_dtype)
+            power_arr = typed_samples(rcs_power, real_dtype)
             if power_arr.shape != expected:
                 raise ValueError(f"rcs_power shape {power_arr.shape} != {expected}")
         elif complex_arr is not None:
-            power_arr = np.abs(complex_arr) ** 2
+            power_arr = allocate_result(expected, real_dtype)
+            for block in result_blocks(expected):
+                power_arr[block] = np.abs(complex_arr[block]) ** 2
         else:
             raise ValueError("provide complex rcs samples and/or rcs_power")
 
         if rcs_phase is not None:
-            phase_arr = np.asarray(rcs_phase, dtype=real_dtype)
+            phase_arr = typed_samples(rcs_phase, real_dtype)
             if phase_arr.shape != expected:
                 raise ValueError(f"rcs_phase shape {phase_arr.shape} != {expected}")
         elif complex_arr is not None:
-            phase_arr = np.angle(complex_arr).astype(real_dtype)
+            phase_arr = allocate_result(expected, real_dtype)
+            for block in result_blocks(expected):
+                phase_arr[block] = np.angle(complex_arr[block])
         else:
-            phase_arr = np.full(expected, np.nan, dtype=real_dtype)
+            phase_arr = allocate_result(expected, real_dtype, fill=np.nan)
 
         if (
             _adopt_clean_arrays is not None
@@ -238,7 +253,8 @@ class RcsGrid(
         else:
             power_clean = self._clean_power(power_arr)
             phase_clean = self._clean_phase(phase_arr)
-            phase_clean[~np.isfinite(power_clean)] = np.nan
+            for block in result_blocks(expected):
+                phase_clean[block][~np.isfinite(power_clean[block])] = np.nan
 
         self._power = power_clean
         self._phase = phase_clean
@@ -314,38 +330,43 @@ class RcsGrid(
     @staticmethod
     def _clean_power(power_value):
         dtype = _real_storage_dtype(power_value)
-        power = np.asarray(power_value, dtype=dtype)
-        finite = np.isfinite(power)
-        out = np.full(power.shape, np.nan, dtype=dtype)
-        out[finite] = np.maximum(power[finite], 0.0)
+        power = typed_samples(power_value, dtype)
+        out = allocate_result(power.shape, dtype, fill=np.nan)
+        for block in result_blocks(power.shape):
+            source = power[block]
+            finite = np.isfinite(source)
+            out[block][finite] = np.maximum(source[finite], 0.0)
         return out
 
     @staticmethod
     def _clean_phase(phase_value):
         dtype = _real_storage_dtype(phase_value)
-        phase = np.array(phase_value, dtype=dtype, copy=True)
-        phase[~np.isfinite(phase)] = np.nan
+        phase = copy_result(phase_value, dtype=dtype)
+        for block in result_blocks(phase.shape):
+            part = phase[block]
+            part[~np.isfinite(part)] = np.nan
         return phase
 
     @staticmethod
-    def _complex_from_power_phase(power_value, phase_value):
+    def _complex_from_power_phase(power_value, phase_value, *, _result=False):
         real_dtype = _real_storage_dtype(power_value, phase_value)
         complex_dtype = np.complex128 if real_dtype == np.float64 else np.complex64
         power = np.asarray(power_value, dtype=real_dtype)
         phase = np.asarray(phase_value, dtype=real_dtype)
         if power.shape != phase.shape:
             raise ValueError(f"power/phase shapes {power.shape}/{phase.shape} do not match")
-        out = np.full(power.shape, np.nan + 1j * np.nan, dtype=complex_dtype)
+        out = (allocate_result(power.shape, complex_dtype, fill=np.nan + 1j * np.nan)
+               if _result else np.full(power.shape, np.nan + 1j * np.nan, dtype=complex_dtype))
         # A zero field is fully known even though its phase is undefined.
         # Keep it in coherent arithmetic and sample counts without inventing
         # a stored phase for diagnostics or treating missing power as zero.
-        zero = power == 0.0
-        out[zero] = 0.0 + 0.0j
-        valid = np.isfinite(power) & np.isfinite(phase) & ~zero
-        if np.any(valid):
-            out[valid] = (
-                np.sqrt(power[valid]) * np.exp(1j * phase[valid])
-            ).astype(complex_dtype)
+        for block in result_blocks(power.shape):
+            p, ph, target = power[block], phase[block], out[block]
+            zero = p == 0.0
+            target[zero] = 0.0 + 0.0j
+            valid = np.isfinite(p) & np.isfinite(ph) & ~zero
+            if np.any(valid):
+                target[valid] = (np.sqrt(p[valid]) * np.exp(1j * ph[valid])).astype(complex_dtype)
         return out
 
     def _complete_authoritative_raw_arrays(self):
@@ -384,10 +405,10 @@ class RcsGrid(
     def _raw_pair_coverage_matches(self, real, imag):
         """Return whether finite raw coverage equals finite modeled coverage.
 
-        The block scan is grid-sized, so its verdict is memoised for the exact
-        array objects it inspected (held weakly).  Replacing any of those arrays
-        invalidates the memo.  An in-place edit that changes a NaN pattern
-        without replacing the array is not re-detected until then.
+        Attached metadata and legacy samples are externally mutable. Array
+        identity (and even a read-only view) cannot prove their contents stayed
+        unchanged, so validate this exceptional path on each read. Canonical
+        raw storage takes the direct shared-buffer path above without a scan.
         """
 
         # A late raw pair may replace the physical source. Inspect coverage
@@ -397,20 +418,7 @@ class RcsGrid(
             if self._complex is not None and not self._legacy_samples
             else self._power
         )
-        arrays = (real, imag, source)
-        cache = getattr(self, "_raw_coverage_cache", None)
-        if cache is not None:
-            refs, verdict = cache
-            if all(ref() is array for ref, array in zip(refs, arrays)):
-                return verdict
-        verdict = self._scan_raw_pair_coverage(real, imag, source)
-        try:
-            self._raw_coverage_cache = (
-                tuple(weakref.ref(array) for array in arrays), verdict
-            )
-        except TypeError:
-            self._raw_coverage_cache = None
-        return verdict
+        return self._scan_raw_pair_coverage(real, imag, source)
 
     @staticmethod
     def _scan_raw_pair_coverage(real, imag, source):
@@ -430,7 +438,7 @@ class RcsGrid(
         return True
 
     def _raw_normalization_defined(self):
-        """Return whether a raw solver pair can be normalised for this dataset.
+        """Return whether a raw solver pair can be normalized for this dataset.
 
         This is the O(1) precondition for every authoritative raw-pair read,
         mirroring ``_authoritative_raw_amplitude_from_pair``; the grid-sized

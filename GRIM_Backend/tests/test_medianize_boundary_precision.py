@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from GRIM_Backend.datasets.grid import RcsGrid
+from GRIM_Backend.datasets.operations import operation_events
 from GRIM_Backend.datasets.transforms import medianize_azimuth
 
 
@@ -47,7 +48,16 @@ def test_exact_window_edges_preserve_known_median_and_source(unit, periodic):
         "discarded_seam_cell_count": 0,
     }
     assert np.isnan(result.phase).all()
-    assert result.history == source.history
+    assert source.history == "source history"
+    assert result.history.startswith(source.history + "\n")
+    events = operation_events(result)
+    assert len(events) == 1
+    assert events[0]["operation"] == "medianize_azimuth"
+    assert events[0]["parameters"] == {
+        "window_degrees": 40.0, "slide_degrees": 20.0, "periodic": periodic,
+        "seam_conflict": "first", "return_report": True,
+    }
+    assert not operation_events(source)
     assert result.units == source.units
     assert result.extra["time_convention"] == source.extra["time_convention"]
     assert result.extra["polarization_basis"] == source.extra["polarization_basis"]

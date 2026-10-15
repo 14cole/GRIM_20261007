@@ -7,12 +7,18 @@ import re
 
 import numpy as np
 
+from GRIM_Backend.datasets.memory import _bounded_grid_selections
+from GRIM_Backend.datasets.result_storage import allocate_result
+
+from GRIM_Backend.datasets.operations import dataset_operation
+
 from GRIM_Backend.datasets.constants import C0, _FREQUENCY_UNITS
 
 
 class GridCalibrationMixin:
     """Range calibration against reference RCS measurements."""
 
+    @dataset_operation('range_calibrate')
     def range_calibrate(
         self,
         measured_calibration,
@@ -248,106 +254,86 @@ class GridCalibrationMixin:
 
         measured_pol_index = [measured_pols.index(label) for label in dut_pols]
         exact_pol_index = [exact_pols.index(label) for label in dut_pols]
-        # Every storage kind returns ``0+0j`` for a zero-power sample, so the
-        # fields need no power grid to repair them, and nothing below edits
-        # these fresh arrays in place.
-        measured_amp = np.asarray(
-            measured_calibration.rcs_slice((Ellipsis, measured_pol_index)),
-            dtype=np.complex128,
-        )
-        exact_amp = np.asarray(
-            exact_reference.rcs_slice((Ellipsis, exact_pol_index)),
-            dtype=np.complex128,
-        )
-        dut_amp = np.asarray(self.rcs, dtype=np.complex128)
-
-        range_phase = np.exp(
-            -1j * (4.0 * np.pi * frequency_hz * offset_m / C0)
-        ).reshape(1, 1, -1, 1)
-        measured_finite = np.isfinite(measured_amp)
-        exact_finite = np.isfinite(exact_amp)
-        dut_finite = np.isfinite(dut_amp)
-        measured_zero = np.isfinite(measured_amp) & (np.abs(measured_amp) == 0.0)
-
-
-        valid_reference = measured_finite & exact_finite & ~measured_zero
-        correction = np.full(
-            np.broadcast_shapes(exact_amp.shape, measured_amp.shape),
-            np.nan + 1j * np.nan,
-            dtype=np.complex128,
-        )
-        correction_numerator = exact_amp * range_phase
-        np.divide(
-            correction_numerator,
-            measured_amp,
-            out=correction,
-            where=valid_reference & ~measured_zero,
-        )
-        valid_correction = np.isfinite(correction)
-        correction_magnitude = np.abs(correction)
-        positive_correction = valid_correction & (correction_magnitude > 0.0)
-        correction_gain_db = np.full(correction.shape, np.nan, dtype=np.float64)
-        correction_gain_db[positive_correction] = (
-            20.0 * np.log10(correction_magnitude[positive_correction])
-        )
-        excessive = np.zeros(correction.shape, dtype=bool)
-        if gain_limit_db is not None:
-            excessive = correction_gain_db > gain_limit_db
-            correction[excessive] = np.nan + 1j * np.nan
+        # Calibrate reference tiles first, then stream the DUT into its final
+        # storage. Singleton angular reference axes broadcast as views, never
+        # as a full-size correction or DUT field in RAM.
+        reference_shape = measured_calibration.shape[:3] + (len(dut_pols),)
+        correction = allocate_result(reference_shape, np.complex128)
+        finite_gain = allocate_result((int(np.prod(reference_shape)),), np.float64)
+        gain_count = 0
+        zero_factor_count = missing_reference_count = measured_zero_count = 0
+        over_limit_count = 0
+        range_phase = np.exp(-1j * (4.0 * np.pi * frequency_hz * offset_m / C0))
+        for selection in _bounded_grid_selections(reference_shape, 262_144):
+            pol_slice = selection[3]
+            measured_selection = selection[:3] + (measured_pol_index[pol_slice],)
+            exact_selection = selection[:3] + (exact_pol_index[pol_slice],)
+            measured_amp = np.asarray(measured_calibration.rcs_slice(measured_selection), dtype=np.complex128)
+            exact_amp = np.asarray(exact_reference.rcs_slice(exact_selection), dtype=np.complex128)
+            measured_finite = np.isfinite(measured_amp)
+            measured_zero = measured_finite & (np.abs(measured_amp) == 0.0)
+            valid_reference = measured_finite & np.isfinite(exact_amp) & ~measured_zero
+            block = np.full(measured_amp.shape, np.nan + 1j * np.nan, dtype=np.complex128)
+            numerator = exact_amp * range_phase[selection[2]][None, None, :, None]
+            np.divide(numerator, measured_amp, out=block, where=valid_reference)
+            valid_correction = np.isfinite(block)
+            magnitude = np.abs(block)
+            positive = valid_correction & (magnitude > 0.0)
+            gains = np.full(block.shape, np.nan, dtype=np.float64)
+            gains[positive] = 20.0 * np.log10(magnitude[positive])
+            finite = gains[np.isfinite(gains)]
+            finite_gain[gain_count:gain_count + finite.size] = finite
+            gain_count += finite.size
+            excessive = gains > gain_limit_db if gain_limit_db is not None else np.zeros(block.shape, dtype=bool)
+            block[excessive] = np.nan + 1j * np.nan
             valid_correction &= ~excessive
-        try:
-            correction_for_dut = np.broadcast_to(correction, dut_amp.shape)
+            correction[selection] = block
+            zero_factor_count += int(np.count_nonzero(valid_correction & (magnitude == 0.0)))
+            missing_reference_count += int(np.count_nonzero(~valid_reference))
+            measured_zero_count += int(np.count_nonzero(measured_zero))
+            over_limit_count += int(np.count_nonzero(excessive))
+
+        output_amp = allocate_result(self.shape, np.complex128)
+        correction_for_dut = np.broadcast_to(correction, self.shape)
+        overflowed_complex_count = overflowed_power_count = usable_count = 0
+        for selection in _bounded_grid_selections(self.shape, 262_144):
+            dut_amp = np.asarray(self.rcs_slice(selection), dtype=np.complex128)
+            factor = correction_for_dut[selection]
             with np.errstate(over="ignore", invalid="ignore"):
-                output_amp = dut_amp * correction_for_dut
-        except ValueError as exc:
-            raise ValueError(
-                "calibration angular axes cannot broadcast to the DUT grid"
-            ) from exc
-        if output_amp.shape != dut_amp.shape:
-            raise ValueError(
-                f"calibration produced shape {output_amp.shape}, expected {dut_amp.shape}"
-            )
-        candidate_output = dut_finite & np.isfinite(correction_for_dut)
-        finite_output_amp = np.isfinite(output_amp)
-        overflowed_complex_count = int(
-            np.count_nonzero(candidate_output & ~finite_output_amp)
-        )
-        valid_output = candidate_output & finite_output_amp
-        output_power = np.full(output_amp.shape, np.nan, dtype=np.float64)
-        with np.errstate(over="ignore", invalid="ignore"):
-            output_power[valid_output] = np.abs(output_amp[valid_output]) ** 2
-        overflowed_power = valid_output & ~np.isfinite(output_power)
-        overflowed_power_count = int(np.count_nonzero(overflowed_power))
-        valid_output &= ~overflowed_power
-        output_amp = np.array(output_amp, copy=True)
-        output_amp[~valid_output] = np.nan + 1j * np.nan
-        output_power[~valid_output] = np.nan
-        if not np.any(valid_output):
+                block = dut_amp * factor
+            candidate = np.isfinite(dut_amp) & np.isfinite(factor)
+            finite_output = np.isfinite(block)
+            overflowed_complex_count += int(np.count_nonzero(candidate & ~finite_output))
+            valid_output = candidate & finite_output
+            power = np.full(block.shape, np.nan, dtype=np.float64)
+            with np.errstate(over="ignore", invalid="ignore"):
+                power[valid_output] = np.abs(block[valid_output]) ** 2
+            overflowed_power = valid_output & ~np.isfinite(power)
+            overflowed_power_count += int(np.count_nonzero(overflowed_power))
+            valid_output &= ~overflowed_power
+            block[~valid_output] = np.nan + 1j * np.nan
+            output_amp[selection] = block
+            usable_count += int(np.count_nonzero(valid_output))
+        if usable_count == 0:
             raise ValueError(
                 "range calibration has no calibratable bins after masking "
                 "missing, zero-denominator, over-limit, or overflowed samples"
             )
 
-        finite_gain = correction_gain_db[np.isfinite(correction_gain_db)]
+        # A finite-only scratch array allows exact in-place partitioning for
+        # the median. With Disk selected this scratch also remains disk-backed.
+        finite_gain = finite_gain[:gain_count]
         gain_summary = {
-            "minimum": float(np.min(finite_gain)) if finite_gain.size else None,
-            "median": float(np.median(finite_gain)) if finite_gain.size else None,
-            "maximum": float(np.max(finite_gain)) if finite_gain.size else None,
-            "zero_factor_count": int(
-                np.count_nonzero(valid_correction & (correction_magnitude == 0.0))
-            ),
-            "missing_reference_bin_count": int(
-                np.count_nonzero(~valid_reference)
-            ),
-            "zero_measured_denominator_bin_count": int(
-                np.count_nonzero(measured_zero)
-            ),
-            "over_limit_correction_bin_count": int(
-                np.count_nonzero(excessive)
-            ),
+            "minimum": float(np.min(finite_gain)) if gain_count else None,
+            "median": float(np.median(finite_gain, overwrite_input=True)) if gain_count else None,
+            "maximum": float(np.max(finite_gain)) if gain_count else None,
+            "zero_factor_count": zero_factor_count,
+            "missing_reference_bin_count": missing_reference_count,
+            "zero_measured_denominator_bin_count": measured_zero_count,
+            "over_limit_correction_bin_count": over_limit_count,
             "overflowed_complex_output_bin_count": overflowed_complex_count,
             "overflowed_power_output_bin_count": overflowed_power_count,
-            "masked_output_bin_count": int(np.count_nonzero(~valid_output)),
+            "masked_output_bin_count": int(output_amp.size - usable_count),
         }
         measured_name = str(
             measured_label or measured_calibration.source_path or "measured calibration"

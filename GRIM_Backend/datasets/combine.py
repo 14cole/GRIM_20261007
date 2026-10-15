@@ -5,6 +5,12 @@ import json
 
 import numpy as np
 
+from GRIM_Backend.datasets.result_storage import (
+    allocate_result, copy_result, select_result, resident_result_bytes, result_storage_mode,
+)
+
+from GRIM_Backend.datasets.operations import dataset_operation
+
 from GRIM_Backend.datasets.constants import _ADOPT_CLEAN_ARRAYS_TOKEN, _JOIN_MERGE_BLOCK_CELLS
 from GRIM_Backend.datasets.memory import _bounded_grid_selections
 
@@ -61,6 +67,7 @@ class GridCombineMixin:
     """Grid joins, stitching, overlap, and multi-dataset dispatch."""
 
     @classmethod
+    @dataset_operation('stitch_many')
     def stitch_many(
         cls,
         *grids,
@@ -322,7 +329,7 @@ class GridCombineMixin:
         )
         merge_block_cells = min(cell_count, _JOIN_MERGE_BLOCK_CELLS)
         merge_scratch_bytes = merge_block_cells * (12 * itemsize + 64)
-        estimated_peak_bytes = output_bytes + state_bytes + merge_scratch_bytes
+        estimated_peak_bytes = resident_result_bytes(output_bytes + state_bytes, aggregate=True) + merge_scratch_bytes
         if memory_limit is not None and estimated_peak_bytes > memory_limit:
             raise MemoryError(
                 "dense stitched grid needs about "
@@ -332,10 +339,10 @@ class GridCombineMixin:
                 f"{memory_limit / (1024**3):.2f} GiB"
             )
 
-        stitched_power = np.full(shape, np.nan, dtype=output_dtype)
-        stitched_phase = np.full(shape, np.nan, dtype=output_dtype)
-        contributor_counts = np.zeros(shape, dtype=np.uint32)
-        conflict_flags = np.zeros(shape, dtype=bool)
+        stitched_power = allocate_result(shape, output_dtype, fill=np.nan)
+        stitched_phase = allocate_result(shape, output_dtype, fill=np.nan)
+        contributor_counts = allocate_result(shape, np.uint32, fill=0)
+        conflict_flags = allocate_result(shape, bool, fill=False)
 
         mapped_indices = []
         for grid in grids:
@@ -758,6 +765,7 @@ class GridCombineMixin:
         return stitched
 
     @classmethod
+    @dataset_operation('join_many')
     def join_many(cls, *grids, tol=1e-6, overlap="error", max_output_bytes=None):
         """Join datasets on union axes without silently replacing finite data.
 
@@ -1010,10 +1018,13 @@ class GridCombineMixin:
                 break
 
 
-            modeled = np.isfinite(grid.power)
-            raw_finite = np.isfinite(raw_real) & np.isfinite(raw_imag)
-            if np.any(modeled & ~raw_finite):
-                preserve_raw_amplitude = False
+            for selection in _bounded_grid_selections(grid.power.shape, _JOIN_MERGE_BLOCK_CELLS):
+                modeled = np.isfinite(grid.power[selection])
+                raw_finite = np.isfinite(raw_real[selection]) & np.isfinite(raw_imag[selection])
+                if np.any(modeled & ~raw_finite):
+                    preserve_raw_amplitude = False
+                    break
+            if not preserve_raw_amplitude:
                 break
             raw_inputs.append((raw_real, raw_imag))
         if not preserve_raw_amplitude:
@@ -1035,21 +1046,21 @@ class GridCombineMixin:
         merge_scratch_bytes = merge_block_cells * (
             8 * itemsize + (48 if preserve_raw_amplitude else 32)
         )
-        estimated_peak_bytes = output_bytes + cell_count + merge_scratch_bytes
+        estimated_peak_bytes = resident_result_bytes(output_bytes + cell_count, aggregate=True) + merge_scratch_bytes
         if max_output_bytes is not None and estimated_peak_bytes > int(max_output_bytes):
             raise MemoryError(
                 f"dense joined grid needs about {estimated_peak_bytes / (1024**3):.2f} GiB peak "
                 f"({output_bytes / (1024**3):.2f} GiB retained), "
                 f"above the configured limit of {int(max_output_bytes) / (1024**3):.2f} GiB"
             )
-        joined_power = np.full(shape, np.nan, dtype=out_dtype)
-        joined_phase = np.full(shape, np.nan, dtype=out_dtype)
+        joined_power = allocate_result(shape, out_dtype, fill=np.nan)
+        joined_phase = allocate_result(shape, out_dtype, fill=np.nan)
         joined_raw_real = (
-            np.full(shape, np.nan, dtype=np.float64)
+            allocate_result(shape, np.float64, fill=np.nan)
             if preserve_raw_amplitude else None
         )
         joined_raw_imag = (
-            np.full(shape, np.nan, dtype=np.float64)
+            allocate_result(shape, np.float64, fill=np.nan)
             if preserve_raw_amplitude else None
         )
 
@@ -1198,21 +1209,15 @@ class GridCombineMixin:
                                 joined_raw_imag[target] = existing_raw_imag
 
 
-        finite = np.empty(shape, dtype=bool)
-        np.isfinite(joined_power, out=finite)
-        np.maximum(joined_power, 0.0, out=joined_power, where=finite)
-        np.logical_not(finite, out=finite)
-        joined_power[finite] = np.nan
-        np.isfinite(joined_phase, out=finite)
-        np.logical_not(finite, out=finite)
-        joined_phase[finite] = np.nan
-        np.isfinite(joined_power, out=finite)
-        np.logical_not(finite, out=finite)
-        joined_phase[finite] = np.nan
-        if preserve_raw_amplitude:
-            joined_raw_real[finite] = np.nan
-            joined_raw_imag[finite] = np.nan
-        del finite
+        for selection in _bounded_grid_selections(shape, _JOIN_MERGE_BLOCK_CELLS):
+            power_block, phase_block = joined_power[selection], joined_phase[selection]
+            finite = np.isfinite(power_block)
+            np.maximum(power_block, 0.0, out=power_block, where=finite)
+            power_block[~finite] = np.nan
+            phase_block[~np.isfinite(phase_block) | ~finite] = np.nan
+            if preserve_raw_amplitude:
+                joined_raw_real[selection][~finite] = np.nan
+                joined_raw_imag[selection][~finite] = np.nan
 
         raw_extra = {}
         if preserve_raw_amplitude:
@@ -1266,14 +1271,14 @@ class GridCombineMixin:
         output_bytes = cell_count * itemsize
         merge_block_cells = min(cell_count, _JOIN_MERGE_BLOCK_CELLS)
         merge_scratch_bytes = merge_block_cells * (4 * itemsize + 48)
-        estimated_peak_bytes = output_bytes + merge_scratch_bytes
+        estimated_peak_bytes = resident_result_bytes(output_bytes) + merge_scratch_bytes
         if max_output_bytes is not None and estimated_peak_bytes > int(max_output_bytes):
             raise MemoryError(
                 f"dense joined grid needs about {estimated_peak_bytes / (1024**3):.2f} GiB peak "
                 f"({output_bytes / (1024**3):.2f} GiB retained), "
                 f"above the configured limit of {int(max_output_bytes) / (1024**3):.2f} GiB"
             )
-        joined = np.full(shape, np.nan + 1j * np.nan, dtype=out_dtype)
+        joined = allocate_result(shape, out_dtype, fill=np.nan + 1j * np.nan)
 
         for grid in grids:
             az_idx, el_idx, f_idx, p_idx = aligned_indices(grid)
@@ -1334,6 +1339,7 @@ class GridCombineMixin:
         return joined
 
     @classmethod
+    @dataset_operation('overlap_many')
     def overlap_many(cls, *grids, tol=1e-6):
         """Return one cropped dataset per input, all on common overlap axes.
 
@@ -1374,33 +1380,34 @@ class GridCombineMixin:
         ):
             raise ValueError("no overlap across one or more axes")
 
-        # One read per input: the aligned samples (a complex field, or power
-        # and phase for other storage) both decide which cells every input
-        # covers and, once trimmed, become the outputs.
+        common_shape = (len(az_common), len(el_common), len(f_common), len(p_common))
+        missing_any = allocate_result(common_shape, bool, fill=False)
         aligned_samples = []
-        missing_any = None
         for grid_idx, grid in enumerate(grids):
-            alignment = np.ix_(
-                az_indices[grid_idx], el_indices[grid_idx],
-                f_indices[grid_idx], p_indices[grid_idx],
-            )
+            alignment = np.ix_(az_indices[grid_idx], el_indices[grid_idx],
+                               f_indices[grid_idx], p_indices[grid_idx])
             if grid.storage_kind == "complex":
                 samples = grid._sample_kwargs(alignment)
-                field = samples["rcs"]
-                missing = np.isnan(field.real) & np.isnan(field.imag)
-            else:
+            elif result_storage_mode() == "memory":
                 power, phase = grid.power_phase_slice(alignment)
-                samples = {"rcs_power": np.array(power, copy=True),
-                           "rcs_phase": np.array(phase, copy=True)}
-                missing = ~np.isfinite(samples["rcs_power"])
+                samples = {"rcs_power": copy_result(power), "rcs_phase": copy_result(phase)}
+            else:
+                samples = grid._sample_kwargs(alignment)
             aligned_samples.append(samples)
-            missing_any = missing if missing_any is None else (missing_any | missing)
+            for selection in _bounded_grid_selections(common_shape, _JOIN_MERGE_BLOCK_CELLS):
+                if "rcs" in samples:
+                    field = samples["rcs"][selection]
+                    missing = np.isnan(field.real) & np.isnan(field.imag)
+                else:
+                    missing = ~np.isfinite(samples["rcs_power"][selection])
+                missing_any[selection] |= missing
 
-        finite = ~missing_any
-        az_keep = finite.any(axis=(1, 2, 3))
-        el_keep = finite.any(axis=(0, 2, 3))
-        f_keep = finite.any(axis=(0, 1, 3))
-        p_keep = finite.any(axis=(0, 1, 2))
+        keeps = [np.zeros(extent, dtype=bool) for extent in common_shape]
+        for selection in _bounded_grid_selections(common_shape, _JOIN_MERGE_BLOCK_CELLS):
+            finite = ~missing_any[selection]
+            for axis in range(4):
+                keeps[axis][selection[axis]] |= finite.any(axis=tuple(i for i in range(4) if i != axis))
+        az_keep, el_keep, f_keep, p_keep = keeps
 
         if not (az_keep.any() and el_keep.any() and f_keep.any() and p_keep.any()):
             raise ValueError("no overlap across one or more axes")
@@ -1416,8 +1423,8 @@ class GridCombineMixin:
 
         overlap_grids = []
         final_common_selection = np.ix_(az_sel, el_sel, f_sel, p_sel)
-        final_missing = missing_any[final_common_selection]
-        for grid_index, (grid, aligned) in enumerate(zip(grids, aligned_samples)):
+        final_missing = select_result(missing_any, final_common_selection)
+        for grid_index, grid in enumerate(grids):
             source_indices = (
                 np.asarray(az_indices[grid_index], dtype=int)[az_sel],
                 np.asarray(el_indices[grid_index], dtype=int)[el_sel],
@@ -1438,29 +1445,25 @@ class GridCombineMixin:
                 )
             )
             overlap_extra = grid._exact_transform_extra(
-                lambda value, selection=source_selection: value[selection],
+                lambda value, selection=source_selection: select_result(value, selection),
                 coordinate_change=("overlap-axis-relabel" if relabeled else None),
             )
-            for raw_key in grid._RAW_AMPLITUDE_EXTRA_KEYS:
-                if raw_key in overlap_extra:
-                    raw = np.asarray(overlap_extra[raw_key]).copy()
-                    raw[final_missing] = np.nan
-                    overlap_extra[raw_key] = raw
-            if "rcs" in aligned:
-                # Owned samples (raw solver field or physical field) that the
-                # constructor adopts; masking NaN pairs keeps them clean.
-                samples = {
-                    key: (value[final_common_selection] if key == "rcs" else value)
-                    for key, value in aligned.items()
-                }
-                samples["rcs"][final_missing] = np.nan + 1j * np.nan
-            else:
-                samples = {
-                    "rcs_power": aligned["rcs_power"][final_common_selection],
-                    "rcs_phase": aligned["rcs_phase"][final_common_selection],
-                }
-                samples["rcs_power"][final_missing] = np.nan
-                samples["rcs_phase"][final_missing] = np.nan
+            samples = {
+                key: select_result(value, final_common_selection)
+                if key in {"rcs", "rcs_power", "rcs_phase"} else value
+                for key, value in aligned_samples[grid_index].items()
+            }
+            for selection in _bounded_grid_selections(final_missing.shape, _JOIN_MERGE_BLOCK_CELLS):
+                missing = final_missing[selection]
+                for raw_key in grid._RAW_AMPLITUDE_EXTRA_KEYS:
+                    if raw_key in overlap_extra:
+                        overlap_extra[raw_key][selection][missing] = np.nan
+                if "rcs" in samples:
+                    samples["rcs"][selection][missing] = np.nan + 1j * np.nan
+                else:
+                    samples["rcs_power"][selection][missing] = np.nan
+                    if "rcs_phase" in samples:
+                        samples["rcs_phase"][selection][missing] = np.nan
             overlap_grids.append(
                 cls(
                     az_common,
